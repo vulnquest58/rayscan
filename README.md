@@ -52,13 +52,15 @@ engine plus UDP probes.
 | Area | Current capability |
 | :--- | :--- |
 | Toolchain | `rust-toolchain.toml`, pinned Rust 1.99.1, `rustfmt`, `clippy` |
-| CLI | `rayscan scan`, `rayscan doctor`, guided `rayscan interactive`, global `--theme` |
+| CLI | `rayscan scan`, `rayscan diff`, `rayscan doctor`, guided `rayscan interactive`, global `--theme` |
 | Discovery | Async TCP connect scanner and Linux raw SYN engine (`--syn`) |
-| Accuracy | Banner verification, SYN retransmission, and connect verification of SYN-open candidates |
+| Accuracy | 4-pillar empirical accuracy scoring (`0-100%`), `--explain`, `--min-confidence` |
+| Defense awareness | Middlebox, TCP tarpit, SYN proxy, and rate-limiting detection (`--defense`) |
+| Change detection | Baseline differential auditing (`--diff`, `--compare-to`, `rayscan diff`) |
 | Service detection | TCP banner grab + signature matching (SSH, HTTP, FTP, MySQL, Redis, …) |
 | UDP detection | DNS, rpcbind, SNMP, NTP, NetBIOS (137), SIP (5060) via `--udp` flag (`src/udp.rs`) |
 | OS fingerprinting | Passive TCP/IP stack analysis (TTL, Window, MSS, WScale, SACK, TS) via `--os` (`src/fingerprint.rs`) |
-| Resumable scans | `--save-state FILE` + `--resume FILE` with JSON state files (`src/resume.rs`) |
+| Resumable scans | Smart `--resume FILE` with pre-scan gap analysis audit + `--save-state FILE` (`src/resume.rs`) |
 | Signal handling | Graceful Ctrl-C: workers stop, partial results printed, state saved |
 | Output formats | `table`, `json`, `jsonl`, `csv`, `nmap-xml`, `greppable`; dark/light/hacker/minimal themes |
 | Packaging | Static musl binary (`make musl`), Dockerfile (scratch), man page (`make man`) |
@@ -229,6 +231,73 @@ sudo rayscan scan --syn --os --target 192.168.100.37 --explain
 
 # Filter out low-confidence/ambiguous candidates (require >= 90% confidence):
 rayscan scan --target 192.168.100.37 --min-confidence 90
+```
+
+### Defense Awareness & Middlebox Classifier (`--defense`)
+
+Enterprise and cloud environments frequently mask service availability using middleboxes, firewalls, and deception defenses. Rather than mistaking these behaviors for real open services or silent drops, `rayscan` actively analyzes handshake discrepancies, silent response ratios, and latency patterns to classify host defense posture:
+
+- `[CLEAN] Direct Host`: Genuine end-host behavior without middlebox interference.
+- `[NOTICE] Rate-Limiting Active`: Probe drops detected under burst rates (suggests reducing `--rate` or using `--profile careful`).
+- `[WARNING] TCP Tarpit Active`: `xt_TARPIT` or honeypots holding TCP handshakes indefinitely without delivering application data.
+- `[WARNING] SYN-Proxy Middlebox Detected`: `iptables SYNPROXY` or hardware proxies answering SYN probes but failing backend TCP completion.
+- `[WARNING] Layer-7 WAF / DPI Detected`: Deep-packet inspection RSTs triggered by application payloads.
+- `[CRITICAL] Heavy Middlebox / Deception Detected`: Multi-layer deception combining proxies, tarpits, and filtering.
+
+```bash
+# Force display of defense intelligence even for clean direct hosts:
+rayscan scan --target 192.168.100.37 --defense
+
+# Defense intelligence is automatically embedded in all --json reports:
+rayscan scan --target 192.168.100.37 --json
+```
+
+### Network State Change Detection & Differential Auditing (`--diff` & `rayscan diff`)
+
+`rayscan` provides built-in differential change detection to track perimeter drift, newly opened ports, vanished services, version upgrades, and defense posture shifts without requiring external diff scripts:
+
+```bash
+# 1. Compare live scan against an existing baseline scan or state file:
+rayscan scan --target 192.168.100.37 --diff /tmp/baseline.json
+
+# 2. Standalone offline diff between any two saved JSON reports or state files:
+rayscan diff /tmp/yesterday.json /tmp/today.json
+
+# 3. Machine-readable JSON diff output for CI/CD and security monitoring:
+rayscan diff /tmp/yesterday.json /tmp/today.json --json
+```
+
+**Differential Output Format:**
+```text
+Network State Differential Analysis (vs /tmp/baseline.json):
+──────────────────────────────────────────────────────────────────────
+[*] CHANGED 192.168.100.37:22     ssh OpenSSH/7.4 → ssh OpenSSH/8.9
+[-] GONE    192.168.100.37:80     http nginx/1.14.0          (http nginx/1.14.0 (Was: open))
+[+] NEW     192.168.100.37:443    https nginx/1.24.0         (https nginx/1.24.0 (Confidence: 98%))
+[~] POSTURE 192.168.100.37        [CLEAN] Direct Host → [NOTICE] Rate-Limiting Active
+
+Diff Summary: 1 new | 1 closed/gone | 1 modified | 1 posture shifted (12 unchanged)
+```
+
+### Smart Resume with Gap Analysis Audit
+
+When resuming an interrupted or large-scale scan with `--resume <FILE>`, `rayscan` executes an immediate pre-scan diagnostic audit to inspect remaining scope and verify host anomaly thresholds:
+
+```bash
+# Resume an interrupted scan with comprehensive gap analysis audit:
+rayscan scan --target 192.168.100.37 --resume /tmp/scan-state.json
+```
+
+```text
+Resume Gap Analysis Audit:
+──────────────────────────────────────────────────────────────────────
+Target Scope:        192.168.100.37
+Port Specification:  1-65535
+Progress:            1024/65535 ports completed (1.6%)
+Remaining Gaps:      64511 ports to scan
+Prior Findings:      19 open, 1005 closed, 0 filtered, 0 silent
+Host Anomaly Check:  Clean (No host anomaly threshold triggered)
+──────────────────────────────────────────────────────────────────────
 ```
 
 Targets may be repeated and may be an IP, CIDR, range, hostname, file path, or
