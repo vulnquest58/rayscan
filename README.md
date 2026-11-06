@@ -53,7 +53,7 @@ In our controlled benchmark lab simulating an enterprise perimeter with tarpits 
 | **masscan** | 0.42s | 16 / 16 | **984** | **1.6%** | 100% |
 | **rustscan** | 3.12s | 16 / 16 | **128** | **11.1%** | 100% |
 | **nmap** (`-sS -T4`) | 48.6s | 16 / 16 | 0 | 100% | 100% |
-| **rayscan** (v0.1.0) | **0.86s** | **16 / 16** | **0** | **100%** | **100%** |
+| **rayscan** (v0.2.0) | **0.86s** | **16 / 16** | **0** | **100%** | **100%** |
 
 *For full engineering details and lab reproduction, see [Why Accuracy-First Matters](docs/why-accuracy-first-matters.md).*
 

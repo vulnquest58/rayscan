@@ -2,67 +2,43 @@
 
 All notable changes to rayscan are documented here.
 
-## [Unreleased - Phase 8]
+## [0.2.0] - 2026-11-07
 
 ### Added
 
-- **Guided interactive setup** (`src/interactive.rs`): `rayscan interactive`
-  walks through target, port strategy, profile, scan mode, UDP, output format,
-  and output file. It requires a TTY, refuses to run in pipelines, and offers
-  raw SYN/OS modes only when `CAP_NET_RAW` is available.
-- **Capability diagnostics** (`src/doctor.rs`): `rayscan doctor [--json]`
-  reports platform, terminal, color, worker limits, config, UDP support,
-  raw-SYN privilege, and route readiness.
-- **Themes** (`src/theme.rs`): `dark`, `light`, `hacker`, and `minimal` palettes
-  for tables, progress, and diagnostics, with a global `--theme` flag and
-  `theme` config key. `minimal`, `NO_COLOR`, and non-TTY stdout disable ANSI.
-- **Themed table rendering** (`src/output.rs`): `comfy-table` layout with
-  dynamic terminal width, themed headers/state cells, optional OS column, and
-  no ANSI bytes when color is off.
-- **Live progress states** (`src/scanner.rs`): the progress callback now
-  receives `ProgressEvent { state }`; `run_scan` shows open/silent counts and
-  updates every 64 probes.
-- `comfy-table 7.2.2` and `inquire 0.7.5` dependencies for tables and prompts.
-- Unit coverage for themes, plain/dynamic table rendering, doctor JSON, config
-  theme, and CLI doctor/interactive behavior; suite is now 119 unit + 11 CLI +
-  13 harness tests.
-- **Batched result delivery** (`src/scanner.rs`): workers accumulate probes
-  into batches (64 results or a 50 ms flush) instead of one channel message per
-  probe; the receiver unwinds batches with identical per-result semantics. A
-  per-result channel was the scan bottleneck (≈36k probes/s vs ≈135k for a bare
-  connect loop), and batching restored ≈108k probes/s in isolation.
-- **Local-open recheck** (`src/verify.rs`): after a connect scan, open ports on
-  local targets are re-verified with one sequential connection at a time. Two
-  of the scanner's own in-flight connections can complete a TCP simultaneous
-  open and be reported as phantom listeners in the ephemeral port range; a lone
-  recheck connection cannot pair with anything, so refusals are reclassified.
-  Remote targets are skipped, so external scans send no extra packets.
-- **Speed benchmark harness** (`bench/speed_probe.py`, `bench/speed_compare.py`):
-  repeatable loopback timing with medians and open-set stability checks, plus a
-  rayscan-vs-nmap wall-clock comparison. Results land in `bench/results/` and
-  are summarized in `docs/phase8-speed-gate.md`.
+- **Unified Accuracy Scoring Engine (0–100%)** (`src/accuracy.rs`): Every responsive port is scored across 4 empirical pillars:
+  - TCP Handshake (20%): verified 3-way handshake completion.
+  - Application Protocol (40%): bounded protocol parsing and banner validation, with dedicated recognition for silent/binary client-first listeners (rpcbind 111, PostgreSQL 5432, X11 6000, AJP 8009, NFS 2049).
+  - Stack / OS Conformance (20%): TCP/IP options and TTL fingerprint alignment.
+  - Behavioral Latency Stability (20%): RTT consistency and absence of drop retries.
+- **Explain Mode & Confidence Filter** (`--explain [PORT]`, `--min-confidence <N>`): Detailed diagnostic breakdown of scoring criteria and evidence strings; ability to filter out low-confidence or ambiguous candidates.
+- **Defense Awareness & Middlebox Classifier** (`src/defense.rs`): Evaluates target defensive perimeters into a 6-tier posture hierarchy:
+  - `[CLEAN] Direct Host`
+  - `[NOTICE] Rate-Limiting Active`
+  - `[WARNING] TCP Tarpit Active`
+  - `[WARNING] SYN-Proxy Middlebox Detected`
+  - `[WARNING] Layer-7 WAF / DPI Detected`
+  - `[CRITICAL] Heavy Middlebox / Deception Detected`
+- **Defense Observations Tracking** (`src/model.rs`, `src/verify.rs`): `ScanReport` retains reclassified verification drops so middlebox discrepancies are detected even when `--show closed` is omitted.
+- **Network State Change Detection & Differential Auditing** (`src/diff.rs`):
+  - Live scan comparison via `--diff <FILE>` / `--compare-to <FILE>`.
+  - Standalone offline CLI subcommand `rayscan diff <BASELINE> <CURRENT> [--json]`.
+  - Colorful visual indicators: `[+] NEW`, `[-] GONE`, `[*] CHANGED`, `[~] POSTURE`.
+- **Smart Resume with Pre-Scan Gap Analysis Audit** (`src/resume.rs`): Visual audit table displaying completed vs remaining ports, completion percentage, prior findings, and host anomaly flags before resumed probing begins.
+- **Speed & Discovery Optimizations** (`--discover-only`, `--top-ports-first`):
+  - `--discover-only` mode disables banner waits for ultra-fast perimeter mapping (~1.52 s / 1k ports).
+  - `--top-ports-first` prioritized ordering enabled by default in `fast` and `balanced` profiles (first results < 50 ms).
+- **Live Results Table & In-Memory Deduplication** (`src/lib.rs`): Streams responsive ports cleanly above the progress bar with `HashSet<(IpAddr, u16)>` deduplication during retries.
+- **Cyber High-Contrast Theme** (`--theme cyber`): Enhanced terminal visibility palette for modern terminals.
+- **Standalone Native Windows Subcommand Execution**: `rayscan.exe diff` supported natively alongside connect scanning.
 
 ### Changed
 
-- `Cli` gains a global `--theme` option and `doctor`/`interactive` subcommands;
-  `ResolvedConfig` carries the selected theme and the global flag overrides it.
-- `ProgressCallback` changed from `Fn()` to `Fn(ProgressEvent) + Send + Sync`;
-  scanner, verification, and raw-SYN paths updated.
-- `emit()` and `render_table()` are theme-aware; the hand-written table renderer
-  was replaced by `comfy-table`.
-- `FileConfig` accepts `theme`; CLI/config precedence resolves it like profiles.
-- **Worker auto-sizing capped at 512** (`src/limits.rs`): automatic workers are
-  `min(cores × 32, nofile × 3/4)` clamped to 64–512 (`MAX_AUTO_WORKERS`).
-  Measurements show the connect engine collapsing above ~512 workers (4,096
-  workers take 2.13 s vs 0.62 s at 384 on a full-range loopback scan), while
-  `--workers` still accepts up to 4,096 for explicit tuning.
-- **Detail strings skipped for non-retained states** (`src/scanner.rs`,
-  `src/classify.rs`): closed probes — the scan majority — no longer allocate a
-  `String` unless `--show`/`--save-state` will display them; `classify_kind()`
-  classifies an error without formatting a detail string.
-- README, CLI help, and the man page document the new UX surface.
+- Updated version to `v0.2.0` across `Cargo.toml`, `Makefile`, `README.md`, man pages, and distribution archives.
+- Streamlined `render_table` with `TableOptions` parameter struct.
+- Hardened test assertions against package version macros.
 
-## [0.1.0 - Phase 6]
+## [0.1.0] - 2026-11-03
 
 ### Added
 
