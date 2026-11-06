@@ -236,6 +236,10 @@ pub struct ScanArgs {
     /// Print comprehensive evidence and accuracy breakdown for all ports or a specific port.
     #[arg(long, num_args = 0..=1, default_missing_value = "0", value_name = "PORT")]
     pub explain: Option<u16>,
+
+    /// Always display detailed defense and middlebox intelligence assessment.
+    #[arg(long)]
+    pub defense: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -276,6 +280,8 @@ pub struct ResolvedConfig {
     pub min_confidence: Option<u8>,
     /// Port to explain (0 means all open ports).
     pub explain: Option<u16>,
+    /// Display defense and middlebox intelligence assessment.
+    pub defense: bool,
 }
 
 impl ScanArgs {
@@ -419,6 +425,7 @@ impl ScanArgs {
             theme: file.theme.unwrap_or_default(),
             min_confidence: self.min_confidence,
             explain: self.explain,
+            defense: self.defense,
         })
     }
 
@@ -504,6 +511,7 @@ mod tests {
             save_state: None,
             min_confidence: None,
             explain: None,
+            defense: false,
         }
     }
 

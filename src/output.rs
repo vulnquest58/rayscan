@@ -51,6 +51,7 @@ pub struct EmitOptions<'a> {
     pub streamed: bool,
     pub min_confidence: Option<u8>,
     pub explain: Option<u16>,
+    pub defense: bool,
 }
 
 pub fn emit(report: &ScanReport, target: &str, options: EmitOptions<'_>) -> Result<(), AppError> {
@@ -81,6 +82,7 @@ pub fn emit(report: &ScanReport, target: &str, options: EmitOptions<'_>) -> Resu
             color_enabled(options.theme, stdout_is_tty) && options.destination.is_none(),
             stdout_is_tty,
             options.explain,
+            options.defense,
         ),
         OutputFormat::Json => render_json(report, target, options.show, options.min_confidence)?,
         OutputFormat::Jsonl => render_jsonl(&selected)?,
@@ -94,7 +96,7 @@ pub fn emit(report: &ScanReport, target: &str, options: EmitOptions<'_>) -> Resu
     }
 
     if options.streamed && options.format == OutputFormat::Table && stdout_is_tty {
-        // Results were already streamed live to stdout. Output the summary footer & OS findings.
+        // Results were already streamed live to stdout. Output the summary footer & findings.
         println!(
             "{}",
             format_live_divider(color_enabled(options.theme, stdout_is_tty))
@@ -117,6 +119,40 @@ pub fn emit(report: &ScanReport, target: &str, options: EmitOptions<'_>) -> Resu
                 );
             }
             println!();
+        }
+        let defenses = crate::defense::analyze_defenses(report);
+        let has_non_direct = defenses
+            .values()
+            .any(|d| d.defense_type != crate::defense::DefenseType::DirectHost);
+        if options.defense || has_non_direct {
+            println!("Defense & Middlebox Intelligence:");
+            println!("{}", "─".repeat(70));
+            for (host, assess) in &defenses {
+                let badge = match assess.defense_type {
+                    crate::defense::DefenseType::DirectHost => "[CLEAN] Direct Host",
+                    crate::defense::DefenseType::SynProxy => "[ALERT] SYN-Proxy Middlebox Detected",
+                    crate::defense::DefenseType::Tarpit => "[ALERT] TCP Tarpit Active",
+                    crate::defense::DefenseType::RateLimiting => "[NOTICE] Rate-Limiting Active",
+                    crate::defense::DefenseType::WafOrDpi => "[ALERT] Layer-7 WAF / DPI Detected",
+                    crate::defense::DefenseType::MultiLayerDefense => {
+                        "[ALERT] Multi-Layer Defense Active"
+                    }
+                };
+                println!("Target {}:", host);
+                println!("  Posture:             {}", badge);
+                println!("  Confidence:          {:.0}%", assess.confidence * 100.0);
+                println!("  Summary:             {}", assess.summary);
+                if !assess.indicators.is_empty() {
+                    println!("  Indicators:");
+                    for ind in &assess.indicators {
+                        println!("    • {}", ind);
+                    }
+                }
+                if let Some(action) = &assess.recommended_action {
+                    println!("  Recommended Action:  {}", action);
+                }
+                println!();
+            }
         }
         if let Some(exp_port) = options.explain {
             println!("\nAccuracy & Evidence Explanations:");
@@ -177,6 +213,7 @@ fn render_table(
     use_color: bool,
     dynamic_width: bool,
     explain: Option<u16>,
+    defense: bool,
 ) -> String {
     let has_os = !report.os_fingerprints.is_empty();
 
@@ -286,6 +323,45 @@ fn render_table(
                 guess.confidence * 100.0,
                 ev
             ));
+        }
+    }
+
+    let defenses = crate::defense::analyze_defenses(report);
+    let has_non_direct = defenses
+        .values()
+        .any(|d| d.defense_type != crate::defense::DefenseType::DirectHost);
+    if defense || has_non_direct {
+        output.push_str("\nDefense & Middlebox Intelligence:\n");
+        output.push_str(&"─".repeat(70));
+        output.push('\n');
+        for (host, assess) in &defenses {
+            let badge = match assess.defense_type {
+                crate::defense::DefenseType::DirectHost => "[CLEAN] Direct Host",
+                crate::defense::DefenseType::SynProxy => "[ALERT] SYN-Proxy Middlebox Detected",
+                crate::defense::DefenseType::Tarpit => "[ALERT] TCP Tarpit Active",
+                crate::defense::DefenseType::RateLimiting => "[NOTICE] Rate-Limiting Active",
+                crate::defense::DefenseType::WafOrDpi => "[ALERT] Layer-7 WAF / DPI Detected",
+                crate::defense::DefenseType::MultiLayerDefense => {
+                    "[ALERT] Multi-Layer Defense Active"
+                }
+            };
+            output.push_str(&format!("Target {}:\n", host));
+            output.push_str(&format!("  Posture:             {}\n", badge));
+            output.push_str(&format!(
+                "  Confidence:          {:.0}%\n",
+                assess.confidence * 100.0
+            ));
+            output.push_str(&format!("  Summary:             {}\n", assess.summary));
+            if !assess.indicators.is_empty() {
+                output.push_str("  Indicators:\n");
+                for ind in &assess.indicators {
+                    output.push_str(&format!("    • {}\n", ind));
+                }
+            }
+            if let Some(action) = &assess.recommended_action {
+                output.push_str(&format!("  Recommended Action:  {}\n", action));
+            }
+            output.push('\n');
         }
     }
 
@@ -481,6 +557,8 @@ struct JsonReport<'a> {
     results: Option<Vec<JsonResult>>,
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     os_fingerprints: HashMap<String, &'a OsGuess>,
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    defense: HashMap<String, crate::defense::HostDefenseAssessment>,
     summary: StateCounts,
     elapsed_ms: f64,
 }
@@ -577,6 +655,10 @@ fn render_json(
             .os_fingerprints
             .iter()
             .map(|(ip, guess)| (ip.to_string(), guess))
+            .collect(),
+        defense: crate::defense::analyze_defenses(report)
+            .into_iter()
+            .map(|(ip, d)| (ip.to_string(), d))
             .collect(),
         summary: report.counts,
         elapsed_ms: (report.elapsed.as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0,
@@ -905,7 +987,7 @@ mod tests {
             .iter()
             .filter(|r| r.state == PortState::Open)
             .collect();
-        let output = render_table(&report, &results, Theme::Minimal, false, false, None);
+        let output = render_table(&report, &results, Theme::Minimal, false, false, None, false);
         assert!(output.contains("HOST"));
         assert!(output.contains("CONFIDENCE"));
         assert!(output.contains("SERVICE"));
@@ -923,7 +1005,7 @@ mod tests {
     fn dynamic_table_keeps_header_labels_intact() {
         let report = sample_report();
         let results: Vec<&PortResult> = report.results.iter().collect();
-        let output = render_table(&report, &results, Theme::Minimal, false, true, None);
+        let output = render_table(&report, &results, Theme::Minimal, false, true, None, false);
         assert!(output.contains("HOST"));
         assert!(output.contains("CONFIDENCE"));
         assert!(output.contains("SERVICE"));
@@ -935,11 +1017,30 @@ mod tests {
         let mut report = sample_report();
         crate::accuracy::score_report(&mut report);
         let results: Vec<&PortResult> = report.results.iter().collect();
-        let output = render_table(&report, &results, Theme::Minimal, false, false, Some(80));
+        let output = render_table(
+            &report,
+            &results,
+            Theme::Minimal,
+            false,
+            false,
+            Some(80),
+            false,
+        );
         assert!(output.contains("Accuracy & Evidence Explanations:"));
         assert!(output.contains("Port 80/tcp on 192.0.2.1"));
         assert!(output.contains("Criteria Breakdown:"));
         assert!(output.contains("Evidence String:"));
+    }
+
+    #[test]
+    fn table_defense_renders_intelligence() {
+        let mut report = sample_report();
+        crate::accuracy::score_report(&mut report);
+        let results: Vec<&PortResult> = report.results.iter().collect();
+        let output = render_table(&report, &results, Theme::Minimal, false, false, None, true);
+        assert!(output.contains("Defense & Middlebox Intelligence:"));
+        assert!(output.contains("Target 192.0.2.1:"));
+        assert!(output.contains("Posture:"));
     }
 
     #[test]

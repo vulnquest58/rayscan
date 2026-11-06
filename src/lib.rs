@@ -3,6 +3,7 @@ pub mod anomaly;
 pub mod classify;
 pub mod cli;
 pub mod config;
+pub mod defense;
 pub mod doctor;
 pub mod error;
 pub mod fingerprint;
@@ -136,6 +137,7 @@ pub(crate) async fn run_scan(args: ScanArgs, theme: Option<Theme>) -> Result<(),
                 streamed: false,
                 min_confidence: resolved.min_confidence,
                 explain: resolved.explain,
+                defense: resolved.defense,
             },
         );
     }
@@ -522,6 +524,7 @@ pub(crate) async fn run_scan(args: ScanArgs, theme: Option<Theme>) -> Result<(),
             streamed: live_streamed.load(Ordering::Relaxed),
             min_confidence: resolved.min_confidence,
             explain: resolved.explain,
+            defense: resolved.defense,
         },
     )
 }
