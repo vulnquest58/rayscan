@@ -1,0 +1,44 @@
+[package]
+name = "rayscan"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+authors = ["vulnquest58 <https://github.com/vulnquest58>"]
+repository = "https://github.com/vulnquest58/rayscan"
+homepage = "https://github.com/vulnquest58/rayscan"
+description = "An accuracy-first TCP/UDP port scanner with OS fingerprinting"
+license = "MIT"
+readme = "README.md"
+keywords = ["port-scanner", "network", "security", "tcp", "nmap"]
+categories = ["command-line-utilities", "network-programming"]
+
+[[bin]]
+name = "rayscan"
+path = "src/main.rs"
+
+[[bin]]
+name = "gen_man"
+path = "src/bin/gen_man.rs"
+
+[dependencies]
+async-channel = "2"
+clap = { version = "4", features = ["derive"] }
+clap_mangen = "0.2"
+comfy-table = "7"
+core_affinity = "0.8"
+crossbeam-channel = "0.5"
+indicatif = "0.18"
+inquire = "0.7"
+libc = "0.2"
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+siphasher = "0.3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util", "signal"] }
+toml = "0.8"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"

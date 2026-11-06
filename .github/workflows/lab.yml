@@ -1,0 +1,33 @@
+name: Lab
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  namespace-lab:
+    name: namespace lab
+    runs-on: [self-hosted, linux, rayscan-lab]
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build release
+        run: cargo build --release --locked
+      - name: Verify ground truth in the isolated namespace
+        run: sudo -E make lab-check
+      - name: Scanner gates at 0% and 5% loss
+        run: |
+          set -euo pipefail
+          trap 'sudo -E make lab-down' EXIT
+          sudo -E make lab
+          sudo -E make syn-gate
+          sudo -E make service-gate
+          sudo -E make syn-service-gate
+          sudo -E make lab-down
+          LAB_LOSS=5% sudo -E make lab
+          sudo -E make syn-gate
+          sudo -E make syn-service-gate
+          sudo -E make lab-down
+          trap - EXIT

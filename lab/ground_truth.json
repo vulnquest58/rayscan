@@ -1,0 +1,25 @@
+{
+  "target": "10.77.0.2",
+  "open": [80, 443, 3306, 8080, 8081],
+  "closed": [81, 9999],
+  "filtered": [9001],
+  "tarpit": [9000],
+  "rate_limited": [8081],
+  "synproxy": [9003],
+  "services": {
+    "80": "http",
+    "443": "http",
+    "3306": "mysql",
+    "8080": "http",
+    "8081": "http-rate-limited",
+    "9003": "syn-proxy"
+  },
+  "service_details": {
+    "80": {"name": "http", "product": "rayscan-lab"},
+    "443": {"name": "http", "product": "rayscan-lab"},
+    "3306": {"name": "mysql", "product": "MySQL", "version": "8.0.36-rayscan-lab"},
+    "8080": {"name": "http", "product": "rayscan-lab"},
+    "8081": {"name": "http", "product": "rayscan-lab-rate-limited"}
+  },
+  "notes": "9000 completes the handshake but never sends data; 8081 accepts new connections only within a 5/s limit; 9001 is dropped; 9003 is answered by netfilter SYNPROXY without a backend."
+}

@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<nmaprun>
+  <host>
+    <address addr="10.77.0.2" addrtype="ipv4"/>
+    <ports>
+      <port protocol="tcp" portid="80"><state state="open"/></port>
+      <port protocol="tcp" portid="443"><state state="open"/></port>
+      <port protocol="tcp" portid="3306"><state state="open"/></port>
+      <port protocol="tcp" portid="8080"><state state="open"/></port>
+      <port protocol="tcp" portid="81"><state state="closed"/></port>
+    </ports>
+  </host>
+</nmaprun>

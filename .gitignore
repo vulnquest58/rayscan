@@ -1,0 +1,12 @@
+/target/
+/lab/state/
+/bench/results/
+*.log
+*.pyc
+__pycache__/
+.DS_Store
+/rayscan-linux
+/rayscan-static-musl
+/rayscan.exe
+/dist/*.tar.gz
+/dist/*.zip

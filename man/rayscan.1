@@ -1,0 +1,53 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH rayscan 1  "rayscan 0.1.0" 
+.SH NAME
+rayscan \- An accuracy\-first TCP port scanner
+.SH SYNOPSIS
+\fBrayscan\fR [\fB\-\-theme\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fB\-V\fR|\fB\-\-version\fR] <\fIsubcommands\fR>
+.SH DESCRIPTION
+An accuracy\-first TCP/UDP scanner. Rayscan uses a bounded worker pool, adaptive per\-host timeouts, a global rate limit, and a short service\-verification read so a bare handshake from a tarpit or SYN proxy is not reported as an open service. Responsive services are identified from their banners, including common products and versions. On Linux, \-\-syn performs raw SYN discovery and verifies responsive candidates over TCP. A UDP scanner is available for service detection on ports that accept UDP traffic.
+.SH OPTIONS
+.TP
+\fB\-\-theme\fR \fI<THEME>\fR
+Color theme for tables, progress, and diagnostics
+.br
+
+.br
+\fIPossible values:\fR
+.RS 14
+.IP \(bu 2
+dark
+.IP \(bu 2
+light
+.IP \(bu 2
+hacker
+.IP \(bu 2
+minimal
+.RE
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help (see a summary with \*(Aq\-h\*(Aq)
+.TP
+\fB\-V\fR, \fB\-\-version\fR
+Print version
+.SH SUBCOMMANDS
+.TP
+rayscan\-scan(1)
+Scan TCP ports on one or more targets
+.TP
+rayscan\-doctor(1)
+Check permissions, terminal support, and scan capabilities
+.TP
+rayscan\-interactive(1)
+Set up and run a scan with guided prompts
+.TP
+rayscan\-help(1)
+Print this message or the help of the given subcommand(s)
+.SH EXTRA
+Examples:
+  rayscan scan \-\-target 127.0.0.1 \-\-ports 1\-1024
+  rayscan scan \-t 10.0.0.0/24 \-p 22,80,443 \-\-json
+  rayscan scan \-t 10.77.0.2 \-p 1\-10000 \-\-profile careful \-\-show all
+.SH VERSION
+v0.1.0

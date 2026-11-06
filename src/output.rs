@@ -1,0 +1,721 @@
+use std::collections::HashMap;
+use std::io::{self, IsTerminal, Write};
+use std::path::Path;
+
+use clap::ValueEnum;
+use comfy_table::{Attribute, Cell, ColumnConstraint, ContentArrangement, Table, Width};
+use serde::{Deserialize, Serialize};
+
+use crate::error::AppError;
+use crate::fingerprint::OsGuess;
+use crate::model::{PortResult, PortState, ScanReport, StateCounts, StateSet};
+use crate::service::ServiceInfo;
+use crate::theme::{Theme, color_enabled};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OutputFormat {
+    Table,
+    Json,
+    Jsonl,
+    Csv,
+    /// Nmap-compatible XML output (compatible with nmap parsers / Metasploit).
+    #[value(name = "nmap-xml")]
+    NmapXml,
+    /// Greppable output — one line per host, Nmap -oG style.
+    #[value(name = "greppable")]
+    Greppable,
+}
+
+impl OutputFormat {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Table => "table",
+            Self::Json => "json",
+            Self::Jsonl => "jsonl",
+            Self::Csv => "csv",
+            Self::NmapXml => "nmap-xml",
+            Self::Greppable => "greppable",
+        }
+    }
+}
+
+pub fn emit(
+    report: &ScanReport,
+    target: &str,
+    format: OutputFormat,
+    show: StateSet,
+    destination: Option<&Path>,
+    quiet: bool,
+    theme: Theme,
+) -> Result<(), AppError> {
+    let mut selected: Vec<&PortResult> = report
+        .results
+        .iter()
+        .filter(|result| show.contains(result.state))
+        .collect();
+    selected.sort_by(|left, right| compare_results(left, right));
+
+    let stdout_is_tty = std::io::stdout().is_terminal();
+    let contents = match format {
+        OutputFormat::Table => render_table(
+            report,
+            &selected,
+            theme,
+            color_enabled(theme, stdout_is_tty) && destination.is_none(),
+            stdout_is_tty,
+        ),
+        OutputFormat::Json => render_json(report, target, show)?,
+        OutputFormat::Jsonl => render_jsonl(&selected)?,
+        OutputFormat::Csv => render_csv(&selected),
+        OutputFormat::NmapXml => render_nmap_xml(report, target, &selected),
+        OutputFormat::Greppable => render_greppable(target, &selected),
+    };
+
+    write_destination(destination, &contents, quiet)
+}
+
+fn compare_results(left: &PortResult, right: &PortResult) -> std::cmp::Ordering {
+    left.host
+        .cmp(&right.host)
+        .then_with(|| left.port.cmp(&right.port))
+}
+
+fn render_table(
+    report: &ScanReport,
+    results: &[&PortResult],
+    theme: Theme,
+    use_color: bool,
+    dynamic_width: bool,
+) -> String {
+    let has_os = !report.os_fingerprints.is_empty();
+
+    let mut table = Table::new();
+    table.load_preset(theme.table_preset());
+    if !dynamic_width {
+        table.force_no_tty();
+    } else {
+        table.set_content_arrangement(ContentArrangement::Dynamic);
+    }
+
+    let header = |label: &str| {
+        let cell = Cell::new(label);
+        if use_color {
+            cell.fg(theme.accent()).add_attribute(Attribute::Bold)
+        } else {
+            cell
+        }
+    };
+    let mut headers = vec![
+        header("HOST"),
+        header("PORT"),
+        header("STATE"),
+        header("SERVICE"),
+        header("LATENCY_MS"),
+    ];
+    if has_os {
+        headers.push(header("OS"));
+    }
+    table.set_header(headers);
+    let mut constraints = vec![
+        ColumnConstraint::LowerBoundary(Width::Fixed(15)),
+        ColumnConstraint::LowerBoundary(Width::Fixed(6)),
+        ColumnConstraint::LowerBoundary(Width::Fixed(10)),
+        ColumnConstraint::LowerBoundary(Width::Fixed(16)),
+        ColumnConstraint::LowerBoundary(Width::Fixed(12)),
+    ];
+    if has_os {
+        constraints.push(ColumnConstraint::LowerBoundary(Width::Fixed(12)));
+    }
+    table.set_constraints(constraints);
+
+    for result in results {
+        let state_cell = match theme.state(result.state) {
+            Some(color) if use_color => Cell::new(result.state.as_str()).fg(color),
+            _ => Cell::new(result.state.as_str()),
+        };
+        let service_cell = Cell::new(service_label(result));
+        let mut row = vec![
+            Cell::new(result.host),
+            Cell::new(result.port),
+            state_cell,
+            service_cell,
+            Cell::new(format!("{:.2}", result.latency.as_secs_f64() * 1000.0)),
+        ];
+        if has_os {
+            let os_label = report
+                .os_fingerprints
+                .get(&result.host)
+                .map(|g| format!("{} ({:.0}%)", g.detail, g.confidence * 100.0))
+                .unwrap_or_default();
+            row.push(Cell::new(os_label.chars().take(24).collect::<String>()));
+        }
+        table.add_row(row);
+    }
+
+    let mut output = table.to_string();
+    output.push('\n');
+    if results.is_empty() {
+        output.push_str("no matching results\n");
+    }
+    output.push('\n');
+    output.push_str(&format_summary(report.counts, report.elapsed));
+    output.push_str(&format!(
+        "  targets {}  ports {}  probes {}  workers {}\n",
+        report.targets, report.ports, report.jobs, report.workers
+    ));
+    output
+}
+
+fn service_label(result: &PortResult) -> String {
+    let Some(service) = &result.service else {
+        return String::new();
+    };
+
+    let mut label = service.name.clone();
+    if let Some(product) = &service.product {
+        label.push(' ');
+        label.push_str(product);
+    }
+    if let Some(version) = &service.version {
+        label.push('/');
+        label.push_str(version);
+    }
+    label.chars().take(30).collect()
+}
+
+fn format_summary(counts: StateCounts, elapsed: std::time::Duration) -> String {
+    format!(
+        "open {}  closed {}  filtered {}  silent {}  unreachable {}  error {}  elapsed {:.2}s\n",
+        counts.open,
+        counts.closed,
+        counts.filtered,
+        counts.silent,
+        counts.unreachable,
+        counts.error,
+        elapsed.as_secs_f64()
+    )
+}
+
+#[derive(Serialize)]
+struct JsonReport<'a> {
+    target: &'a str,
+    targets: usize,
+    ports: usize,
+    jobs: u64,
+    workers: usize,
+    open: Vec<JsonResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    results: Option<Vec<JsonResult>>,
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    os_fingerprints: HashMap<String, &'a OsGuess>,
+    summary: StateCounts,
+    elapsed_ms: f64,
+}
+
+#[derive(Serialize)]
+struct JsonResult {
+    host: String,
+    port: u16,
+    state: PortState,
+    latency_ms: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    banner: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    service: Option<ServiceInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    confidence: Option<f32>,
+}
+
+impl JsonResult {
+    fn from_result(result: &PortResult) -> Self {
+        Self {
+            host: result.host.to_string(),
+            port: result.port,
+            state: result.state,
+            latency_ms: (result.latency.as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0,
+            banner: result.banner.clone(),
+            service: result.service.clone(),
+            detail: result.detail.clone(),
+            confidence: result.confidence,
+        }
+    }
+}
+
+fn render_json(report: &ScanReport, target: &str, show: StateSet) -> Result<String, AppError> {
+    let mut opens: Vec<&PortResult> = report
+        .results
+        .iter()
+        .filter(|result| result.state == PortState::Open)
+        .collect();
+    opens.sort_by(|left, right| compare_results(left, right));
+
+    let include_results = PortState::ALL
+        .into_iter()
+        .any(|state| state != PortState::Open && show.contains(state));
+
+    let mut selected: Vec<&PortResult> = report
+        .results
+        .iter()
+        .filter(|result| show.contains(result.state))
+        .collect();
+    selected.sort_by(|left, right| compare_results(left, right));
+
+    let payload = JsonReport {
+        target,
+        targets: report.targets,
+        ports: report.ports,
+        jobs: report.jobs,
+        workers: report.workers,
+        open: opens.into_iter().map(JsonResult::from_result).collect(),
+        results: include_results
+            .then(|| selected.into_iter().map(JsonResult::from_result).collect()),
+        os_fingerprints: report
+            .os_fingerprints
+            .iter()
+            .map(|(ip, guess)| (ip.to_string(), guess))
+            .collect(),
+        summary: report.counts,
+        elapsed_ms: (report.elapsed.as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0,
+    };
+
+    let mut json = serde_json::to_string_pretty(&payload)
+        .map_err(|error| AppError::runtime(format!("cannot encode JSON: {error}")))?;
+    json.push('\n');
+    Ok(json)
+}
+
+fn render_jsonl(results: &[&PortResult]) -> Result<String, AppError> {
+    let mut output = String::new();
+    for result in results {
+        let item = JsonResult::from_result(result);
+        let line = serde_json::to_string(&item)
+            .map_err(|error| AppError::runtime(format!("cannot encode JSON line: {error}")))?;
+        output.push_str(&line);
+        output.push('\n');
+    }
+    Ok(output)
+}
+
+fn render_csv(results: &[&PortResult]) -> String {
+    let mut output = String::from(
+        "host,port,state,latency_ms,service,product,version,banner,detail,confidence\n",
+    );
+    for result in results {
+        let service = result.service.as_ref();
+        let detail = result.detail.as_deref().unwrap_or("");
+        let name = service.map(|service| service.name.as_str()).unwrap_or("");
+        let product = service
+            .and_then(|service| service.product.as_deref())
+            .unwrap_or("");
+        let version = service
+            .and_then(|service| service.version.as_deref())
+            .unwrap_or("");
+        let banner = result.banner.as_deref().unwrap_or("");
+        let confidence = result
+            .confidence
+            .map(|c| format!("{c:.3}"))
+            .unwrap_or_default();
+        output.push_str(&format!(
+            "{},{},{},{:.3},{},{},{},{},{},{}\n",
+            result.host,
+            result.port,
+            result.state.as_str(),
+            result.latency.as_secs_f64() * 1000.0,
+            csv_field(name),
+            csv_field(product),
+            csv_field(version),
+            csv_field(banner),
+            csv_field(detail),
+            confidence
+        ));
+    }
+    output
+}
+
+fn csv_field(value: &str) -> String {
+    if value.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_string()
+    }
+}
+
+/// Render Nmap-compatible XML output.
+///
+/// The format is compatible with nmap XML parsers (e.g. Metasploit, nmap-parse-output)
+/// and can be imported by any tool that understands nmap XML scan results.
+fn render_nmap_xml(report: &ScanReport, target: &str, results: &[&PortResult]) -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let start_secs = now_secs.saturating_sub(report.elapsed.as_secs());
+    let version = env!("CARGO_PKG_VERSION");
+
+    let mut xml = String::new();
+    xml.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+    xml.push_str("<!DOCTYPE nmaprun>\n");
+    xml.push_str(&format!(
+        "<nmaprun scanner=\"rayscan\" args=\"rayscan scan --target {target}\" \
+         start=\"{start_secs}\" version=\"{version}\" \
+         xmloutputversion=\"1.04\">\n"
+    ));
+
+    // Group results by host.
+    let mut by_host: std::collections::BTreeMap<String, Vec<&PortResult>> =
+        std::collections::BTreeMap::new();
+    for result in results {
+        by_host
+            .entry(result.host.to_string())
+            .or_default()
+            .push(result);
+    }
+
+    for (host_str, host_results) in &by_host {
+        let end_secs = now_secs;
+        xml.push_str(&format!(
+            "  <host starttime=\"{start_secs}\" endtime=\"{end_secs}\">\n"
+        ));
+
+        // Determine address type.
+        let addr_type = if host_str.contains(':') {
+            "ipv6"
+        } else {
+            "ipv4"
+        };
+        xml.push_str(&format!(
+            "    <address addr=\"{host_str}\" addrtype=\"{addr_type}\"/>\n"
+        ));
+
+        // OS fingerprint if available.
+        if let Ok(ip) = host_str.parse::<std::net::IpAddr>()
+            && let Some(os) = report.os_fingerprints.get(&ip)
+        {
+            let name = xml_escape(&os.detail);
+            xml.push_str("    <os>\n");
+            xml.push_str(&format!(
+                "      <osmatch name=\"{name}\" accuracy=\"{:.0}\"/>\n",
+                os.confidence * 100.0
+            ));
+            xml.push_str("    </os>\n");
+        }
+
+        xml.push_str("    <ports>\n");
+        for result in host_results {
+            let proto = "tcp";
+            let state_str = result.state.as_str();
+            let reason = match result.state {
+                PortState::Open => "syn-ack",
+                PortState::Closed => "rst",
+                PortState::Filtered => "no-response",
+                PortState::Silent => "no-response",
+                PortState::Unreachable => "host-unreach",
+                PortState::Error => "unknown",
+            };
+            xml.push_str(&format!(
+                "      <port protocol=\"{proto}\" portid=\"{}\">\n",
+                result.port
+            ));
+            xml.push_str(&format!(
+                "        <state state=\"{state_str}\" reason=\"{reason}\" reason_ttl=\"0\"/>\n"
+            ));
+            if let Some(svc) = &result.service {
+                let mut attrs = format!("name=\"{}\"", xml_escape(&svc.name));
+                if let Some(product) = &svc.product {
+                    attrs.push_str(&format!(" product=\"{}\"", xml_escape(product)));
+                }
+                if let Some(version) = &svc.version {
+                    attrs.push_str(&format!(" version=\"{}\"", xml_escape(version)));
+                }
+                xml.push_str(&format!("        <service {attrs}/>\n"));
+            }
+            xml.push_str("      </port>\n");
+        }
+        xml.push_str("    </ports>\n");
+        xml.push_str("  </host>\n");
+    }
+
+    let hosts_up = by_host.len();
+    let elapsed = report.elapsed.as_secs_f64();
+    let open_count = report.counts.open;
+    xml.push_str("  <runstats>\n");
+    xml.push_str(&format!(
+        "    <finished time=\"{now_secs}\" elapsed=\"{elapsed:.2}\" \
+         summary=\"rayscan done at {now_secs}; {open_count} open port(s)\"/>\n"
+    ));
+    xml.push_str(&format!(
+        "    <hosts up=\"{hosts_up}\" down=\"0\" total=\"{hosts_up}\"/>\n"
+    ));
+    xml.push_str("  </runstats>\n");
+    xml.push_str("</nmaprun>\n");
+    xml
+}
+
+/// Escape special XML characters in attribute values and text.
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+/// Render Nmap-compatible greppable output (-oG style).
+///
+/// Format: one line per host.
+/// `Host: <ip> ()  Ports: <port>/<state>/<proto>//<service>/<product>/,…`
+fn render_greppable(target: &str, results: &[&PortResult]) -> String {
+    let mut output = String::new();
+    output.push_str(&format!("# rayscan greppable output — target: {target}\n"));
+
+    // Group by host.
+    let mut by_host: std::collections::BTreeMap<String, Vec<&PortResult>> =
+        std::collections::BTreeMap::new();
+    for result in results {
+        by_host
+            .entry(result.host.to_string())
+            .or_default()
+            .push(result);
+    }
+
+    for (host_str, host_results) in &by_host {
+        let ports_field: Vec<String> = host_results
+            .iter()
+            .map(|r| {
+                let state = r.state.as_str();
+                let proto = "tcp";
+                let svc_name = r.service.as_ref().map(|s| s.name.as_str()).unwrap_or("");
+                let product = r
+                    .service
+                    .as_ref()
+                    .and_then(|s| s.product.as_deref())
+                    .unwrap_or("");
+                let version = r
+                    .service
+                    .as_ref()
+                    .and_then(|s| s.version.as_deref())
+                    .unwrap_or("");
+                let product_ver = if version.is_empty() {
+                    product.to_string()
+                } else {
+                    format!("{product} {version}")
+                };
+                format!("{}/{state}/{proto}//{svc_name}/{product_ver}/", r.port)
+            })
+            .collect();
+
+        output.push_str(&format!(
+            "Host: {host_str} ()\tPorts: {}\n",
+            ports_field.join(", ")
+        ));
+    }
+    output
+}
+
+fn write_destination(
+    destination: Option<&Path>,
+    contents: &str,
+    quiet: bool,
+) -> Result<(), AppError> {
+    let Some(path) = destination else {
+        let mut stdout = io::stdout().lock();
+        stdout
+            .write_all(contents.as_bytes())
+            .and_then(|_| stdout.flush())
+            .map_err(|error| AppError::runtime(format!("cannot write stdout: {error}")))?;
+        return Ok(());
+    };
+
+    if path.as_os_str() == "-" {
+        return write_destination(None, contents, quiet);
+    }
+
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            AppError::runtime(format!(
+                "cannot create output directory {}: {error}",
+                parent.display()
+            ))
+        })?;
+    }
+
+    std::fs::write(path, contents)
+        .map_err(|error| AppError::runtime(format!("cannot write {}: {error}", path.display())))?;
+
+    if !quiet {
+        eprintln!("wrote {}", path.display());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::IpAddr;
+    use std::time::Duration;
+
+    use super::*;
+    use crate::service::{Detection, ServiceInfo};
+
+    fn sample_report() -> ScanReport {
+        let host: IpAddr = "192.0.2.1".parse().unwrap();
+        let open = PortResult::new(host, 80, PortState::Open, Duration::from_millis(3))
+            .with_detection(Detection {
+                service: Some(ServiceInfo {
+                    name: "http".to_string(),
+                    product: Some("rayscan-lab".to_string()),
+                    version: None,
+                }),
+                banner: Some("HTTP/1.1 200 OK".to_string()),
+            });
+        ScanReport {
+            targets: 1,
+            ports: 3,
+            jobs: 3,
+            workers: 2,
+            elapsed: Duration::from_millis(250),
+            counts: StateCounts {
+                open: 1,
+                closed: 1,
+                filtered: 1,
+                ..StateCounts::default()
+            },
+            results: vec![
+                open,
+                PortResult::new(host, 81, PortState::Closed, Duration::from_millis(1)),
+                PortResult::new(host, 82, PortState::Filtered, Duration::from_millis(500)),
+            ],
+            os_fingerprints: std::collections::HashMap::new(),
+            probed_ports: vec![80, 81, 82],
+            partial: false,
+        }
+    }
+
+    #[test]
+    fn table_renders_rows_without_ansi_when_color_is_off() {
+        let report = sample_report();
+        let results: Vec<&PortResult> = report
+            .results
+            .iter()
+            .filter(|r| r.state == PortState::Open)
+            .collect();
+        let output = render_table(&report, &results, Theme::Minimal, false, false);
+        assert!(output.contains("HOST"));
+        assert!(output.contains("SERVICE"));
+        assert!(output.contains("192.0.2.1"));
+        assert!(output.contains("80"));
+        assert!(output.contains("open"));
+        assert!(output.contains("http"));
+        assert!(
+            !output.contains("\u{1b}["),
+            "plain table must not contain ANSI"
+        );
+    }
+
+    #[test]
+    fn dynamic_table_keeps_header_labels_intact() {
+        let report = sample_report();
+        let results: Vec<&PortResult> = report.results.iter().collect();
+        let output = render_table(&report, &results, Theme::Minimal, false, true);
+        assert!(output.contains("HOST"));
+        assert!(output.contains("SERVICE"));
+        assert!(output.contains("LATENCY_MS"));
+    }
+
+    #[test]
+    fn json_contains_open_and_optional_results() {
+        let report = sample_report();
+        let output = render_json(&report, "192.0.2.1", StateSet::all()).unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(payload["open"][0]["port"], 80);
+        assert_eq!(payload["open"][0]["service"]["name"], "http");
+        assert_eq!(payload["open"][0]["service"]["product"], "rayscan-lab");
+        assert_eq!(payload["open"][0]["banner"], "HTTP/1.1 200 OK");
+        assert_eq!(payload["results"].as_array().unwrap().len(), 3);
+        assert_eq!(payload["summary"]["filtered"], 1);
+    }
+
+    #[test]
+    fn default_json_omits_non_open_results() {
+        let report = sample_report();
+        let output = render_json(&report, "192.0.2.1", StateSet::open()).unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert!(payload.get("results").is_none());
+    }
+
+    #[test]
+    fn csv_quotes_details() {
+        let report = sample_report();
+        let mut results: Vec<&PortResult> = report.results.iter().collect();
+        let closed = PortResult::new(
+            "192.0.2.1".parse().unwrap(),
+            81,
+            PortState::Closed,
+            Duration::from_millis(1),
+        )
+        .with_detail("refused, then reset");
+        results[1] = &closed;
+        let output = render_csv(&results);
+        assert!(
+            output.contains("host,port,state,latency_ms,service,product,version,banner,detail")
+        );
+        assert!(output.contains("http,rayscan-lab"));
+        assert!(output.contains("\"refused, then reset\""));
+    }
+
+    #[test]
+    fn nmap_xml_contains_host_and_port() {
+        let report = sample_report();
+        let results: Vec<&PortResult> = report
+            .results
+            .iter()
+            .filter(|r| r.state == PortState::Open)
+            .collect();
+        let xml = render_nmap_xml(&report, "192.0.2.1", &results);
+        assert!(xml.contains("<nmaprun"), "must have nmaprun element");
+        assert!(xml.contains("addr=\"192.0.2.1\""), "must contain host addr");
+        assert!(xml.contains("portid=\"80\""), "must contain port 80");
+        assert!(xml.contains("state=\"open\""), "must mark port as open");
+        assert!(xml.contains("name=\"http\""), "must include service name");
+        assert!(xml.contains("</nmaprun>"), "must be closed");
+    }
+
+    #[test]
+    fn nmap_xml_omits_absent_version_attribute() {
+        let mut report = sample_report();
+        if let Some(service) = report.results[0].service.as_mut() {
+            service.version = None;
+        }
+        let results: Vec<&PortResult> = report
+            .results
+            .iter()
+            .filter(|r| r.state == PortState::Open)
+            .collect();
+        let xml = render_nmap_xml(&report, "192.0.2.1", &results);
+        assert!(xml.contains("name=\"http\""));
+        assert!(
+            !xml.contains("version=\"\""),
+            "empty version must be omitted"
+        );
+    }
+
+    #[test]
+    fn greppable_format_one_line_per_host() {
+        let report = sample_report();
+        let results: Vec<&PortResult> = report
+            .results
+            .iter()
+            .filter(|r| r.state == PortState::Open)
+            .collect();
+        let output = render_greppable("192.0.2.1", &results);
+        // Should have a Host: line
+        assert!(output.contains("Host: 192.0.2.1"), "must contain host line");
+        assert!(output.contains("80/open/tcp"), "must contain port entry");
+        assert!(output.contains("http"), "must include service name");
+    }
+}
