@@ -3,16 +3,17 @@ use std::fmt;
 use std::net::IpAddr;
 use std::time::Duration;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::fingerprint::OsGuess;
 use crate::service::{Detection, ServiceInfo};
 
 /// The result of probing one TCP port.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum PortState {
     Open,
+    #[default]
     Closed,
     Filtered,
     Silent,

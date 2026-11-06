@@ -91,7 +91,11 @@ pub fn analyze_defenses(report: &ScanReport) -> HashMap<IpAddr, HostDefenseAsses
     assessments
 }
 
-fn assess_host(host: IpAddr, results: &[&PortResult], report: &ScanReport) -> HostDefenseAssessment {
+fn assess_host(
+    host: IpAddr,
+    results: &[&PortResult],
+    report: &ScanReport,
+) -> HostDefenseAssessment {
     let mut open_count = 0usize;
     let mut silent_count = 0usize;
     let mut reclassified_closed = 0usize;
@@ -110,7 +114,8 @@ fn assess_host(host: IpAddr, results: &[&PortResult], report: &ScanReport) -> Ho
             }
             PortState::Closed
                 if r.detail.as_deref().is_some_and(|detail| {
-                    detail.contains("connection closed during verification") || detail.contains("anomaly:")
+                    detail.contains("connection closed during verification")
+                        || detail.contains("anomaly:")
                 }) =>
             {
                 reclassified_closed += 1;
@@ -157,7 +162,10 @@ fn assess_host(host: IpAddr, results: &[&PortResult], report: &ScanReport) -> Ho
 
     // Check 4: Rate-limiting detection
     // Probes that required retries or were marked with low retry confidence
-    let retried_count = results.iter().filter(|r| r.confidence.unwrap_or(1.0) < 0.85).count();
+    let retried_count = results
+        .iter()
+        .filter(|r| r.confidence.unwrap_or(1.0) < 0.85)
+        .count();
     if retried_count >= 4 {
         is_rate_limited = true;
         indicators.push(format!(
@@ -191,8 +199,12 @@ fn assess_host(host: IpAddr, results: &[&PortResult], report: &ScanReport) -> Ho
         (
             DefenseType::RateLimiting,
             0.80,
-            "Target network enforces probe rate-limiting or token-bucket traffic policing.".to_string(),
-            Some("Use `--rate 50` or `--profile careful` to stay below packet drop thresholds.".to_string()),
+            "Target network enforces probe rate-limiting or token-bucket traffic policing."
+                .to_string(),
+            Some(
+                "Use `--rate 50` or `--profile careful` to stay below packet drop thresholds."
+                    .to_string(),
+            ),
         )
     } else {
         let os_evidence = report
@@ -225,8 +237,8 @@ fn assess_host(host: IpAddr, results: &[&PortResult], report: &ScanReport) -> Ho
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
     use crate::service::ServiceInfo;
+    use std::time::Duration;
 
     #[test]
     fn direct_clean_host_is_classified_as_direct() {

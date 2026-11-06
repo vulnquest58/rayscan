@@ -52,6 +52,7 @@ pub struct EmitOptions<'a> {
     pub min_confidence: Option<u8>,
     pub explain: Option<u16>,
     pub defense: bool,
+    pub diff: Option<&'a crate::diff::ScanDiff>,
 }
 
 pub fn emit(report: &ScanReport, target: &str, options: EmitOptions<'_>) -> Result<(), AppError> {
@@ -78,13 +79,23 @@ pub fn emit(report: &ScanReport, target: &str, options: EmitOptions<'_>) -> Resu
         OutputFormat::Table => render_table(
             report,
             &selected,
-            options.theme,
-            color_enabled(options.theme, stdout_is_tty) && options.destination.is_none(),
-            stdout_is_tty,
-            options.explain,
-            options.defense,
+            TableOptions {
+                theme: options.theme,
+                use_color: color_enabled(options.theme, stdout_is_tty)
+                    && options.destination.is_none(),
+                dynamic_width: stdout_is_tty,
+                explain: options.explain,
+                defense: options.defense,
+                diff: options.diff,
+            },
         ),
-        OutputFormat::Json => render_json(report, target, options.show, options.min_confidence)?,
+        OutputFormat::Json => render_json(
+            report,
+            target,
+            options.show,
+            options.min_confidence,
+            options.diff,
+        )?,
         OutputFormat::Jsonl => render_jsonl(&selected)?,
         OutputFormat::Csv => render_csv(&selected),
         OutputFormat::NmapXml => render_nmap_xml(report, target, &selected),
@@ -189,6 +200,12 @@ pub fn emit(report: &ScanReport, target: &str, options: EmitOptions<'_>) -> Resu
             }
             println!();
         }
+        if let Some(diff) = options.diff {
+            print!(
+                "{}",
+                diff.render_terminal(color_enabled(options.theme, stdout_is_tty))
+            );
+        }
         print!("{}", format_summary(report.counts, report.elapsed));
         println!(
             "  targets {}  ports {}  probes {}  workers {}",
@@ -206,20 +223,22 @@ fn compare_results(left: &PortResult, right: &PortResult) -> std::cmp::Ordering 
         .then_with(|| left.port.cmp(&right.port))
 }
 
-fn render_table(
-    report: &ScanReport,
-    results: &[&PortResult],
-    theme: Theme,
-    use_color: bool,
-    dynamic_width: bool,
-    explain: Option<u16>,
-    defense: bool,
-) -> String {
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TableOptions<'a> {
+    pub theme: Theme,
+    pub use_color: bool,
+    pub dynamic_width: bool,
+    pub explain: Option<u16>,
+    pub defense: bool,
+    pub diff: Option<&'a crate::diff::ScanDiff>,
+}
+
+fn render_table(report: &ScanReport, results: &[&PortResult], opts: TableOptions<'_>) -> String {
     let has_os = !report.os_fingerprints.is_empty();
 
     let mut table = Table::new();
-    table.load_preset(theme.table_preset());
-    if !dynamic_width {
+    table.load_preset(opts.theme.table_preset());
+    if !opts.dynamic_width {
         table.force_no_tty();
     } else {
         table.set_content_arrangement(ContentArrangement::Dynamic);
@@ -227,8 +246,8 @@ fn render_table(
 
     let header = |label: &str| {
         let cell = Cell::new(label);
-        if use_color {
-            cell.fg(theme.accent()).add_attribute(Attribute::Bold)
+        if opts.use_color {
+            cell.fg(opts.theme.accent()).add_attribute(Attribute::Bold)
         } else {
             cell
         }
@@ -259,15 +278,15 @@ fn render_table(
     table.set_constraints(constraints);
 
     for result in results {
-        let state_cell = match theme.state(result.state) {
-            Some(color) if use_color => Cell::new(result.state.as_str()).fg(color),
+        let state_cell = match opts.theme.state(result.state) {
+            Some(color) if opts.use_color => Cell::new(result.state.as_str()).fg(color),
             _ => Cell::new(result.state.as_str()),
         };
         let conf_str = match result.confidence {
             Some(conf) => format!("{:.0}%", conf * 100.0),
             None => "-".to_string(),
         };
-        let conf_cell = if use_color {
+        let conf_cell = if opts.use_color {
             if let Some(conf) = result.confidence {
                 if conf >= 0.80 {
                     Cell::new(conf_str).fg(comfy_table::Color::Green)
@@ -330,7 +349,7 @@ fn render_table(
     let has_non_direct = defenses
         .values()
         .any(|d| d.defense_type != crate::defense::DefenseType::DirectHost);
-    if defense || has_non_direct {
+    if opts.defense || has_non_direct {
         output.push_str("\nDefense & Middlebox Intelligence:\n");
         output.push_str(&"─".repeat(70));
         output.push('\n');
@@ -356,7 +375,7 @@ fn render_table(
         }
     }
 
-    if let Some(exp_port) = explain {
+    if let Some(exp_port) = opts.explain {
         output.push_str("\nAccuracy & Evidence Explanations:\n");
         output.push_str(&"─".repeat(70));
         output.push('\n');
@@ -388,6 +407,10 @@ fn render_table(
                 output.push('\n');
             }
         }
+    }
+
+    if let Some(diff) = opts.diff {
+        output.push_str(&diff.render_terminal(opts.use_color));
     }
 
     output.push('\n');
@@ -550,6 +573,8 @@ struct JsonReport<'a> {
     os_fingerprints: HashMap<String, &'a OsGuess>,
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     defense: HashMap<String, crate::defense::HostDefenseAssessment>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diff: Option<&'a crate::diff::ScanDiff>,
     summary: StateCounts,
     elapsed_ms: f64,
 }
@@ -593,6 +618,7 @@ fn render_json(
     target: &str,
     show: StateSet,
     min_confidence: Option<u8>,
+    diff: Option<&crate::diff::ScanDiff>,
 ) -> Result<String, AppError> {
     let min_conf_ratio = min_confidence.map(|c| (c as f32) / 100.0);
     let mut opens: Vec<&PortResult> = report
@@ -651,6 +677,7 @@ fn render_json(
             .into_iter()
             .map(|(ip, d)| (ip.to_string(), d))
             .collect(),
+        diff,
         summary: report.counts,
         elapsed_ms: (report.elapsed.as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0,
     };
@@ -978,7 +1005,14 @@ mod tests {
             .iter()
             .filter(|r| r.state == PortState::Open)
             .collect();
-        let output = render_table(&report, &results, Theme::Minimal, false, false, None, false);
+        let output = render_table(
+            &report,
+            &results,
+            TableOptions {
+                theme: Theme::Minimal,
+                ..Default::default()
+            },
+        );
         assert!(output.contains("HOST"));
         assert!(output.contains("CONFIDENCE"));
         assert!(output.contains("SERVICE"));
@@ -996,7 +1030,15 @@ mod tests {
     fn dynamic_table_keeps_header_labels_intact() {
         let report = sample_report();
         let results: Vec<&PortResult> = report.results.iter().collect();
-        let output = render_table(&report, &results, Theme::Minimal, false, true, None, false);
+        let output = render_table(
+            &report,
+            &results,
+            TableOptions {
+                theme: Theme::Minimal,
+                dynamic_width: true,
+                ..Default::default()
+            },
+        );
         assert!(output.contains("HOST"));
         assert!(output.contains("CONFIDENCE"));
         assert!(output.contains("SERVICE"));
@@ -1011,11 +1053,11 @@ mod tests {
         let output = render_table(
             &report,
             &results,
-            Theme::Minimal,
-            false,
-            false,
-            Some(80),
-            false,
+            TableOptions {
+                theme: Theme::Minimal,
+                explain: Some(80),
+                ..Default::default()
+            },
         );
         assert!(output.contains("Accuracy & Evidence Explanations:"));
         assert!(output.contains("Port 80/tcp on 192.0.2.1"));
@@ -1028,7 +1070,15 @@ mod tests {
         let mut report = sample_report();
         crate::accuracy::score_report(&mut report);
         let results: Vec<&PortResult> = report.results.iter().collect();
-        let output = render_table(&report, &results, Theme::Minimal, false, false, None, true);
+        let output = render_table(
+            &report,
+            &results,
+            TableOptions {
+                theme: Theme::Minimal,
+                defense: true,
+                ..Default::default()
+            },
+        );
         assert!(output.contains("Defense & Middlebox Intelligence:"));
         assert!(output.contains("Target 192.0.2.1:"));
         assert!(output.contains("Posture:"));
@@ -1038,7 +1088,7 @@ mod tests {
     fn json_contains_open_and_optional_results() {
         let mut report = sample_report();
         crate::accuracy::score_report(&mut report);
-        let output = render_json(&report, "192.0.2.1", StateSet::all(), None).unwrap();
+        let output = render_json(&report, "192.0.2.1", StateSet::all(), None, None).unwrap();
         let payload: serde_json::Value = serde_json::from_str(&output).unwrap();
         assert_eq!(payload["open"][0]["port"], 80);
         assert_eq!(payload["open"][0]["service"]["name"], "http");
@@ -1055,12 +1105,14 @@ mod tests {
         let mut report = sample_report();
         crate::accuracy::score_report(&mut report);
         // Port 80 should have high confidence (>80%)
-        let output_high = render_json(&report, "192.0.2.1", StateSet::open(), Some(80)).unwrap();
+        let output_high =
+            render_json(&report, "192.0.2.1", StateSet::open(), Some(80), None).unwrap();
         let payload_high: serde_json::Value = serde_json::from_str(&output_high).unwrap();
         assert_eq!(payload_high["open"].as_array().unwrap().len(), 1);
 
         // Filter requiring 101% (impossible)
-        let output_none = render_json(&report, "192.0.2.1", StateSet::open(), Some(101)).unwrap();
+        let output_none =
+            render_json(&report, "192.0.2.1", StateSet::open(), Some(101), None).unwrap();
         let payload_none: serde_json::Value = serde_json::from_str(&output_none).unwrap();
         assert_eq!(payload_none["open"].as_array().unwrap().len(), 0);
     }
@@ -1068,7 +1120,7 @@ mod tests {
     #[test]
     fn default_json_omits_non_open_results() {
         let report = sample_report();
-        let output = render_json(&report, "192.0.2.1", StateSet::open(), None).unwrap();
+        let output = render_json(&report, "192.0.2.1", StateSet::open(), None, None).unwrap();
         let payload: serde_json::Value = serde_json::from_str(&output).unwrap();
         assert!(payload.get("results").is_none());
     }

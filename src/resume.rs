@@ -264,6 +264,99 @@ pub fn restore_results(state: &ScanState) -> (Vec<PortResult>, StateCounts) {
     (results, counts)
 }
 
+/// Detailed gap analysis audit produced when resuming an interrupted scan.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ResumeGapAudit {
+    pub target_label: String,
+    pub original_spec: String,
+    pub total_scope_ports: usize,
+    pub completed_ports: usize,
+    pub remaining_ports: usize,
+    pub completion_pct: f32,
+    pub prior_open: u64,
+    pub prior_closed: u64,
+    pub prior_filtered: u64,
+    pub prior_silent: u64,
+    pub anomaly_note: Option<String>,
+}
+
+impl ResumeGapAudit {
+    pub fn build(state: &ScanState, all_ports: &[u16]) -> Self {
+        let total_scope_ports = all_ports.len();
+        let completed_ports = state.ports_scanned.len().min(total_scope_ports);
+        let remaining_ports = total_scope_ports.saturating_sub(completed_ports);
+        let completion_pct = if total_scope_ports > 0 {
+            (completed_ports as f32 / total_scope_ports as f32) * 100.0
+        } else {
+            100.0
+        };
+
+        // Anomaly / defense check from prior scan
+        let anomaly_note = if state.counts.silent >= 5 {
+            Some(format!(
+                "⚠️ {} silent ports detected in prior scan (target likely running TCP tarpit)",
+                state.counts.silent
+            ))
+        } else if state.counts.filtered > state.counts.closed && state.counts.filtered > 50 {
+            Some(format!(
+                "⚠️ High filtered ratio ({} filtered vs {} closed) suggests firewall rate drops",
+                state.counts.filtered, state.counts.closed
+            ))
+        } else {
+            None
+        };
+
+        Self {
+            target_label: state.target_label.clone(),
+            original_spec: state.ports_spec.clone(),
+            total_scope_ports,
+            completed_ports,
+            remaining_ports,
+            completion_pct,
+            prior_open: state.counts.open,
+            prior_closed: state.counts.closed,
+            prior_filtered: state.counts.filtered,
+            prior_silent: state.counts.silent,
+            anomaly_note,
+        }
+    }
+
+    pub fn format_terminal(&self, use_color: bool) -> String {
+        let mut out = String::new();
+        out.push_str("\nResume Gap Analysis Audit:\n");
+        out.push_str(&"─".repeat(70));
+        out.push('\n');
+        out.push_str(&format!("Target Scope:        {}\n", self.target_label));
+        out.push_str(&format!("Port Specification:  {}\n", self.original_spec));
+        out.push_str(&format!(
+            "Progress:            {}/{} ports completed ({:.1}%)\n",
+            self.completed_ports, self.total_scope_ports, self.completion_pct
+        ));
+        out.push_str(&format!(
+            "Remaining Gaps:      {} ports to scan\n",
+            self.remaining_ports
+        ));
+        out.push_str(&format!(
+            "Prior Findings:      {} open, {} closed, {} filtered, {} silent\n",
+            self.prior_open, self.prior_closed, self.prior_filtered, self.prior_silent
+        ));
+        let anomaly_str = match &self.anomaly_note {
+            Some(note) => {
+                if use_color {
+                    format!("\x1b[1;33m{}\x1b[0m", note)
+                } else {
+                    note.clone()
+                }
+            }
+            None => "Clean (No host anomaly threshold triggered)".to_string(),
+        };
+        out.push_str(&format!("Host Anomaly Check:  {}\n", anomaly_str));
+        out.push_str(&"─".repeat(70));
+        out.push('\n');
+        out
+    }
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /// Return current UTC time in ISO-8601 format without depending on `chrono`.

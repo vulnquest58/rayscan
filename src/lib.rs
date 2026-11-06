@@ -4,6 +4,7 @@ pub mod classify;
 pub mod cli;
 pub mod config;
 pub mod defense;
+pub mod diff;
 pub mod doctor;
 pub mod error;
 pub mod fingerprint;
@@ -78,20 +79,16 @@ pub(crate) async fn run_scan(args: ScanArgs, theme: Option<Theme>) -> Result<(),
     let (prior_results, prior_counts, prior_scanned, mut ports) =
         if let Some(state) = resume_state.as_ref() {
             if !args.quiet {
-                eprintln!(
-                    "[resume] loaded {} previously scanned port(s) from {}",
-                    state.ports_scanned.len(),
-                    resolved
-                        .resume_file
-                        .as_ref()
-                        .map(|path| path.display().to_string())
-                        .unwrap_or_default()
+                let audit = resume::ResumeGapAudit::build(state, &all_ports);
+                eprint!(
+                    "{}",
+                    audit.format_terminal(color_enabled(
+                        resolved.theme,
+                        std::io::stderr().is_terminal()
+                    ))
                 );
             }
             let remaining = resume::remaining_ports(&all_ports, &state.ports_scanned);
-            if !args.quiet {
-                eprintln!("[resume] {} port(s) remaining to scan", remaining.len());
-            }
             let (results, counts) = resume::restore_results(state);
             (results, counts, state.ports_scanned.clone(), remaining)
         } else {
@@ -125,6 +122,25 @@ pub(crate) async fn run_scan(args: ScanArgs, theme: Option<Theme>) -> Result<(),
             partial: false,
         };
         accuracy::score_report(&mut report);
+        let diff_report = if let Some(ref diff_path) = resolved.diff_file {
+            match diff::load_baseline(diff_path) {
+                Ok(baseline) => {
+                    let diff_res = diff::ScanDiff::compute(
+                        &diff_path.display().to_string(),
+                        &args.target_label(),
+                        &baseline,
+                        &report,
+                    );
+                    Some(diff_res)
+                }
+                Err(e) => {
+                    eprintln!("[rayscan] warning: failed to load baseline diff file: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         return output::emit(
             &report,
             &args.target_label(),
@@ -138,6 +154,7 @@ pub(crate) async fn run_scan(args: ScanArgs, theme: Option<Theme>) -> Result<(),
                 min_confidence: resolved.min_confidence,
                 explain: resolved.explain,
                 defense: resolved.defense,
+                diff: diff_report.as_ref(),
             },
         );
     }
@@ -512,6 +529,26 @@ pub(crate) async fn run_scan(args: ScanArgs, theme: Option<Theme>) -> Result<(),
 
     accuracy::score_report(&mut report);
 
+    let diff_report = if let Some(ref diff_path) = resolved.diff_file {
+        match diff::load_baseline(diff_path) {
+            Ok(baseline) => {
+                let diff_res = diff::ScanDiff::compute(
+                    &diff_path.display().to_string(),
+                    &target_label,
+                    &baseline,
+                    &report,
+                );
+                Some(diff_res)
+            }
+            Err(e) => {
+                eprintln!("[rayscan] warning: failed to load baseline diff file: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     output::emit(
         &report,
         &target_label,
@@ -525,6 +562,7 @@ pub(crate) async fn run_scan(args: ScanArgs, theme: Option<Theme>) -> Result<(),
             min_confidence: resolved.min_confidence,
             explain: resolved.explain,
             defense: resolved.defense,
+            diff: diff_report.as_ref(),
         },
     )
 }

@@ -135,6 +135,7 @@ pub async fn run(theme: Option<Theme>) -> Result<(), AppError> {
         min_confidence: None,
         explain: None,
         defense: false,
+        diff: None,
     };
 
     let start = Confirm::new("Start scan?")

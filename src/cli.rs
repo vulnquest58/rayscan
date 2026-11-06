@@ -240,6 +240,10 @@ pub struct ScanArgs {
     /// Always display detailed defense and middlebox intelligence assessment.
     #[arg(long)]
     pub defense: bool,
+
+    /// Compare scan results against a previous scan JSON report or state file to detect changes.
+    #[arg(long, visible_alias = "compare-to", value_name = "FILE")]
+    pub diff: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -282,6 +286,8 @@ pub struct ResolvedConfig {
     pub explain: Option<u16>,
     /// Display defense and middlebox intelligence assessment.
     pub defense: bool,
+    /// Path to baseline report file to compute diff against.
+    pub diff_file: Option<PathBuf>,
 }
 
 impl ScanArgs {
@@ -426,6 +432,7 @@ impl ScanArgs {
             min_confidence: self.min_confidence,
             explain: self.explain,
             defense: self.defense,
+            diff_file: self.diff.clone(),
         })
     }
 
@@ -512,6 +519,7 @@ mod tests {
             min_confidence: None,
             explain: None,
             defense: false,
+            diff: None,
         }
     }
 
