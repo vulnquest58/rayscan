@@ -73,7 +73,7 @@ pub(crate) async fn run_scan(args: ScanArgs, theme: Option<Theme>) -> Result<(),
     }
 
     // ── Phase 6: Resume — load previous state and compute remaining ports ────
-    let (prior_results, prior_counts, prior_scanned, ports) =
+    let (prior_results, prior_counts, prior_scanned, mut ports) =
         if let Some(state) = resume_state.as_ref() {
             if !args.quiet {
                 eprintln!(
@@ -101,6 +101,10 @@ pub(crate) async fn run_scan(args: ScanArgs, theme: Option<Theme>) -> Result<(),
             )
         };
 
+    if resolved.top_ports_first {
+        crate::ports::prioritize_ports(&mut ports);
+    }
+
     if ports.is_empty() && resolved.resume_file.is_some() {
         if !args.quiet {
             eprintln!("[resume] all ports already scanned — outputting saved results");
@@ -126,6 +130,7 @@ pub(crate) async fn run_scan(args: ScanArgs, theme: Option<Theme>) -> Result<(),
             args.output.as_deref(),
             args.quiet,
             resolved.theme,
+            false,
         );
     }
 
@@ -133,6 +138,19 @@ pub(crate) async fn run_scan(args: ScanArgs, theme: Option<Theme>) -> Result<(),
         .checked_mul(ports.len() as u64)
         .ok_or_else(|| AppError::usage("target/port combination count overflowed"))?;
     let target_label = args.target_label();
+    let profile_name = args.profile.map(|p| p.as_str()).unwrap_or("balanced");
+    let scan_mode = if resolved.syn_mode {
+        if resolved.connect_only {
+            "SYN (raw)"
+        } else {
+            "SYN+Verify"
+        }
+    } else if resolved.connect_only {
+        "Connect (raw)"
+    } else {
+        "Connect+Verify"
+    };
+
     // State files capture every probed outcome so an interrupted scan can be
     // resumed without losing silent/filtered ports.  Display filtering still
     // happens later in `output::emit`.
@@ -141,7 +159,14 @@ pub(crate) async fn run_scan(args: ScanArgs, theme: Option<Theme>) -> Result<(),
     } else {
         resolved.show.union(StateSet::open())
     };
-    let progress = make_progress(jobs, args.quiet, resolved.theme);
+    let progress = make_progress(
+        jobs,
+        args.quiet,
+        resolved.theme,
+        &target_label,
+        profile_name,
+        scan_mode,
+    );
 
     // ── Phase 6: Graceful Ctrl-C signal handling ─────────────────────────────
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -153,33 +178,71 @@ pub(crate) async fn run_scan(args: ScanArgs, theme: Option<Theme>) -> Result<(),
         }
     });
 
+    let live_table_enabled = resolved.live_table
+        && std::io::stdout().is_terminal()
+        && !args.quiet
+        && resolved.format == output::OutputFormat::Table
+        && args.output.is_none();
+
+    let live_streamed = Arc::new(AtomicBool::new(false));
+    let live_streamed_ref = Arc::clone(&live_streamed);
+
     let callback: Option<ProgressCallback> = progress.as_ref().map(|bar| {
         let bar = bar.clone();
         let opens = Arc::new(AtomicU64::new(0));
+        let closed = Arc::new(AtomicU64::new(0));
+        let filtered = Arc::new(AtomicU64::new(0));
         let silent = Arc::new(AtomicU64::new(0));
+        let header_printed = Arc::new(AtomicBool::new(false));
+        let stdout_is_tty = std::io::stdout().is_terminal();
+        let show = resolved.show;
+        let theme = resolved.theme;
+        let use_color = color_enabled(theme, stdout_is_tty);
+
         Arc::new(move |event: ProgressEvent| {
             bar.inc(1);
-            let stateful = event.state.is_some();
-            match event.state {
-                Some(crate::model::PortState::Open) => {
-                    opens.fetch_add(1, Ordering::Relaxed);
+            if let Some(state) = event.state {
+                match state {
+                    crate::model::PortState::Open => {
+                        opens.fetch_add(1, Ordering::Relaxed);
+                    }
+                    crate::model::PortState::Closed => {
+                        closed.fetch_add(1, Ordering::Relaxed);
+                    }
+                    crate::model::PortState::Filtered => {
+                        filtered.fetch_add(1, Ordering::Relaxed);
+                    }
+                    crate::model::PortState::Silent => {
+                        silent.fetch_add(1, Ordering::Relaxed);
+                    }
+                    _ => {}
                 }
-                Some(crate::model::PortState::Silent) => {
-                    silent.fetch_add(1, Ordering::Relaxed);
-                }
-                _ => {}
             }
-            let position = bar.position();
-            if position % 64 == 0 || position == jobs {
-                if stateful {
-                    bar.set_message(format!(
-                        "open {}  silent {}",
-                        opens.load(Ordering::Relaxed),
-                        silent.load(Ordering::Relaxed)
-                    ));
-                } else {
-                    bar.set_message("discovering");
+
+            if live_table_enabled
+                && let Some(result) = &event.result
+                && show.contains(result.state)
+            {
+                if !header_printed.swap(true, Ordering::Relaxed) {
+                    bar.println(output::format_live_header(theme, use_color));
+                    bar.println(output::format_live_divider(use_color));
+                    live_streamed_ref.store(true, Ordering::Relaxed);
                 }
+                bar.println(output::format_live_row(result, theme, use_color));
+            }
+
+            let position = bar.position();
+            if position % 16 == 0
+                || position == jobs
+                || event.state == Some(crate::model::PortState::Open)
+            {
+                bar.set_message(format!(
+                    "Open: {}  Closed: {}  Filtered: {}  Silent: {}",
+                    opens.load(Ordering::Relaxed),
+                    closed.load(Ordering::Relaxed),
+                    filtered.load(Ordering::Relaxed),
+                    silent.load(Ordering::Relaxed)
+                ));
             }
         }) as ProgressCallback
     });
@@ -373,12 +436,18 @@ pub(crate) async fn run_scan(args: ScanArgs, theme: Option<Theme>) -> Result<(),
                 fingerprint::probe_fingerprint_async(host, port, probe_timeout).await
             {
                 if !args.quiet {
+                    let ev = guess
+                        .evidence
+                        .as_deref()
+                        .map(|e| format!(" | Evidence: {e}"))
+                        .unwrap_or_default();
                     eprintln!(
-                        "[os] {} → {} ({}) confidence={:.0}%",
+                        "[os] {} → {} ({}) confidence={:.0}%{}",
                         host,
                         guess.detail,
                         guess.family,
-                        guess.confidence * 100.0
+                        guess.confidence * 100.0,
+                        ev
                     );
                 }
                 os_map.insert(host, guess);
@@ -437,25 +506,39 @@ pub(crate) async fn run_scan(args: ScanArgs, theme: Option<Theme>) -> Result<(),
         args.output.as_deref(),
         args.quiet,
         resolved.theme,
+        live_streamed.load(Ordering::Relaxed),
     )
 }
 
-fn make_progress(jobs: u64, quiet: bool, theme: Theme) -> Option<ProgressBar> {
+fn make_progress(
+    jobs: u64,
+    quiet: bool,
+    theme: Theme,
+    target_label: &str,
+    profile_name: &str,
+    scan_mode: &str,
+) -> Option<ProgressBar> {
     let stderr_is_tty = std::io::stderr().is_terminal();
     if quiet || !stderr_is_tty {
         return None;
     }
 
     let bar = ProgressBar::new(jobs);
-    let theme = if color_enabled(theme, stderr_is_tty) {
+    let active_theme = if color_enabled(theme, stderr_is_tty) {
         theme
     } else {
         Theme::Minimal
     };
-    let style = ProgressStyle::with_template(theme.progress_template())
+    let style = ProgressStyle::with_template(active_theme.progress_template())
         .unwrap_or_else(|_| ProgressStyle::default_bar())
         .progress_chars("=>-");
     bar.set_style(style);
-    bar.set_message("starting");
+    bar.set_message("Open: 0  Closed: 0  Filtered: 0  Silent: 0");
+    if !quiet && stderr_is_tty {
+        eprintln!(
+            "Scanning {}  |  Profile: {}  |  Mode: {}",
+            target_label, profile_name, scan_mode
+        );
+    }
     Some(bar)
 }

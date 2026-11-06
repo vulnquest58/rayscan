@@ -12,6 +12,7 @@ pub enum Theme {
     Light,
     Hacker,
     Minimal,
+    Cyber,
 }
 
 impl Theme {
@@ -21,6 +22,7 @@ impl Theme {
             Self::Light => "light",
             Self::Hacker => "hacker",
             Self::Minimal => "minimal",
+            Self::Cyber => "cyber",
         }
     }
 
@@ -30,6 +32,7 @@ impl Theme {
             Self::Light => Color::Blue,
             Self::Hacker => Color::Green,
             Self::Minimal => Color::Reset,
+            Self::Cyber => Color::Magenta,
         }
     }
 
@@ -41,6 +44,12 @@ impl Theme {
             (Self::Hacker, PortState::Open) => Color::Green,
             (Self::Hacker, PortState::Closed) => Color::DarkGreen,
             (Self::Hacker, _) => Color::DarkGrey,
+            (Self::Cyber, PortState::Open) => Color::Cyan,
+            (Self::Cyber, PortState::Closed) => Color::Magenta,
+            (Self::Cyber, PortState::Filtered) => Color::Blue,
+            (Self::Cyber, PortState::Silent) => Color::DarkGrey,
+            (Self::Cyber, PortState::Unreachable) => Color::DarkMagenta,
+            (Self::Cyber, PortState::Error) => Color::Red,
             (Self::Light, PortState::Open) => Color::DarkGreen,
             (Self::Light, PortState::Closed) => Color::DarkRed,
             (Self::Light, PortState::Filtered) => Color::DarkYellow,
@@ -65,15 +74,18 @@ impl Theme {
     pub const fn progress_template(self) -> &'static str {
         match self {
             Self::Dark => {
-                "{spinner:.cyan} {bar:40.cyan/blue} {pos}/{len} {per_sec} ETA {eta} | {msg}"
+                "{spinner:.cyan} [{bar:24.cyan/blue}] {percent:>3}% {pos}/{len} | {per_sec} | ETA {eta} | {msg}"
+            }
+            Self::Cyber => {
+                "{spinner:.magenta} [{bar:24.magenta/cyan}] {percent:>3}% {pos}/{len} | {per_sec} | ETA {eta} | {msg}"
             }
             Self::Light => {
-                "{spinner:.blue} {bar:40.blue/white} {pos}/{len} {per_sec} ETA {eta} | {msg}"
+                "{spinner:.blue} [{bar:24.blue/white}] {percent:>3}% {pos}/{len} | {per_sec} | ETA {eta} | {msg}"
             }
             Self::Hacker => {
-                "{spinner:.green} {bar:40.green/black} {pos}/{len} {per_sec} ETA {eta} | {msg}"
+                "{spinner:.green} [{bar:24.green/black}] {percent:>3}% {pos}/{len} | {per_sec} | ETA {eta} | {msg}"
             }
-            Self::Minimal => "{pos}/{len} {per_sec} ETA {eta} | {msg}",
+            Self::Minimal => "{percent:>3}% {pos}/{len} | {per_sec} | ETA {eta} | {msg}",
         }
     }
 }
@@ -97,5 +109,13 @@ mod tests {
     fn hacker_theme_uses_a_green_palette() {
         assert_eq!(Theme::Hacker.accent(), Color::Green);
         assert_eq!(Theme::Hacker.state(PortState::Open), Some(Color::Green));
+    }
+
+    #[test]
+    fn cyber_theme_uses_cyan_and_magenta_palette() {
+        assert_eq!(Theme::Cyber.accent(), Color::Magenta);
+        assert_eq!(Theme::Cyber.state(PortState::Open), Some(Color::Cyan));
+        assert_eq!(Theme::Cyber.state(PortState::Closed), Some(Color::Magenta));
+        assert_eq!(Theme::Cyber.state(PortState::Filtered), Some(Color::Blue));
     }
 }

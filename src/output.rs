@@ -40,6 +40,7 @@ impl OutputFormat {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn emit(
     report: &ScanReport,
     target: &str,
@@ -48,6 +49,7 @@ pub fn emit(
     destination: Option<&Path>,
     quiet: bool,
     theme: Theme,
+    streamed: bool,
 ) -> Result<(), AppError> {
     let mut selected: Vec<&PortResult> = report
         .results
@@ -72,7 +74,44 @@ pub fn emit(
         OutputFormat::Greppable => render_greppable(target, &selected),
     };
 
-    write_destination(destination, &contents, quiet)
+    if let Some(path) = destination {
+        return write_destination(Some(path), &contents, quiet);
+    }
+
+    if streamed && format == OutputFormat::Table && stdout_is_tty {
+        // Results were already streamed live to stdout. Output the summary footer & OS findings.
+        println!(
+            "{}",
+            format_live_divider(color_enabled(theme, stdout_is_tty))
+        );
+        if !report.os_fingerprints.is_empty() {
+            println!("OS Fingerprint Evidence:");
+            for (host, guess) in &report.os_fingerprints {
+                let ev = guess
+                    .evidence
+                    .as_deref()
+                    .map(|e| format!(" | Evidence: {e}"))
+                    .unwrap_or_default();
+                println!(
+                    "  {} → {} ({}) confidence={:.0}%{}",
+                    host,
+                    guess.detail,
+                    guess.family,
+                    guess.confidence * 100.0,
+                    ev
+                );
+            }
+            println!();
+        }
+        print!("{}", format_summary(report.counts, report.elapsed));
+        println!(
+            "  targets {}  ports {}  probes {}  workers {}",
+            report.targets, report.ports, report.jobs, report.workers
+        );
+        return Ok(());
+    }
+
+    write_destination(None, &contents, quiet)
 }
 
 fn compare_results(left: &PortResult, right: &PortResult) -> std::cmp::Ordering {
@@ -158,6 +197,24 @@ fn render_table(
     if results.is_empty() {
         output.push_str("no matching results\n");
     }
+    if has_os {
+        output.push_str("\nOS Fingerprint Evidence:\n");
+        for (host, guess) in &report.os_fingerprints {
+            let ev = guess
+                .evidence
+                .as_deref()
+                .map(|e| format!(" | Evidence: {e}"))
+                .unwrap_or_default();
+            output.push_str(&format!(
+                "  {} → {} ({}) confidence={:.0}%{}\n",
+                host,
+                guess.detail,
+                guess.family,
+                guess.confidence * 100.0,
+                ev
+            ));
+        }
+    }
     output.push('\n');
     output.push_str(&format_summary(report.counts, report.elapsed));
     output.push_str(&format!(
@@ -165,6 +222,90 @@ fn render_table(
         report.targets, report.ports, report.jobs, report.workers
     ));
     output
+}
+
+pub fn color_to_ansi(color: comfy_table::Color) -> &'static str {
+    match color {
+        comfy_table::Color::Black => "30",
+        comfy_table::Color::DarkGrey => "90",
+        comfy_table::Color::Red => "31",
+        comfy_table::Color::DarkRed => "31",
+        comfy_table::Color::Green => "32",
+        comfy_table::Color::DarkGreen => "32",
+        comfy_table::Color::Yellow => "33",
+        comfy_table::Color::DarkYellow => "33",
+        comfy_table::Color::Blue => "34",
+        comfy_table::Color::DarkBlue => "34",
+        comfy_table::Color::Magenta => "35",
+        comfy_table::Color::DarkMagenta => "35",
+        comfy_table::Color::Cyan => "36",
+        comfy_table::Color::DarkCyan => "36",
+        comfy_table::Color::White => "37",
+        comfy_table::Color::Grey => "37",
+        comfy_table::Color::Reset => "0",
+        _ => "0",
+    }
+}
+
+pub fn format_live_header(theme: Theme, use_color: bool) -> String {
+    let host = "HOST";
+    let port = "PORT";
+    let state = "STATE";
+    let service = "SERVICE";
+    let version = "VERSION";
+    let latency = "LATENCY";
+    let header = format!(
+        "{:<17} {:<6} {:<10} {:<18} {:<20} {:<8}",
+        host, port, state, service, version, latency
+    );
+    if use_color {
+        format!("\x1b[1;{}m{}\x1b[0m", color_to_ansi(theme.accent()), header)
+    } else {
+        header
+    }
+}
+
+pub fn format_live_divider(_use_color: bool) -> String {
+    "─".repeat(83)
+}
+
+pub fn format_live_row(result: &PortResult, theme: Theme, use_color: bool) -> String {
+    let host = result.host.to_string();
+    let port = result.port.to_string();
+    let state_str = result.state.as_str();
+
+    let (svc_name, svc_ver) = match &result.service {
+        Some(s) => {
+            let name = match &s.product {
+                Some(p) => format!("{} ({})", s.name, p),
+                None => s.name.clone(),
+            };
+            let ver = s.version.clone().unwrap_or_default();
+            (name, ver)
+        }
+        None => (result.detail.clone().unwrap_or_default(), String::new()),
+    };
+    let lat = format!("{:.1}ms", result.latency.as_secs_f64() * 1000.0);
+
+    let state_col = if use_color {
+        if let Some(col) = theme.state(result.state) {
+            format!("\x1b[{}m{:<10}\x1b[0m", color_to_ansi(col), state_str)
+        } else {
+            format!("{:<10}", state_str)
+        }
+    } else {
+        format!("{:<10}", state_str)
+    };
+
+    format!(
+        "{:<17} {:<6} {} {:<18} {:<20} {:<8}",
+        host,
+        port,
+        state_col,
+        svc_name.chars().take(18).collect::<String>(),
+        svc_ver.chars().take(20).collect::<String>(),
+        lat
+    )
 }
 
 fn service_label(result: &PortResult) -> String {

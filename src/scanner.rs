@@ -36,14 +36,32 @@ fn batch_channel_capacity(workers: usize) -> usize {
     workers.clamp(4, MAX_BATCHED_MESSAGES)
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct ProgressEvent {
     pub state: Option<PortState>,
+    pub result: Option<PortResult>,
 }
 
 impl ProgressEvent {
+    pub const fn state(state: PortState) -> Self {
+        Self {
+            state: Some(state),
+            result: None,
+        }
+    }
+
     pub const fn result(state: PortState) -> Self {
-        Self { state: Some(state) }
+        Self {
+            state: Some(state),
+            result: None,
+        }
+    }
+
+    pub fn with_result(result: PortResult) -> Self {
+        Self {
+            state: Some(result.state),
+            result: Some(result),
+        }
     }
 }
 
@@ -134,11 +152,16 @@ pub async fn scan(
             counts.add(result.state);
             probed_ports.push(result.port);
             let state = result.state;
-            if options.retain.contains(result.state) {
+            let retained = options.retain.contains(result.state);
+            let res_clone = if retained { Some(result.clone()) } else { None };
+            if retained {
                 results.push(result);
             }
             if let Some(progress) = &progress {
-                progress(ProgressEvent::result(state));
+                progress(ProgressEvent {
+                    state: Some(state),
+                    result: res_clone,
+                });
             }
         }
     }
@@ -229,7 +252,7 @@ pub async fn verify_candidates(
     let mut results = Vec::with_capacity(candidates.len());
     while let Ok(result) = receiver.recv().await {
         if let Some(progress) = &progress {
-            progress(ProgressEvent::result(result.state));
+            progress(ProgressEvent::with_result(result.clone()));
         }
         results.push(result);
     }

@@ -74,6 +74,21 @@ pub fn inspect(port: u16, data: &[u8]) -> Detection {
     if let Some(detection) = mysql(data) {
         return detection;
     }
+    if let Some(detection) = redis(data) {
+        return detection;
+    }
+    if let Some(detection) = postgresql(data) {
+        return detection;
+    }
+    if let Some(detection) = smb(data) {
+        return detection;
+    }
+    if let Some(detection) = rdp(data) {
+        return detection;
+    }
+    if let Some(detection) = mongodb(text) {
+        return detection;
+    }
     if let Some(detection) = tls(data) {
         return detection;
     }
@@ -194,6 +209,104 @@ fn telnet(data: &[u8]) -> Option<Detection> {
     })
 }
 
+fn redis(data: &[u8]) -> Option<Detection> {
+    let line = first_line_text(data)?;
+    let upper = line.to_ascii_uppercase();
+    let is_redis = upper.starts_with("-ERR ")
+        || upper.starts_with("-NOAUTH ")
+        || upper.starts_with("-DENIED ")
+        || upper.starts_with("+PONG")
+        || (line.starts_with('$') && line.contains("redis"))
+        || upper.contains("REDIS");
+    if !is_redis {
+        return None;
+    }
+    let version = if let Some(idx) = line.find("redis_version:") {
+        line[idx + 14..]
+            .split_whitespace()
+            .next()
+            .and_then(clean_token)
+    } else {
+        None
+    };
+    Some(Detection {
+        service: Some(
+            ServiceInfo::new("redis")
+                .with_product(Some("Redis".to_string()))
+                .with_version(version),
+        ),
+        banner: Some(line),
+    })
+}
+
+fn postgresql(data: &[u8]) -> Option<Detection> {
+    if data.is_empty() {
+        return None;
+    }
+    // PostgreSQL binary error packet starts with 'E' and contains SFATAL or SERROR
+    let is_pg_binary = data[0] == b'E'
+        && (data.windows(7).any(|w| w == b"SFATAL\0") || data.windows(7).any(|w| w == b"SERROR\0"));
+    let text = String::from_utf8_lossy(data);
+    let is_pg_text = text.starts_with("FATAL:")
+        && (text.contains("pg_")
+            || text.contains("database")
+            || text.contains("role")
+            || text.contains("PostgreSQL"));
+    if is_pg_binary || is_pg_text {
+        let banner = first_line_text(data).unwrap_or_else(|| "PostgreSQL response".to_string());
+        return Some(Detection {
+            service: Some(
+                ServiceInfo::new("postgresql").with_product(Some("PostgreSQL".to_string())),
+            ),
+            banner: Some(banner),
+        });
+    }
+    None
+}
+
+fn smb(data: &[u8]) -> Option<Detection> {
+    if data.len() < 4 {
+        return None;
+    }
+    let is_smb1 = data.starts_with(b"\xffSMB") || (data.len() >= 8 && &data[4..8] == b"\xffSMB");
+    let is_smb2 = data.starts_with(b"\xfeSMB") || (data.len() >= 8 && &data[4..8] == b"\xfeSMB");
+    if is_smb1 {
+        return Some(Detection {
+            service: Some(ServiceInfo::new("smb").with_product(Some("SMBv1".to_string()))),
+            banner: Some("SMBv1 (NetBIOS-SSN)".to_string()),
+        });
+    }
+    if is_smb2 {
+        return Some(Detection {
+            service: Some(ServiceInfo::new("smb").with_product(Some("SMBv2/v3".to_string()))),
+            banner: Some("SMBv2/v3 (Microsoft-DS)".to_string()),
+        });
+    }
+    None
+}
+
+fn rdp(data: &[u8]) -> Option<Detection> {
+    if data.len() >= 6 && data[0] == 0x03 && data[1] == 0x00 && data[5] == 0xd0 {
+        return Some(Detection {
+            service: Some(ServiceInfo::new("rdp").with_product(Some("Microsoft RDP".to_string()))),
+            banner: Some("RDP / TPKT connection confirm".to_string()),
+        });
+    }
+    None
+}
+
+fn mongodb(data: &[u8]) -> Option<Detection> {
+    let line = first_line_text(data)?;
+    let lower = line.to_ascii_lowercase();
+    if lower.contains("mongodb") || lower.contains("trying to access mongodb over http") {
+        return Some(Detection {
+            service: Some(ServiceInfo::new("mongodb").with_product(Some("MongoDB".to_string()))),
+            banner: Some(line),
+        });
+    }
+    None
+}
+
 fn text_protocol(port: u16, data: &[u8]) -> Option<Detection> {
     let line = first_line_text(data)?;
     let upper = line.to_ascii_uppercase();
@@ -283,6 +396,9 @@ fn ftp_product(line: &str) -> (Option<String>, Option<String>) {
         ("filezilla", "FileZilla"),
         ("pure-ftpd", "Pure-FTPd"),
         ("serv-u", "Serv-U"),
+        ("microsoft ftp", "Microsoft FTP"),
+        ("wu-ftpd", "WU-FTPD"),
+        ("pyftpdlib", "pyftpdlib"),
     ];
     let lower = line.to_ascii_lowercase();
     for (needle, display) in PRODUCTS {
@@ -301,6 +417,9 @@ fn smtp_product(line: &str) -> (Option<String>, Option<String>) {
         ("exim", "Exim"),
         ("sendmail", "Sendmail"),
         ("microsoft", "Microsoft"),
+        ("haraka", "Haraka"),
+        ("courier", "Courier"),
+        ("opensmtpd", "OpenSMTPD"),
     ];
     let lower = line.to_ascii_lowercase();
     for (needle, display) in PRODUCTS {
@@ -337,7 +456,11 @@ fn vnc(version: &str, banner: String) -> Detection {
         .and_then(|version| clean_token(&version));
 
     Detection {
-        service: Some(ServiceInfo::new("vnc").with_version(version)),
+        service: Some(
+            ServiceInfo::new("vnc")
+                .with_product(Some("VNC".to_string()))
+                .with_version(version),
+        ),
         banner: Some(banner),
     }
 }
@@ -594,5 +717,62 @@ mod tests {
             (Some("rayscan-lab".to_string()), None)
         );
         assert_eq!(parse_product_version(""), (None, None));
+    }
+
+    #[test]
+    fn detects_redis_banner() {
+        let det = inspect(6379, b"-ERR unknown command 'HEAD'\r\n");
+        let svc = service(&det, "redis");
+        assert_eq!(svc.product.as_deref(), Some("Redis"));
+        assert_eq!(det.banner.as_deref(), Some("-ERR unknown command 'HEAD'"));
+
+        let det2 = inspect(6379, b"-NOAUTH Authentication required.\r\n");
+        service(&det2, "redis");
+
+        let det3 = inspect(6379, b"+PONG\r\n");
+        service(&det3, "redis");
+    }
+
+    #[test]
+    fn detects_postgresql_response() {
+        let text_det = inspect(
+            5432,
+            b"FATAL:  no pg_hba.conf entry for host \"10.0.0.1\"\n",
+        );
+        let svc = service(&text_det, "postgresql");
+        assert_eq!(svc.product.as_deref(), Some("PostgreSQL"));
+
+        let binary_payload = b"E\x00\x00\x00\x40SFATAL\0C28000\0Mno pg_hba.conf\0";
+        let bin_det = inspect(5432, binary_payload);
+        service(&bin_det, "postgresql");
+    }
+
+    #[test]
+    fn detects_smb_signatures() {
+        let smb1 = inspect(445, b"\xffSMB\x72\x00\x00\x00\x00");
+        let svc1 = service(&smb1, "smb");
+        assert_eq!(svc1.product.as_deref(), Some("SMBv1"));
+
+        let smb2 = inspect(445, b"\xfeSMB\x40\x00\x00\x00\x00");
+        let svc2 = service(&smb2, "smb");
+        assert_eq!(svc2.product.as_deref(), Some("SMBv2/v3"));
+    }
+
+    #[test]
+    fn detects_rdp_tpkt_confirm() {
+        let rdp_data = &[
+            0x03, 0x00, 0x00, 0x0b, 0x06, 0xd0, 0x00, 0x00, 0x12, 0x34, 0x00,
+        ];
+        let det = inspect(3389, rdp_data);
+        let svc = service(&det, "rdp");
+        assert_eq!(svc.product.as_deref(), Some("Microsoft RDP"));
+    }
+
+    #[test]
+    fn detects_mongodb_http_notice() {
+        let data = b"It looks like you are trying to access MongoDB over HTTP on the native driver port.\r\n";
+        let det = inspect(27017, data);
+        let svc = service(&det, "mongodb");
+        assert_eq!(svc.product.as_deref(), Some("MongoDB"));
     }
 }

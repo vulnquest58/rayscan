@@ -65,6 +65,15 @@ pub enum Profile {
 }
 
 impl Profile {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Fast => "fast",
+            Self::Balanced => "balanced",
+            Self::Careful => "careful",
+            Self::Stealth => "stealth",
+        }
+    }
+
     pub const fn defaults(self) -> ProfileDefaults {
         match self {
             Self::Fast => ProfileDefaults {

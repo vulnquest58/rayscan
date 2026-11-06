@@ -135,6 +135,18 @@ pub struct ScanArgs {
     #[arg(long)]
     pub sequential: bool,
 
+    /// Scan most common ports first to minimize time-to-first-result.
+    #[arg(long, conflicts_with = "randomize")]
+    pub top_ports_first: bool,
+
+    /// Fast discovery mode: report open ports immediately without service/banner inspection.
+    #[arg(long, conflicts_with = "verify")]
+    pub discover_only: bool,
+
+    /// Disable real-time live results table streaming during scan.
+    #[arg(long)]
+    pub no_live: bool,
+
     /// Report handshake success as open without banner or connect verification.
     #[arg(long, conflicts_with = "verify")]
     pub connect_only: bool,
@@ -238,6 +250,10 @@ pub struct ResolvedConfig {
     /// Per-host SYN-open count above which the host is treated as an anomaly.
     /// `0` disables anomaly detection.
     pub anomaly_threshold: u32,
+    /// Scan most common ports first.
+    pub top_ports_first: bool,
+    /// Stream live results table during scan.
+    pub live_table: bool,
     /// Path to a saved state file to resume from.
     pub resume_file: Option<PathBuf>,
     /// Path to write the scan state on completion or interruption.
@@ -301,7 +317,7 @@ impl ScanArgs {
             file.randomize.unwrap_or(false)
         };
 
-        let connect_only = if self.connect_only {
+        let connect_only = if self.discover_only || self.connect_only {
             true
         } else if self.verify {
             false
@@ -309,7 +325,7 @@ impl ScanArgs {
             file.connect_only.unwrap_or(false)
         };
 
-        let service_detection = if self.no_service_detection {
+        let service_detection = if self.discover_only || self.no_service_detection {
             false
         } else {
             file.service_detection.unwrap_or(true)
@@ -363,6 +379,8 @@ impl ScanArgs {
             aimd: !self.no_aimd,
             aimd_min_pps: self.aimd_min_rate.unwrap_or(100),
             anomaly_threshold: self.anomaly_threshold.unwrap_or(1000),
+            top_ports_first: self.top_ports_first,
+            live_table: !self.no_live,
             resume_file: self.resume.clone(),
             save_state_file: self.save_state.clone(),
             theme: file.theme.unwrap_or_default(),
@@ -427,6 +445,9 @@ mod tests {
             retries: None,
             randomize: false,
             sequential: false,
+            top_ports_first: false,
+            discover_only: false,
+            no_live: false,
             connect_only: false,
             verify: false,
             no_service_detection: false,
@@ -527,5 +548,22 @@ mod tests {
         assert_eq!(spec, "top-20");
         assert_eq!(ports.len(), 20);
         assert_eq!(ports[0], 80);
+    }
+
+    #[test]
+    fn discover_only_and_speed_flags_work() {
+        let mut disc = args();
+        disc.discover_only = true;
+        let resolved = disc.resolve().unwrap();
+        assert!(resolved.connect_only);
+        assert!(!resolved.service_detection);
+
+        let mut prioritized = args();
+        prioritized.top_ports_first = true;
+        assert!(prioritized.resolve().unwrap().top_ports_first);
+
+        let mut no_live = args();
+        no_live.no_live = true;
+        assert!(!no_live.resolve().unwrap().live_table);
     }
 }

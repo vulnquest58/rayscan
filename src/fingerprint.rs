@@ -89,6 +89,48 @@ pub struct TcpFingerprint {
     pub options_order: Vec<u8>,
 }
 
+impl TcpFingerprint {
+    /// Format observed TCP/IP features into a concise evidence string:
+    /// e.g. `TTL=64, Window=5840, MSS=1460, Options=mss,sack,wscale`
+    pub fn evidence_summary(&self) -> String {
+        let mut parts = Vec::new();
+        parts.push(format!("TTL={}", self.ttl));
+        parts.push(format!("Window={}", self.window));
+        if let Some(mss) = self.mss {
+            parts.push(format!("MSS={mss}"));
+        }
+        if let Some(ws) = self.wscale {
+            parts.push(format!("WScale={ws}"));
+        }
+        if self.sack_ok {
+            parts.push("SACK=yes".to_string());
+        }
+        if self.timestamps {
+            parts.push("TS=yes".to_string());
+        }
+        if self.df {
+            parts.push("DF=yes".to_string());
+        }
+        if !self.options_order.is_empty() {
+            let names: Vec<&'static str> = self
+                .options_order
+                .iter()
+                .map(|&k| match k {
+                    0 => "eol",
+                    1 => "nop",
+                    2 => "mss",
+                    3 => "wscale",
+                    4 => "sack",
+                    8 => "ts",
+                    _ => "opt",
+                })
+                .collect();
+            parts.push(format!("Options={}", names.join(",")));
+        }
+        parts.join(", ")
+    }
+}
+
 /// An OS guess produced by `classify()`.
 #[derive(Clone, Debug, Serialize)]
 pub struct OsGuess {
@@ -102,6 +144,9 @@ pub struct OsGuess {
     /// Inferred initial TTL (rounded to nearest of 64 / 128 / 255).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub initial_ttl: Option<u8>,
+    /// Evidence string extracted from observed TCP/IP stack options.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<String>,
 }
 
 // ── Signature database ────────────────────────────────────────────────────────
@@ -584,6 +629,7 @@ pub fn classify(fp: &TcpFingerprint) -> OsGuess {
     } else {
         0.0
     };
+    let evidence = Some(fp.evidence_summary());
 
     match best_sig {
         Some(sig) if confidence >= 0.20 => OsGuess {
@@ -591,6 +637,7 @@ pub fn classify(fp: &TcpFingerprint) -> OsGuess {
             detail: sig.detail.to_string(),
             confidence,
             initial_ttl: Some(initial_ttl),
+            evidence,
         },
         _ => OsGuess {
             family: OsFamily::Unknown,
@@ -600,6 +647,7 @@ pub fn classify(fp: &TcpFingerprint) -> OsGuess {
             ),
             confidence,
             initial_ttl: Some(initial_ttl),
+            evidence,
         },
     }
 }
@@ -1257,5 +1305,23 @@ mod tests {
         assert_eq!(estimate_hops(127), 1); // Windows, 1 hop
         assert_eq!(estimate_hops(254), 1); // Cisco, 1 hop
         assert_eq!(estimate_hops(128), 0); // Windows, direct
+    }
+
+    #[test]
+    fn evidence_summary_formats_all_features() {
+        let fp = linux_fp();
+        let ev = fp.evidence_summary();
+        assert!(ev.contains("TTL=63"));
+        assert!(ev.contains("Window=29200"));
+        assert!(ev.contains("MSS=1460"));
+        assert!(ev.contains("WScale=7"));
+        assert!(ev.contains("SACK=yes"));
+        assert!(ev.contains("TS=yes"));
+        assert!(ev.contains("DF=yes"));
+        assert!(ev.contains("Options=mss,nop,wscale,nop,nop,sack,ts"));
+
+        let guess = classify(&fp);
+        assert!(guess.evidence.is_some());
+        assert_eq!(guess.evidence.as_deref(), Some(ev.as_str()));
     }
 }

@@ -47,6 +47,21 @@ pub fn top_ports(count: usize) -> Result<Vec<u16>, AppError> {
     Ok(ports)
 }
 
+/// Reorder a slice of ports in-place so that common ports (as defined by [`TOP_PORTS_100`])
+/// appear first in order of their popularity rank, followed by the remaining ports in ascending order.
+///
+/// This dramatically improves time-to-first-result on wide scans.
+pub fn prioritize_ports(ports: &mut [u16]) {
+    let rank_of = |p: u16| -> (usize, u16) {
+        if let Some(idx) = TOP_PORTS_100.iter().position(|&x| x == p) {
+            (idx, p)
+        } else {
+            (usize::MAX, p)
+        }
+    };
+    ports.sort_by_key(|&p| rank_of(p));
+}
+
 /// Parse a saved port specification produced by the CLI (`"1-1024"`,
 /// `"80,443"`, or `"top-100"`).
 pub fn parse_spec(input: &str) -> Result<Vec<u16>, AppError> {
@@ -172,5 +187,19 @@ mod tests {
         assert_eq!(parse_spec("80,443").unwrap(), vec![80, 443]);
         assert_eq!(parse_spec("top-5").unwrap(), vec![80, 23, 443, 21, 22]);
         assert_eq!(parse_spec("top-nope").unwrap_err().exit_code(), 2);
+    }
+
+    #[test]
+    fn prioritize_ports_orders_common_ports_first() {
+        let mut ports = vec![8080, 12345, 22, 9999, 80, 443];
+        prioritize_ports(&mut ports);
+        // TOP_PORTS_100 ranks: 80 (0), 443 (2), 22 (4), 8080 (14)
+        // 9999 is in TOP_PORTS_100 (index 96), 12345 is not (usize::MAX)
+        assert_eq!(ports[0], 80);
+        assert_eq!(ports[1], 443);
+        assert_eq!(ports[2], 22);
+        assert_eq!(ports[3], 8080);
+        assert_eq!(ports[4], 9999);
+        assert_eq!(ports[5], 12345);
     }
 }
