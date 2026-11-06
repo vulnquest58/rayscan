@@ -994,6 +994,7 @@ mod tests {
             os_fingerprints: std::collections::HashMap::new(),
             probed_ports: vec![80, 81, 82],
             partial: false,
+            defense_observations: Vec::new(),
         }
     }
 

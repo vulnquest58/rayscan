@@ -737,6 +737,7 @@ mod tests {
             os_fingerprints: HashMap::new(),
             probed_ports: vec![21, 22, 80],
             partial: false,
+            defense_observations: Vec::new(),
         };
 
         let diff = ScanDiff::compute("baseline.json", "192.168.1.10", &baseline, &report);

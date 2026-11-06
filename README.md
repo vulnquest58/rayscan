@@ -1,7 +1,7 @@
 # rayscan
 
 [![CI](https://img.shields.io/badge/CI-passing-brightgreen.svg)](https://github.com/vulnquest58/rayscan)
-[![Version](https://img.shields.io/badge/version-v0.1.0-blue.svg)](Cargo.toml)
+[![Version](https://img.shields.io/badge/version-v0.2.0-blue.svg)](Cargo.toml)
 [![Rust](https://img.shields.io/badge/rust-1.99.1%20pinned-orange.svg)](rust-toolchain.toml)
 [![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20Windows%20%7C%20Static%20musl-informational.svg)](#cross-platform-binaries)
 [![Author](https://img.shields.io/badge/author-vulnquest58-blueviolet.svg)](https://github.com/vulnquest58)
@@ -10,9 +10,35 @@
 An accuracy-first TCP/UDP port scanner with passive OS fingerprinting, written in Rust.  
 Maintained by **vulnquest58** ([@vulnquest58](https://github.com/vulnquest58)).
 
-**Status: Production Ready (v0.1.0).** High-speed scanners without evidence-based verification produce thousands of false positives when encountering real-world enterprise defenses (TCP tarpits, SYN-proxies, and middlebox drop rules). `rayscan` solves this with a two-phase architecture: high-speed raw SYN discovery combined with rigorous semantic handshake verification, banner grabbing, and passive TCP/IP stack fingerprinting.
+**Status: Production Ready (v0.2.0).** High-speed scanners without evidence-based verification produce thousands of false positives when encountering real-world enterprise defenses (TCP tarpits, SYN-proxies, and middlebox drop rules). `rayscan` solves this with a two-phase architecture: high-speed raw SYN discovery combined with rigorous semantic handshake verification, banner grabbing, and passive TCP/IP stack fingerprinting.
 
 Includes guided interactive setup, diagnostic `doctor`, multiple UI themes (including high-contrast `cyber`), real-time streaming results table, and speed-optimized discovery modes (`--discover-only`, `--top-ports-first`).
+
+---
+
+## What Makes Rayscan Different
+
+Most port scanners fall into one of two extremes: raw packet blasters that drown operators in false positives (masscan, rustscan), or classic deep probes that crawl when scanning large subnets (nmap). `rayscan` introduces three architectural differentiators:
+
+### 1. Empirical Accuracy Scoring (0–100%)
+Instead of reducing open ports to an opaque binary `open` state, `rayscan` computes an empirical **Accuracy Score** derived from 4 foundational pillars:
+- **TCP Handshake (20%)**: Validated 3-way handshake completion.
+- **Application Protocol Verification (40%)**: Bounded banner capture and protocol validation (with dedicated recognition for client-first binary listeners like RPC, PostgreSQL, X11).
+- **Stack & OS Conformance (20%)**: Passive TCP/IP fingerprint alignment (TTL, Window, MSS, SACK, TS).
+- **Behavioral Latency Stability (20%)**: Response latency consistency and absence of drop retransmissions.
+Every finding includes an inspectable evidence string (e.g. `handshake:ok(20%) banner:OpenSSH/8.9(40%) stack:linux(20%) latency:2.1ms(19%)`).
+
+### 2. Defense Awareness & Middlebox Classification
+`rayscan` acts as a network intelligence classifier. When scanning modern infrastructure, it detects and categorizes middleboxes, firewalls, and deception defenses:
+- `[CLEAN] Direct Host`
+- `[NOTICE] Rate-Limiting Active`
+- `[WARNING] TCP Tarpit Active`
+- `[WARNING] SYN-Proxy Middlebox Detected`
+- `[WARNING] Layer-7 WAF / DPI Detected`
+- `[CRITICAL] Heavy Middlebox / Deception Detected`
+
+### 3. Built-In Network Differential Auditing (`--diff`)
+Tracks perimeter drift natively in $O(N)$ time. Compare live scans against historical baselines or evaluate two saved reports offline to immediately identify new ports, retired services, version upgrades, and posture shifts without external diff scripts or database dependencies.
 
 ---
 
@@ -277,6 +303,28 @@ Network State Differential Analysis (vs /tmp/baseline.json):
 [~] POSTURE 192.168.100.37        [CLEAN] Direct Host → [NOTICE] Rate-Limiting Active
 
 Diff Summary: 1 new | 1 closed/gone | 1 modified | 1 posture shifted (12 unchanged)
+```
+
+#### Practical Daily Workflow: Baseline → Scan → Diff
+
+Here is how security teams integrate `rayscan` into automated daily perimeter monitoring:
+
+```bash
+# Day 1 (Monday): Establish clean baseline snapshot of target infrastructure:
+sudo rayscan scan --syn --os --target 192.168.100.0/24 --top-ports 100 \
+    --json -o /var/log/rayscan/baseline.json
+
+# Day 2 (Tuesday): Run daily audit against the baseline to catch newly exposed services:
+sudo rayscan scan --syn --os --target 192.168.100.0/24 --top-ports 100 \
+    --diff /var/log/rayscan/baseline.json \
+    --json -o /var/log/rayscan/tuesday.json
+
+# Offline Investigation: Perform offline differential comparison between any historical scans:
+rayscan diff /var/log/rayscan/baseline.json /var/log/rayscan/tuesday.json
+
+# CI/CD & SIEM Automation: Fail pipeline if unauthorized ports are opened:
+rayscan diff /var/log/rayscan/baseline.json /var/log/rayscan/tuesday.json --json \
+    | jq -e '.summary.new_ports == 0' > /dev/null || echo "ALERT: Unauthorized ports detected!"
 ```
 
 ### Smart Resume with Gap Analysis Audit

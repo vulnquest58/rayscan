@@ -82,6 +82,9 @@ pub fn analyze_defenses(report: &ScanReport) -> HashMap<IpAddr, HostDefenseAsses
     for result in &report.results {
         by_host.entry(result.host).or_default().push(result);
     }
+    for result in &report.defense_observations {
+        by_host.entry(result.host).or_default().push(result);
+    }
 
     let mut assessments = HashMap::new();
     for (host, results) in by_host {
@@ -270,6 +273,7 @@ mod tests {
             os_fingerprints: HashMap::new(),
             probed_ports: vec![80, 22],
             partial: false,
+            defense_observations: Vec::new(),
         };
 
         let assessments = analyze_defenses(&report);
@@ -299,6 +303,7 @@ mod tests {
             os_fingerprints: HashMap::new(),
             probed_ports: vec![9000, 9001, 9002],
             partial: false,
+            defense_observations: Vec::new(),
         };
 
         let assessments = analyze_defenses(&report);
@@ -327,6 +332,7 @@ mod tests {
             os_fingerprints: HashMap::new(),
             probed_ports: vec![9003],
             partial: false,
+            defense_observations: Vec::new(),
         };
 
         let assessments = analyze_defenses(&report);

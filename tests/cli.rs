@@ -70,7 +70,7 @@ fn version_is_reported() {
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).expect("utf-8 output");
     assert!(stdout.starts_with("rayscan "));
-    assert!(stdout.contains("0.1.0"));
+    assert!(stdout.contains(env!("CARGO_PKG_VERSION")));
 }
 
 #[test]
@@ -196,7 +196,7 @@ fn doctor_json_reports_capability_checks() {
         String::from_utf8_lossy(&output.stderr)
     );
     let payload: Value = serde_json::from_slice(&output.stdout).expect("valid JSON output");
-    assert_eq!(payload["version"], "0.1.0");
+    assert_eq!(payload["version"], env!("CARGO_PKG_VERSION"));
     let checks = payload["checks"].as_array().expect("checks array");
     assert!(checks.iter().any(|check| check["name"] == "raw-syn"));
     assert!(checks.iter().any(|check| check["name"] == "config"));

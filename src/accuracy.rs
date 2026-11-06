@@ -68,7 +68,11 @@ impl AccuracyScore {
             }
         } else if result.state == PortState::Open {
             // A verified active TCP listener socket that expects client-first initiation or binary frames (e.g. RPC, PostgreSQL, X11, AJP)
-            (0.25, "banner:listener-verified(25%)".to_string())
+            if is_known_binary_port(result.port) {
+                (0.30, "banner:binary-protocol(30%)".to_string())
+            } else {
+                (0.28, "banner:listener-verified(28%)".to_string())
+            }
         } else {
             (0.0, "banner:none(0%)".to_string())
         };
@@ -191,6 +195,25 @@ impl AccuracyScore {
     }
 }
 
+/// Recognized binary / client-first protocol ports where silent listeners are normal and expected.
+pub const fn is_known_binary_port(port: u16) -> bool {
+    matches!(
+        port,
+        111           // rpcbind / sunrpc
+        | 135         // msrpc
+        | 139         // netbios-ssn
+        | 445         // microsoft-ds
+        | 1433        // ms-sql-s
+        | 1521        // oracle
+        | 2049        // nfs
+        | 3632        // distccd
+        | 5432        // postgresql
+        | 6000
+            ..=6009 // x11
+        | 8009 // ajp13
+    )
+}
+
 /// Apply accuracy scores to all results in a scan report.
 pub fn score_report(report: &mut ScanReport) {
     for result in &mut report.results {
@@ -274,11 +297,11 @@ mod tests {
         };
         let score = AccuracyScore::calculate(&result, Some(&guess));
         assert_eq!(score.handshake, 0.20);
-        assert_eq!(score.banner, 0.25);
+        assert_eq!(score.banner, 0.30);
         assert_eq!(score.stack, 0.20);
         assert_eq!(score.stability, 0.20);
-        assert_eq!(score.total, 0.85);
+        assert_eq!(score.total, 0.90);
         assert_eq!(score.classification, "genuine_service");
-        assert!(score.evidence.contains("banner:listener-verified"));
+        assert!(score.evidence.contains("banner:binary-protocol(30%)"));
     }
 }

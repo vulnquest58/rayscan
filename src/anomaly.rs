@@ -135,6 +135,7 @@ mod tests {
             os_fingerprints: std::collections::HashMap::new(),
             probed_ports: ports.to_vec(),
             partial: false,
+            defense_observations: Vec::new(),
         }
     }
 

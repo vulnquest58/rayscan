@@ -55,6 +55,10 @@ fn merge_verification(report: &mut ScanReport, verified: Vec<PortResult>, retain
         report.counts.remove(PortState::Open);
         report.counts.add(result.state);
 
+        if result.state != PortState::Open {
+            report.defense_observations.push(result.clone());
+        }
+
         if retain.contains(result.state) {
             report.results[index] = result;
         } else {
@@ -186,6 +190,7 @@ mod tests {
             os_fingerprints: std::collections::HashMap::new(),
             probed_ports: vec![port],
             partial: false,
+            defense_observations: Vec::new(),
         }
     }
 
@@ -214,6 +219,7 @@ mod tests {
             os_fingerprints: std::collections::HashMap::new(),
             probed_ports: vec![80, 9000, 9003],
             partial: false,
+            defense_observations: Vec::new(),
         }
     }
 
@@ -315,6 +321,7 @@ mod tests {
             os_fingerprints: std::collections::HashMap::new(),
             probed_ports: vec![80],
             partial: false,
+            defense_observations: Vec::new(),
         };
 
         recheck_local_opens(&mut report, &options(StateSet::open())).await;

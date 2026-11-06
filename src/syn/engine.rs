@@ -720,6 +720,7 @@ pub fn syn_scan(
         os_fingerprints: std::collections::HashMap::new(),
         probed_ports: opts.ports.clone(),
         partial: false,
+        defense_observations: Vec::new(),
     })
 }
 

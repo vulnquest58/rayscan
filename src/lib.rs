@@ -121,6 +121,7 @@ pub(crate) async fn run_scan(args: ScanArgs, theme: Option<Theme>) -> Result<(),
             os_fingerprints: HashMap::new(),
             probed_ports: all_ports.clone(),
             partial: false,
+            defense_observations: Vec::new(),
         };
         accuracy::score_report(&mut report);
         let diff_report = if let Some(ref diff_path) = resolved.diff_file {

@@ -213,4 +213,6 @@ pub struct ScanReport {
     /// True when the scan was interrupted (Ctrl-C) before all probes completed.
     /// Partial results are still valid but may be incomplete.
     pub partial: bool,
+    /// Defense and middlebox discrepancy observations (reclassified verification drops, etc.).
+    pub defense_observations: Vec<PortResult>,
 }

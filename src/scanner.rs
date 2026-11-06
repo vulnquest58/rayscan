@@ -191,6 +191,7 @@ pub async fn scan(
             os_fingerprints: std::collections::HashMap::new(),
             probed_ports,
             partial: true,
+            defense_observations: Vec::new(),
         });
     }
 
@@ -205,6 +206,7 @@ pub async fn scan(
         os_fingerprints: std::collections::HashMap::new(),
         probed_ports,
         partial: false,
+        defense_observations: Vec::new(),
     })
 }
 

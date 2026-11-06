@@ -474,6 +474,7 @@ mod tests {
             os_fingerprints: HashMap::new(),
             probed_ports: vec![22, 23],
             partial: true,
+            defense_observations: Vec::new(),
         };
 
         let state = ScanState::from_report(&report, "192.0.2.1", "1-100", vec![22, 23]);
@@ -517,6 +518,7 @@ mod tests {
             os_fingerprints: HashMap::new(),
             probed_ports: vec![80, 81],
             partial: false,
+            defense_observations: Vec::new(),
         };
         let state = ScanState::from_report(&report, "10.0.0.1", "80-81", vec![80, 81]);
         let (results, counts) = restore_results(&state);
@@ -554,6 +556,7 @@ mod tests {
             os_fingerprints: HashMap::new(),
             probed_ports: vec![21],
             partial: true,
+            defense_observations: Vec::new(),
         };
         let state = ScanState::from_report(&report, "192.0.2.10", "21", vec![21]);
         let (results, _) = restore_results(&state);
