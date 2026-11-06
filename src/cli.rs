@@ -42,10 +42,27 @@ pub struct Cli {
 pub enum Command {
     /// Scan TCP ports on one or more targets.
     Scan(ScanArgs),
+    /// Compare two previous scan reports or state files to display differences.
+    Diff(DiffArgs),
     /// Check permissions, terminal support, and scan capabilities.
     Doctor(DoctorArgs),
     /// Set up and run a scan with guided prompts.
     Interactive,
+}
+
+#[derive(Debug, Args)]
+pub struct DiffArgs {
+    /// Baseline JSON report or state file.
+    #[arg(value_name = "BASELINE_FILE")]
+    pub baseline: PathBuf,
+
+    /// Current/comparison JSON report or state file.
+    #[arg(value_name = "CURRENT_FILE")]
+    pub current: PathBuf,
+
+    /// Output differences in JSON format.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]

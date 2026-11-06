@@ -42,6 +42,7 @@ pub async fn run(cli: Cli) -> Result<(), AppError> {
     let Cli { theme, command } = cli;
     match command {
         Command::Scan(args) => run_scan(args, theme).await,
+        Command::Diff(args) => diff::run_cli(args, theme),
         Command::Doctor(args) => doctor::run(args, theme),
         Command::Interactive => interactive::run(theme).await,
     }

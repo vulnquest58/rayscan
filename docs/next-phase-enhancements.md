@@ -170,6 +170,49 @@ open 4  closed 0  filtered 0  silent 0  unreachable 0  error 0  elapsed 0.69s
 }
 ```
 
+### 4.2 Defense Awareness & Middlebox Classifier (Phase 8)
+- **Engine:** [`src/defense.rs`](file:///e:/VulnQuest_Pro/rayscan/src/defense.rs)
+- **Posture Hierarchy:**
+  - `[CLEAN] Direct Host`
+  - `[NOTICE] Rate-Limiting Active`
+  - `[WARNING] TCP Tarpit Active` / `SYN-Proxy Middlebox Detected` / `Layer-7 WAF / DPI`
+  - `[CRITICAL] Heavy Middlebox / Deception Detected`
+- **Output:** Surfaced in terminal summary, live table footer, and embedded inside machine-readable JSON under `"defense"`.
+
+### 4.3 Change Detection & Differential Analysis (`--diff` / `--compare-to`) (Phase 9)
+- **Engine:** [`src/diff.rs`](file:///e:/VulnQuest_Pro/rayscan/src/diff.rs)
+- **Capability:** Compares any current scan against a baseline JSON report or state file, reporting:
+  - `[+] NEW`: Newly opened ports with confidence.
+  - `[-] GONE`: Previously open ports now closed or filtered.
+  - `[*] CHANGED`: Service version and banner modifications (e.g. `OpenSSH 7.4 → 8.9`).
+  - `[~] POSTURE`: Shifts in host defense posture (e.g. `[CLEAN] Direct Host → [NOTICE] Rate-Limiting Active`).
+- **Terminal View:**
+  ```text
+  Network State Differential Analysis (vs baseline.json):
+  ──────────────────────────────────────────────────────────────────────
+  [-] GONE    192.168.100.37:21     ftp vsFTPd/2.3.4           (ftp vsFTPd/2.3.4 (Was: open))
+  [-] GONE    192.168.100.37:3306   mysql MySQL/5.0.51a-3ubuntu5 (mysql MySQL/5.0.51a-3ubuntu5 (Was: open))
+  [+] NEW     192.168.100.37:5900   vnc VNC/3.3                (vnc VNC/3.3 (Confidence: 95%))
+
+  Diff Summary: 1 new | 2 closed/gone | 0 modified | 0 posture shifted (1 unchanged)
+  ```
+- **JSON View:** Embedded `"diff"` object inside `--json` reports.
+
+### 4.4 Smart Resume with Gap Analysis Audit (Phase 9)
+- **Engine:** [`src/resume.rs`](file:///e:/VulnQuest_Pro/rayscan/src/resume.rs)
+- **Capability:** When `--resume <FILE>` is invoked, performs an immediate diagnostic gap analysis before probing:
+  ```text
+  Resume Gap Analysis Audit:
+  ──────────────────────────────────────────────────────────────────────
+  Target Scope:        192.168.100.37
+  Port Specification:  1-50
+  Progress:            50/100 ports completed (50.0%)
+  Remaining Gaps:      50 ports to scan
+  Prior Findings:      4 open, 46 closed, 0 filtered, 0 silent
+  Host Anomaly Check:  Clean (No host anomaly threshold triggered)
+  ──────────────────────────────────────────────────────────────────────
+  ```
+
 ---
 
 ## 5. Verification Checklist
@@ -178,7 +221,7 @@ open 4  closed 0  filtered 0  silent 0  unreachable 0  error 0  elapsed 0.69s
 |---|---|---|---|
 | Code Formatting | `cargo fmt --all -- --check` | **PASS (0)** | Strictly compliant |
 | Linting & Warnings | `cargo clippy --all-targets --all-features -- -D warnings` | **PASS (0)** | Zero warnings |
-| Unit Tests | `cargo test --lib` | **133/133 PASS** | All 133 tests passing |
+| Unit Tests | `cargo test --lib` | **139/139 PASS** | All 139 tests passing |
 | Integration Tests | `cargo test --test cli` | **11/11 PASS** | All 11 tests passing |
 | Bench Unittests | `python3 -m unittest discover -s bench/tests` | **13/13 PASS** | Command & parser tests |
 | Dynamic Linux Build | `target/release/rayscan` -> `rayscan-linux` | **SUCCESS** | Stripped ELF64 |

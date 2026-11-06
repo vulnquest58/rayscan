@@ -7,6 +7,7 @@
 //! - Defensive posture shifts (`[~] POSTURE`)
 
 use std::collections::{BTreeMap, HashMap};
+use std::io::IsTerminal;
 use std::net::IpAddr;
 use std::path::Path;
 
@@ -110,42 +111,61 @@ pub struct BaselineSnapshot {
     pub defense_postures: HashMap<IpAddr, (String, f32)>,
 }
 
+impl BaselineSnapshot {
+    /// Build a snapshot from an active [`ScanReport`].
+    pub fn from_report(report: &ScanReport) -> Self {
+        let mut snapshot = Self::default();
+        for res in &report.results {
+            let svc = service_display(res);
+            snapshot.ports.insert(
+                (res.host, res.port),
+                BaselineEntry {
+                    state: res.state,
+                    service_label: if svc.is_empty() { None } else { Some(svc) },
+                    confidence: res.confidence,
+                },
+            );
+        }
+        let defenses = crate::defense::analyze_defenses(report);
+        for (host, assess) in defenses {
+            snapshot.defense_postures.insert(
+                host,
+                (assess.defense_type.badge().to_string(), assess.confidence),
+            );
+        }
+        snapshot
+    }
+}
+
 impl ScanDiff {
-    /// Compute differences between a loaded baseline snapshot and a current [`ScanReport`].
-    pub fn compute(
+    /// Compute differences between two baseline snapshots.
+    pub fn compute_snapshots(
         baseline_source: &str,
-        target_label: &str,
+        current_target: &str,
         baseline: &BaselineSnapshot,
-        current_report: &ScanReport,
+        current: &BaselineSnapshot,
     ) -> Self {
         let mut port_changes = Vec::new();
         let mut unchanged_ports = 0usize;
 
-        // Group current results by (host, port)
-        let mut current_map: HashMap<(IpAddr, u16), &PortResult> = HashMap::new();
-        for res in &current_report.results {
-            current_map.insert((res.host, res.port), res);
-        }
-
-        // Union of all (host, port) pairs in baseline and current
         let mut all_keys: BTreeMap<(IpAddr, u16), ()> = BTreeMap::new();
         for k in baseline.ports.keys() {
             all_keys.insert(*k, ());
         }
-        for k in current_map.keys() {
+        for k in current.ports.keys() {
             all_keys.insert(*k, ());
         }
 
         for (host, port) in all_keys.keys().copied() {
             let base_opt = baseline.ports.get(&(host, port));
-            let curr_opt = current_map.get(&(host, port)).copied();
+            let curr_opt = current.ports.get(&(host, port));
 
             match (base_opt, curr_opt) {
                 // Case 1: Present in current, but absent from baseline
                 (None, Some(curr)) => {
                     if curr.state == PortState::Open {
-                        let svc = service_display(curr);
                         let conf = curr.confidence.unwrap_or(1.0);
+                        let svc = curr.service_label.clone();
                         port_changes.push(PortChange {
                             host,
                             port,
@@ -153,16 +173,12 @@ impl ScanDiff {
                             old_state: None,
                             new_state: Some(curr.state),
                             old_service: None,
-                            new_service: if svc.is_empty() {
-                                None
-                            } else {
-                                Some(svc.clone())
-                            },
+                            new_service: svc.clone(),
                             old_confidence: None,
                             new_confidence: curr.confidence,
                             summary: format!(
                                 "{} (Confidence: {:.0}%)",
-                                if svc.is_empty() { "open port" } else { &svc },
+                                svc.as_deref().unwrap_or("open port"),
                                 conf * 100.0
                             ),
                         });
@@ -192,11 +208,10 @@ impl ScanDiff {
 
                 // Case 3: Present in both
                 (Some(base), Some(curr)) => {
-                    let curr_svc = service_display(curr);
                     let base_svc = base.service_label.clone().unwrap_or_default();
+                    let curr_svc = curr.service_label.clone().unwrap_or_default();
 
                     if base.state == PortState::Open && curr.state != PortState::Open {
-                        // Port closed or filtered
                         port_changes.push(PortChange {
                             host,
                             port,
@@ -204,11 +219,7 @@ impl ScanDiff {
                             old_state: Some(base.state),
                             new_state: Some(curr.state),
                             old_service: base.service_label.clone(),
-                            new_service: if curr_svc.is_empty() {
-                                None
-                            } else {
-                                Some(curr_svc)
-                            },
+                            new_service: curr.service_label.clone(),
                             old_confidence: base.confidence,
                             new_confidence: curr.confidence,
                             summary: format!(
@@ -218,7 +229,6 @@ impl ScanDiff {
                             ),
                         });
                     } else if base.state != PortState::Open && curr.state == PortState::Open {
-                        // Port newly opened
                         port_changes.push(PortChange {
                             host,
                             port,
@@ -248,7 +258,6 @@ impl ScanDiff {
                             ),
                         });
                     } else if base.state == PortState::Open && curr.state == PortState::Open {
-                        // Both open — check for service updates or significant confidence shifts
                         let svc_diff =
                             !curr_svc.is_empty() && !base_svc.is_empty() && curr_svc != base_svc;
                         let conf_diff = match (base.confidence, curr.confidence) {
@@ -307,21 +316,18 @@ impl ScanDiff {
         }
 
         // Defensive posture comparison
-        let current_defenses = crate::defense::analyze_defenses(current_report);
         let mut posture_changes = Vec::new();
-
-        for (host, current_assess) in &current_defenses {
-            if let Some((old_posture, old_conf)) = baseline.defense_postures.get(host) {
-                let current_posture = current_assess.defense_type.badge();
-                if current_posture != old_posture.as_str() {
-                    posture_changes.push(HostPostureChange {
-                        host: *host,
-                        old_posture: old_posture.clone(),
-                        new_posture: current_posture.to_string(),
-                        old_confidence: *old_conf,
-                        new_confidence: current_assess.confidence,
-                    });
-                }
+        for (host, (current_posture, current_conf)) in &current.defense_postures {
+            if let Some((old_posture, old_conf)) = baseline.defense_postures.get(host)
+                && current_posture != old_posture
+            {
+                posture_changes.push(HostPostureChange {
+                    host: *host,
+                    old_posture: old_posture.clone(),
+                    new_posture: current_posture.clone(),
+                    old_confidence: *old_conf,
+                    new_confidence: *current_conf,
+                });
             }
         }
 
@@ -356,11 +362,22 @@ impl ScanDiff {
 
         Self {
             baseline_source: baseline_source.to_string(),
-            current_target: target_label.to_string(),
+            current_target: current_target.to_string(),
             port_changes,
             posture_changes,
             summary,
         }
+    }
+
+    /// Compute differences between a loaded baseline snapshot and a current [`ScanReport`].
+    pub fn compute(
+        baseline_source: &str,
+        target_label: &str,
+        baseline: &BaselineSnapshot,
+        current_report: &ScanReport,
+    ) -> Self {
+        let current_snapshot = BaselineSnapshot::from_report(current_report);
+        Self::compute_snapshots(baseline_source, target_label, baseline, &current_snapshot)
     }
 
     /// Render human-readable terminal diff output matching user specifications.
@@ -473,6 +490,11 @@ pub fn load_baseline(path: &Path) -> Result<BaselineSnapshot, AppError> {
         let mut snapshot = BaselineSnapshot::default();
 
         // 1. Parse open or all results
+        let default_host = value
+            .get("target")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<IpAddr>().ok());
+
         let results_array = value
             .get("results")
             .and_then(|v| v.as_array())
@@ -480,13 +502,15 @@ pub fn load_baseline(path: &Path) -> Result<BaselineSnapshot, AppError> {
 
         if let Some(arr) = results_array {
             for item in arr {
-                let Some(h_str) = item.get("host").and_then(|v| v.as_str()) else {
+                let host = item
+                    .get("host")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.parse::<IpAddr>().ok())
+                    .or(default_host);
+                let Some(host) = host else {
                     continue;
                 };
                 let Some(port) = item.get("port").and_then(|v| v.as_u64()) else {
-                    continue;
-                };
-                let Ok(host) = h_str.parse::<IpAddr>() else {
                     continue;
                 };
 
@@ -504,20 +528,35 @@ pub fn load_baseline(path: &Path) -> Result<BaselineSnapshot, AppError> {
 
                 let mut service_label = None;
                 if let Some(svc) = item.get("service") {
-                    let name = svc.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                    let product = svc.get("product").and_then(|v| v.as_str());
-                    let version = svc.get("version").and_then(|v| v.as_str());
-                    let mut label = name.to_string();
-                    if let Some(p) = product {
-                        label.push(' ');
-                        label.push_str(p);
-                    }
-                    if let Some(v) = version {
-                        label.push('/');
-                        label.push_str(v);
-                    }
-                    if !label.is_empty() {
-                        service_label = Some(label);
+                    if let Some(s_str) = svc.as_str() {
+                        let mut label = s_str.to_string();
+                        if let Some(p) = item.get("product").and_then(|v| v.as_str()) {
+                            label.push(' ');
+                            label.push_str(p);
+                        }
+                        if let Some(v) = item.get("version").and_then(|v| v.as_str()) {
+                            label.push('/');
+                            label.push_str(v);
+                        }
+                        if !label.is_empty() {
+                            service_label = Some(label);
+                        }
+                    } else if let Some(obj) = svc.as_object() {
+                        let name = obj.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                        let product = obj.get("product").and_then(|v| v.as_str());
+                        let version = obj.get("version").and_then(|v| v.as_str());
+                        let mut label = name.to_string();
+                        if let Some(p) = product {
+                            label.push(' ');
+                            label.push_str(p);
+                        }
+                        if let Some(v) = version {
+                            label.push('/');
+                            label.push_str(v);
+                        }
+                        if !label.is_empty() {
+                            service_label = Some(label);
+                        }
                     }
                 }
 
@@ -547,12 +586,20 @@ pub fn load_baseline(path: &Path) -> Result<BaselineSnapshot, AppError> {
                         .and_then(|v| v.as_f64())
                         .unwrap_or(1.0) as f32;
                     let badge = match d_type {
-                        Some("direct_host") => "[CLEAN] Direct Host",
-                        Some("rate_limiting") => "[NOTICE] Rate-Limiting Active",
-                        Some("tarpit") => "[WARNING] TCP Tarpit Active",
-                        Some("syn_proxy") => "[WARNING] SYN-Proxy Middlebox Detected",
-                        Some("waf_or_dpi") => "[WARNING] Layer-7 WAF / DPI Detected",
-                        Some("multi_layer_defense") => {
+                        Some("direct_host") | Some("DirectHost") | Some("Direct") => {
+                            "[CLEAN] Direct Host"
+                        }
+                        Some("rate_limiting") | Some("RateLimiting") | Some("RateLimited") => {
+                            "[NOTICE] Rate-Limiting Active"
+                        }
+                        Some("tarpit") | Some("Tarpit") => "[WARNING] TCP Tarpit Active",
+                        Some("syn_proxy") | Some("SynProxy") => {
+                            "[WARNING] SYN-Proxy Middlebox Detected"
+                        }
+                        Some("waf_or_dpi") | Some("WafOrDpi") => {
+                            "[WARNING] Layer-7 WAF / DPI Detected"
+                        }
+                        Some("multi_layer_defense") | Some("MultiLayerDefense") => {
                             "[CRITICAL] Heavy Middlebox / Deception Detected"
                         }
                         _ => "[CLEAN] Direct Host",
@@ -598,6 +645,32 @@ pub fn load_baseline(path: &Path) -> Result<BaselineSnapshot, AppError> {
         "baseline file {} is not a valid rayscan JSON report or state file",
         path.display()
     )))
+}
+
+/// CLI entry point for the standalone `rayscan diff <BASELINE> <CURRENT>` command.
+pub fn run_cli(
+    args: crate::cli::DiffArgs,
+    theme: Option<crate::theme::Theme>,
+) -> Result<(), AppError> {
+    let base = load_baseline(&args.baseline)?;
+    let curr = load_baseline(&args.current)?;
+    let diff = ScanDiff::compute_snapshots(
+        &args.baseline.display().to_string(),
+        &args.current.display().to_string(),
+        &base,
+        &curr,
+    );
+
+    if args.json {
+        let json = serde_json::to_string_pretty(&diff)
+            .map_err(|e| AppError::runtime(format!("cannot encode JSON diff: {e}")))?;
+        println!("{json}");
+    } else {
+        let stdout_is_tty = std::io::stdout().is_terminal();
+        let use_color = crate::theme::color_enabled(theme.unwrap_or_default(), stdout_is_tty);
+        print!("{}", diff.render_terminal(use_color));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
