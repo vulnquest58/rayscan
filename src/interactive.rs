@@ -111,6 +111,7 @@ pub async fn run(theme: Option<Theme>) -> Result<(), AppError> {
         randomize: false,
         sequential: false,
         top_ports_first: false,
+        no_top_ports_first: false,
         discover_only: false,
         no_live: false,
         connect_only: false,

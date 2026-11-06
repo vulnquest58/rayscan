@@ -24,8 +24,8 @@ pub mod verify;
 use std::collections::{HashMap, HashSet};
 use std::io::IsTerminal;
 use std::net::IpAddr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use indicatif::{ProgressBar, ProgressStyle};
 
@@ -194,6 +194,7 @@ pub(crate) async fn run_scan(args: ScanArgs, theme: Option<Theme>) -> Result<(),
         let filtered = Arc::new(AtomicU64::new(0));
         let silent = Arc::new(AtomicU64::new(0));
         let header_printed = Arc::new(AtomicBool::new(false));
+        let seen_ports = Arc::new(Mutex::new(HashSet::<(IpAddr, u16)>::new()));
         let stdout_is_tty = std::io::stdout().is_terminal();
         let show = resolved.show;
         let theme = resolved.theme;
@@ -223,12 +224,15 @@ pub(crate) async fn run_scan(args: ScanArgs, theme: Option<Theme>) -> Result<(),
                 && let Some(result) = &event.result
                 && show.contains(result.state)
             {
-                if !header_printed.swap(true, Ordering::Relaxed) {
-                    bar.println(output::format_live_header(theme, use_color));
-                    bar.println(output::format_live_divider(use_color));
-                    live_streamed_ref.store(true, Ordering::Relaxed);
+                let mut seen = seen_ports.lock().unwrap();
+                if seen.insert((result.host, result.port)) {
+                    if !header_printed.swap(true, Ordering::Relaxed) {
+                        bar.println(output::format_live_header(theme, use_color));
+                        bar.println(output::format_live_divider(use_color));
+                        live_streamed_ref.store(true, Ordering::Relaxed);
+                    }
+                    bar.println(output::format_live_row(result, theme, use_color));
                 }
-                bar.println(output::format_live_row(result, theme, use_color));
             }
 
             let position = bar.position();

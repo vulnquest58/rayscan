@@ -24,9 +24,10 @@ This document details the architectural and feature enhancements implemented loc
 
 ## 2. Modern UI / UX Evolution (تطوير الواجهة وتجربة المستخدم)
 
-### 2.1 Real-Time Streaming Results Table
+### 2.1 Real-Time Streaming Results Table & Deduplication
 - **Location:** [`src/lib.rs`](file:///e:/VulnQuest_Pro/rayscan/src/lib.rs), [`src/output.rs`](file:///e:/VulnQuest_Pro/rayscan/src/output.rs)
 - **Mechanism:** Integrated `bar.println(...)` via `indicatif`. As soon as any worker verifies an open port matching the active filter, a formatted table row is immediately logged above the active progress bar without flickering or terminal tearing.
+- **Deduplication:** Uses an in-memory `HashSet<(IpAddr, u16)>` so retried ports or multi-stage probes never print duplicate rows.
 - **Controls:** Automatically enabled on interactive TTY terminals; disabled when output is redirected to files/pipes, when `--json`/`--csv`/`--nmap-xml` is selected, or when `--no-live` or `--quiet` is specified.
 
 ### 2.2 Rich Live Progress Section
@@ -37,12 +38,12 @@ This document details the architectural and feature enhancements implemented loc
 
 ### 2.3 New Cyber Theme (`--theme cyber`)
 - **Location:** [`src/theme.rs`](file:///e:/VulnQuest_Pro/rayscan/src/theme.rs)
-- **Palette:** Modern cyberpunk aesthetic:
+- **Palette:** Modern cyberpunk aesthetic with enhanced high-contrast visibility:
   - Header & Accent: Magenta (`\x1b[35m`)
   - Open Ports: Cyan (`\x1b[36m`)
   - Closed Ports: Magenta (`\x1b[35m`)
-  - Filtered Ports: Blue (`\x1b[34m`)
-  - Silent Ports: Dark Grey (`\x1b[90m`)
+  - Filtered Ports: Dark Cyan (`\x1b[36m`)
+  - Silent Ports: Calm Yellow / Amber (`\x1b[33m`)
   - Progress bar: `bar:24.magenta/cyan`
 - **Standard Themes:** `dark` (default), `cyber`, `hacker`, `light`, `minimal`.
 - **Compliance:** Full support for `NO_COLOR` environment variable and non-TTY autodetection.
@@ -156,3 +157,4 @@ open 4  closed 0  filtered 0  silent 0  unreachable 0  error 0  elapsed 2.25s
 | Windows PE Build | `target/x86_64-pc-windows-gnu/release/rayscan.exe` -> `rayscan.exe` | **SUCCESS** | Native PE32+ console |
 | Release Dist Archives | `make dist` | **SUCCESS** | `.tar.gz`, `.zip`, `SHA256SUMS` updated |
 | Local Git State | `git status` | **1 commit ahead of origin/main** | Local only; no push executed |
+

@@ -46,8 +46,8 @@ impl Theme {
             (Self::Hacker, _) => Color::DarkGrey,
             (Self::Cyber, PortState::Open) => Color::Cyan,
             (Self::Cyber, PortState::Closed) => Color::Magenta,
-            (Self::Cyber, PortState::Filtered) => Color::Blue,
-            (Self::Cyber, PortState::Silent) => Color::DarkGrey,
+            (Self::Cyber, PortState::Filtered) => Color::DarkCyan,
+            (Self::Cyber, PortState::Silent) => Color::Yellow,
             (Self::Cyber, PortState::Unreachable) => Color::DarkMagenta,
             (Self::Cyber, PortState::Error) => Color::Red,
             (Self::Light, PortState::Open) => Color::DarkGreen,
@@ -116,6 +116,10 @@ mod tests {
         assert_eq!(Theme::Cyber.accent(), Color::Magenta);
         assert_eq!(Theme::Cyber.state(PortState::Open), Some(Color::Cyan));
         assert_eq!(Theme::Cyber.state(PortState::Closed), Some(Color::Magenta));
-        assert_eq!(Theme::Cyber.state(PortState::Filtered), Some(Color::Blue));
+        assert_eq!(
+            Theme::Cyber.state(PortState::Filtered),
+            Some(Color::DarkCyan)
+        );
+        assert_eq!(Theme::Cyber.state(PortState::Silent), Some(Color::Yellow));
     }
 }

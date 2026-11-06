@@ -12,9 +12,7 @@ Maintained by **vulnquest58** ([@vulnquest58](https://github.com/vulnquest58)).
 
 **Status: Production Ready (v0.1.0).** High-speed scanners without evidence-based verification produce thousands of false positives when encountering real-world enterprise defenses (TCP tarpits, SYN-proxies, and middlebox drop rules). `rayscan` solves this with a two-phase architecture: high-speed raw SYN discovery combined with rigorous semantic handshake verification, banner grabbing, and passive TCP/IP stack fingerprinting.
 
-The Phase 8 UX foundation (interactive setup, `doctor`, themes) is in the
-unreleased source tree; release archives will be refreshed after the speed and
-accuracy tracks.
+Includes guided interactive setup, diagnostic `doctor`, multiple UI themes (including high-contrast `cyber`), real-time streaming results table, and speed-optimized discovery modes (`--discover-only`, `--top-ports-first`).
 
 ---
 
@@ -179,13 +177,39 @@ rayscan doctor
 rayscan doctor --json
 
 # Choose a palette for tables, progress, and diagnostics
-rayscan scan --target 127.0.0.1 --theme hacker
+rayscan scan --target 127.0.0.1 --theme cyber
 ```
 
-Themes are `dark` (default), `light`, `hacker`, and `minimal`. `minimal`
+Themes are `dark` (default), `light`, `hacker`, `cyber` (vibrant magenta & cyan high-contrast palette), and `minimal`. `minimal`
 disables color, and `NO_COLOR` or a non-TTY stdout also disables ANSI styling.
 The interactive wizard covers target, port strategy, profile, scan mode, UDP,
 output format, and output file; it never invokes a raw mode it cannot support.
+
+### Discovery vs. Verification Modes & Port Prioritization
+
+Rayscan decouples rapid network discovery from in-depth verification:
+
+| Mode | Command Flag | Time (1,024 ports) | Service Banners | OS Evidence | Best For |
+|---|---|---|---|---|---|
+| **Verified Scan** (Default) | *(standard scan)* | **~6.2 s** | Yes (full probe) | Yes (with `--os`) | Auditing, elimination of tarpits/proxies |
+| **Fast Discovery** | `--discover-only` | **~1.52 s** (4× faster) | Skipped (0 ms wait) | SYN handshake only | Perimeter mapping, massive sweeps |
+
+```bash
+# Ultra-fast discovery mode (disables banner read timeouts):
+rayscan scan --target 192.168.100.37 --discover-only
+
+# Top-ports-first prioritization (default in 'fast' and 'balanced' profiles):
+# Scans prevalence-ranked ports (HTTP, SSH, MySQL...) first; first open ports show up < 50ms:
+rayscan scan --target 192.168.100.37
+
+# Disable top-ports prioritization to preserve numeric sequence:
+rayscan scan --target 192.168.100.37 --no-top-ports-first
+```
+
+### Real-Time Live Results Table & Deduplication
+
+During scans, `rayscan` dynamically streams open and responsive ports to a live table directly above the progress bar without interfering with progress updates. Retried or ambiguous candidates are deduplicated in memory so each port is displayed cleanly once.
+To disable the live table stream and display only the final summary table, pass `--no-live`.
 
 Targets may be repeated and may be an IP, CIDR, range, hostname, file path, or
 `@file`:

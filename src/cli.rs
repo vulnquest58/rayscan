@@ -139,6 +139,10 @@ pub struct ScanArgs {
     #[arg(long, conflicts_with = "randomize")]
     pub top_ports_first: bool,
 
+    /// Disable top ports prioritization (keep sequential or natural order).
+    #[arg(long, conflicts_with = "top_ports_first")]
+    pub no_top_ports_first: bool,
+
     /// Fast discovery mode: report open ports immediately without service/banner inspection.
     #[arg(long, conflicts_with = "verify")]
     pub discover_only: bool,
@@ -361,6 +365,15 @@ impl ScanArgs {
             AddressFamily::Any
         };
 
+        let top_ports_first = if self.no_top_ports_first || self.sequential || randomize {
+            false
+        } else if self.top_ports_first {
+            true
+        } else {
+            // Enabled by default in Fast and Balanced profiles
+            matches!(profile, Profile::Fast | Profile::Balanced)
+        };
+
         Ok(ResolvedConfig {
             timeout: Duration::from_secs_f64(timeout_seconds),
             probe_timeout: Duration::from_millis(probe_timeout_ms),
@@ -379,7 +392,7 @@ impl ScanArgs {
             aimd: !self.no_aimd,
             aimd_min_pps: self.aimd_min_rate.unwrap_or(100),
             anomaly_threshold: self.anomaly_threshold.unwrap_or(1000),
-            top_ports_first: self.top_ports_first,
+            top_ports_first,
             live_table: !self.no_live,
             resume_file: self.resume.clone(),
             save_state_file: self.save_state.clone(),
@@ -446,6 +459,7 @@ mod tests {
             randomize: false,
             sequential: false,
             top_ports_first: false,
+            no_top_ports_first: false,
             discover_only: false,
             no_live: false,
             connect_only: false,
@@ -474,6 +488,7 @@ mod tests {
         let resolved = args().resolve().unwrap();
         assert!(!resolved.connect_only);
         assert!(!resolved.randomize);
+        assert!(resolved.top_ports_first);
         assert!(resolved.service_detection);
         assert_eq!(resolved.format, OutputFormat::Table);
         assert!(resolved.show.contains(crate::model::PortState::Open));
@@ -561,6 +576,14 @@ mod tests {
         let mut prioritized = args();
         prioritized.top_ports_first = true;
         assert!(prioritized.resolve().unwrap().top_ports_first);
+
+        let mut disabled_prio = args();
+        disabled_prio.no_top_ports_first = true;
+        assert!(!disabled_prio.resolve().unwrap().top_ports_first);
+
+        let mut seq = args();
+        seq.sequential = true;
+        assert!(!seq.resolve().unwrap().top_ports_first);
 
         let mut no_live = args();
         no_live.no_live = true;
