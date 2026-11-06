@@ -335,16 +335,7 @@ fn render_table(
         output.push_str(&"─".repeat(70));
         output.push('\n');
         for (host, assess) in &defenses {
-            let badge = match assess.defense_type {
-                crate::defense::DefenseType::DirectHost => "[CLEAN] Direct Host",
-                crate::defense::DefenseType::SynProxy => "[ALERT] SYN-Proxy Middlebox Detected",
-                crate::defense::DefenseType::Tarpit => "[ALERT] TCP Tarpit Active",
-                crate::defense::DefenseType::RateLimiting => "[NOTICE] Rate-Limiting Active",
-                crate::defense::DefenseType::WafOrDpi => "[ALERT] Layer-7 WAF / DPI Detected",
-                crate::defense::DefenseType::MultiLayerDefense => {
-                    "[ALERT] Multi-Layer Defense Active"
-                }
-            };
+            let badge = assess.defense_type.badge();
             output.push_str(&format!("Target {}:\n", host));
             output.push_str(&format!("  Posture:             {}\n", badge));
             output.push_str(&format!(

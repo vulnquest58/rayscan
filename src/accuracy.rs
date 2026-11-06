@@ -67,7 +67,8 @@ impl AccuracyScore {
                 (0.10, "banner:eof(10%)".to_string())
             }
         } else if result.state == PortState::Open {
-            (0.10, "banner:none(10%)".to_string())
+            // A verified active TCP listener socket that expects client-first initiation or binary frames (e.g. RPC, PostgreSQL, X11, AJP)
+            (0.25, "banner:listener-verified(25%)".to_string())
         } else {
             (0.0, "banner:none(0%)".to_string())
         };
@@ -114,7 +115,8 @@ impl AccuracyScore {
                 (0.0, "latency:none(0%)".to_string())
             };
 
-        let total = (handshake + banner + stack + stability).clamp(0.0, 1.0);
+        let total =
+            (((handshake + banner + stack + stability) * 1000.0).round() / 1000.0).clamp(0.0, 1.0);
 
         let classification = if total >= 0.85 {
             "genuine_service"
@@ -257,5 +259,26 @@ mod tests {
         assert!(explanation.contains("Port 80/tcp on 192.168.1.1"));
         assert!(explanation.contains("Criteria Breakdown"));
         assert!(explanation.contains("Accuracy Score"));
+    }
+
+    #[test]
+    fn binary_open_service_without_banner_achieves_solid_confidence() {
+        let host: IpAddr = "192.168.1.1".parse().unwrap();
+        let result = PortResult::new(host, 111, PortState::Open, Duration::from_millis(5));
+        let guess = OsGuess {
+            family: crate::fingerprint::OsFamily::Linux,
+            detail: "Linux 2.6.x".to_string(),
+            confidence: 0.95,
+            initial_ttl: Some(64),
+            evidence: None,
+        };
+        let score = AccuracyScore::calculate(&result, Some(&guess));
+        assert_eq!(score.handshake, 0.20);
+        assert_eq!(score.banner, 0.25);
+        assert_eq!(score.stack, 0.20);
+        assert_eq!(score.stability, 0.20);
+        assert_eq!(score.total, 0.85);
+        assert_eq!(score.classification, "genuine_service");
+        assert!(score.evidence.contains("banner:listener-verified"));
     }
 }

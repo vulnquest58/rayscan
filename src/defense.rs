@@ -35,6 +35,17 @@ pub enum DefenseType {
 }
 
 impl DefenseType {
+    pub const fn badge(self) -> &'static str {
+        match self {
+            Self::DirectHost => "[CLEAN] Direct Host",
+            Self::RateLimiting => "[NOTICE] Rate-Limiting Active",
+            Self::Tarpit => "[WARNING] TCP Tarpit Active",
+            Self::SynProxy => "[WARNING] SYN-Proxy Middlebox Detected",
+            Self::WafOrDpi => "[WARNING] Layer-7 WAF / DPI Detected",
+            Self::MultiLayerDefense => "[CRITICAL] Heavy Middlebox / Deception Detected",
+        }
+    }
+
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::DirectHost => "Clean Direct Endpoint",
