@@ -70,54 +70,83 @@ This document details the architectural and feature enhancements implemented loc
   `Evidence: TTL=63, Window=5840, MSS=1460, WScale=5, SACK=yes, DF=yes, Options=mss,nop,nop,sack,nop,wscale`
 - **Output:** Surfaced in terminal diagnostic logs, the final table footer, and embedded inside machine-readable JSON reports.
 
+### 3.3 Unified Accuracy Scoring Engine (Phase 7B)
+- **Location:** [`src/accuracy.rs`](file:///e:/VulnQuest_Pro/rayscan/src/accuracy.rs), [`src/output.rs`](file:///e:/VulnQuest_Pro/rayscan/src/output.rs), [`src/cli.rs`](file:///e:/VulnQuest_Pro/rayscan/src/cli.rs)
+- **4-Pillar Evaluation Model:**
+  1. **TCP Handshake (20%):** 3-way handshake established without truncation.
+  2. **Application Data / Banner (40%):** Protocol inspection and recognized signature matching (SSH, HTTP, MySQL, Redis, SMB, etc.) or raw application text.
+  3. **Stack & OS Conformance (20%):** TCP/IP options, TTL, and window scaling align with operating system fingerprint database.
+  4. **Behavioral Stability & Latency (20%):** Low, consistent RTT without packet drop retries or anomalous resets.
+- **CLI Options:**
+  - `--explain [PORT]`: Multi-line diagnostic evidence breakdown explaining every point awarded.
+  - `--min-confidence <N>`: Filter out ambiguous or defensive candidates with confidence < N%.
+- **Output Formats:**
+  - Table: Dedicated `CONFIDENCE` column with color grading (Green >=80%, Yellow 50-79%, Grey <50%).
+  - JSON / JSONL: `confidence` (float 0.0–1.0) and `evidence` string embedded in every port object.
+
 ---
 
 ## 4. Live Verification Against Metasploitable 2 (`192.168.100.37`)
 
-### 4.1 Raw SYN + OS Fingerprint + Evidence Verification (Linux)
+### 4.1 Raw SYN + OS Fingerprint + Accuracy Explanation
 ```console
-# ./rayscan-static-musl scan -t 192.168.100.37 -p 21,22,80,3306 --syn --os
+# sudo ./rayscan-linux scan --syn --os -t 192.168.100.37 -p 21,22,80,3306 --explain 22
 [os] fingerprinting 1 host(s) …
 [os] 192.168.100.37 → Linux 2.6.x (linux) confidence=100% | Evidence: TTL=63, Window=5840, MSS=1460, WScale=5, SACK=yes, DF=yes, Options=mss,nop,nop,sack,nop,wscale
-┌────────────────┬──────┬──────────┬──────────────────────────────┬────────────┬────────────────────┐
-│ HOST           ┆ PORT ┆ STATE    ┆ SERVICE                      ┆ LATENCY_MS ┆ OS                 │
-╞════════════════╪══════╪══════════╪══════════════════════════════╪════════════╪════════════════════╡
-│ 192.168.100.37 ┆ 21   ┆ open     ┆ ftp vsFTPd/2.3.4             ┆ 1.18       ┆ Linux 2.6.x (100%) │
-├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
-│ 192.168.100.37 ┆ 22   ┆ open     ┆ ssh OpenSSH/4.7p1            ┆ 1.04       ┆ Linux 2.6.x (100%) │
-├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
-│ 192.168.100.37 ┆ 80   ┆ open     ┆ http Apache/2.2.8            ┆ 0.90       ┆ Linux 2.6.x (100%) │
-├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
-│ 192.168.100.37 ┆ 3306 ┆ open     ┆ mysql MySQL/5.0.51a-3ubuntu5 ┆ 0.78       ┆ Linux 2.6.x (100%) │
-└────────────────┴──────┴──────────┴──────────────────────────────┴────────────┴────────────────────┘
+┌────────────────┬──────┬───────┬────────────┬─────────────────────────────────────┬────────────┬──────────────────────────┐
+│ HOST           ┆ PORT ┆ STATE ┆ CONFIDENCE ┆ SERVICE                             ┆ LATENCY_MS ┆ OS                       │
+╞════════════════╪══════╪═══════╪════════════╪═════════════════════════════════════╪════════════╪══════════════════════════╡
+│ 192.168.100.37 ┆ 21   ┆ open  ┆ 100%       ┆ ftp (vsFTPd 2.3.4)                  ┆ 0.73       ┆ Linux 2.6.x (100%)       │
+├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌┼╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
+│ 192.168.100.37 ┆ 22   ┆ open  ┆ 100%       ┆ ssh (OpenSSH 4.7p1 Debian 8ubuntu1) ┆ 0.70       ┆ Linux 2.6.x (100%)       │
+├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌┼╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
+│ 192.168.100.37 ┆ 80   ┆ open  ┆ 100%       ┆ http (Apache 2.2.8 (Ubuntu) DAV/2)  ┆ 0.69       ┆ Linux 2.6.x (100%)       │
+├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌┼╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
+│ 192.168.100.37 ┆ 3306 ┆ open  ┆ 100%       ┆ mysql (MySQL 5.0.51a-3ubuntu5)      ┆ 0.73       ┆ Linux 2.6.x (100%)       │
+└────────────────┴──────┴───────┴────────────┴─────────────────────────────────────┴────────────┴──────────────────────────┘
 
 OS Fingerprint Evidence:
   192.168.100.37 → Linux 2.6.x (linux) confidence=100% | Evidence: TTL=63, Window=5840, MSS=1460, WScale=5, SACK=yes, DF=yes, Options=mss,nop,nop,sack,nop,wscale
 
-open 4  closed 0  filtered 0  silent 0  unreachable 0  error 0  elapsed 2.25s
-  targets 1  ports 4  probes 4  workers 2
+Accuracy & Evidence Explanations:
+──────────────────────────────────────────────────────────────────────
+Port 22/tcp on 192.168.100.37:
+  State:               open
+  Accuracy Score:      100% (High Confidence - Genuine Service)
+  Criteria Breakdown:
+    [+] TCP Handshake:   20.0% / 20%  (3-way handshake established)
+    [+] Application:     40.0% / 40%  (ssh OpenSSH 4.7p1 Debian 8ubuntu1)
+    [+] Stack / OS:      20.0% / 20%  (TCP options and TTL characteristics)
+    [+] Stability:       20.0% / 20%  (Handshake latency and RTT consistency)
+  Evidence String:     handshake:ok(20%) banner:ssh/OpenSSH(40%) stack:linux(20%) latency:0.7ms(20%)
+
+open 4  closed 0  filtered 0  silent 0  unreachable 0  error 0  elapsed 0.69s
+  targets 1  ports 4  probes 4  workers 4
+  syn: sent 4  syn-ack 4  rst 0  drops 0  retransmits 0
 ```
 
-### 4.2 Machine-Readable JSON with OS Evidence
+### 4.2 Machine-Readable JSON with Confidence and Evidence
 ```json
 {
   "target": "192.168.100.37",
   "targets": 1,
   "ports": 1,
   "jobs": 1,
-  "workers": 2,
+  "workers": 1,
   "open": [
     {
       "host": "192.168.100.37",
       "port": 22,
       "state": "open",
-      "latency_ms": 1.024,
-      "banner": "SSH-2.0-OpenSSH_4.7p1 Debian-8ubuntu1",
+      "latency_ms": 0.817,
+      "banner": "SSH-2.0-OpenSSH_4.7p1 Debian-8ubuntu1\r\n",
       "service": {
         "name": "ssh",
         "product": "OpenSSH",
-        "version": "4.7p1"
-      }
+        "version": "4.7p1 Debian 8ubuntu1"
+      },
+      "confidence": 1.0,
+      "evidence": "handshake:ok(20%) banner:ssh/OpenSSH(40%) stack:linux(20%) latency:0.8ms(20%)"
     }
   ],
   "os_fingerprints": {
@@ -137,7 +166,7 @@ open 4  closed 0  filtered 0  silent 0  unreachable 0  error 0  elapsed 2.25s
     "unreachable": 0,
     "error": 0
   },
-  "elapsed_ms": 166.484
+  "elapsed_ms": 686.0
 }
 ```
 
@@ -149,12 +178,12 @@ open 4  closed 0  filtered 0  silent 0  unreachable 0  error 0  elapsed 2.25s
 |---|---|---|---|
 | Code Formatting | `cargo fmt --all -- --check` | **PASS (0)** | Strictly compliant |
 | Linting & Warnings | `cargo clippy --all-targets --all-features -- -D warnings` | **PASS (0)** | Zero warnings |
-| Unit Tests | `cargo test --lib` | **128/128 PASS** | All 128 tests passing |
+| Unit Tests | `cargo test --lib` | **133/133 PASS** | All 133 tests passing |
 | Integration Tests | `cargo test --test cli` | **11/11 PASS** | All 11 tests passing |
 | Bench Unittests | `python3 -m unittest discover -s bench/tests` | **13/13 PASS** | Command & parser tests |
 | Dynamic Linux Build | `target/release/rayscan` -> `rayscan-linux` | **SUCCESS** | Stripped ELF64 |
 | Static Musl Build | `target/x86_64-unknown-linux-musl/release/rayscan` -> `rayscan-static-musl` | **SUCCESS** | Fully portable static-pie |
 | Windows PE Build | `target/x86_64-pc-windows-gnu/release/rayscan.exe` -> `rayscan.exe` | **SUCCESS** | Native PE32+ console |
 | Release Dist Archives | `make dist` | **SUCCESS** | `.tar.gz`, `.zip`, `SHA256SUMS` updated |
-| Local Git State | `git status` | **1 commit ahead of origin/main** | Local only; no push executed |
+| Local Git State | `git status` | **Local commits ahead of origin/main** | Local only; no push executed |
 

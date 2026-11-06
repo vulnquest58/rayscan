@@ -228,6 +228,14 @@ pub struct ScanArgs {
     /// Use with --resume to continue an interrupted scan.
     #[arg(long, value_name = "FILE")]
     pub save_state: Option<PathBuf>,
+
+    /// Filter results to only show ports with confidence score >= N percent (0-100).
+    #[arg(long, value_name = "PERCENT")]
+    pub min_confidence: Option<u8>,
+
+    /// Print comprehensive evidence and accuracy breakdown for all ports or a specific port.
+    #[arg(long, num_args = 0..=1, default_missing_value = "0", value_name = "PORT")]
+    pub explain: Option<u16>,
 }
 
 #[derive(Clone, Debug)]
@@ -264,6 +272,10 @@ pub struct ResolvedConfig {
     pub save_state_file: Option<PathBuf>,
     /// Selected color theme.
     pub theme: Theme,
+    /// Minimum confidence percentage filter.
+    pub min_confidence: Option<u8>,
+    /// Port to explain (0 means all open ports).
+    pub explain: Option<u16>,
 }
 
 impl ScanArgs {
@@ -374,6 +386,14 @@ impl ScanArgs {
             matches!(profile, Profile::Fast | Profile::Balanced)
         };
 
+        if let Some(min_conf) = self.min_confidence
+            && min_conf > 100
+        {
+            return Err(AppError::usage(
+                "--min-confidence must be between 0 and 100 percent",
+            ));
+        }
+
         Ok(ResolvedConfig {
             timeout: Duration::from_secs_f64(timeout_seconds),
             probe_timeout: Duration::from_millis(probe_timeout_ms),
@@ -397,6 +417,8 @@ impl ScanArgs {
             resume_file: self.resume.clone(),
             save_state_file: self.save_state.clone(),
             theme: file.theme.unwrap_or_default(),
+            min_confidence: self.min_confidence,
+            explain: self.explain,
         })
     }
 
@@ -480,6 +502,8 @@ mod tests {
             anomaly_threshold: None,
             resume: None,
             save_state: None,
+            min_confidence: None,
+            explain: None,
         }
     }
 
@@ -540,6 +564,14 @@ mod tests {
         let mut invalid = args();
         invalid.workers = Some(MAX_WORKERS + 1);
         assert_eq!(invalid.resolve().unwrap_err().exit_code(), 2);
+
+        let mut invalid_conf = args();
+        invalid_conf.min_confidence = Some(101);
+        assert_eq!(invalid_conf.resolve().unwrap_err().exit_code(), 2);
+
+        let mut valid_conf = args();
+        valid_conf.min_confidence = Some(80);
+        assert_eq!(valid_conf.resolve().unwrap().min_confidence, Some(80));
     }
 
     #[test]

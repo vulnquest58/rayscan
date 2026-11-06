@@ -211,6 +211,26 @@ rayscan scan --target 192.168.100.37 --no-top-ports-first
 During scans, `rayscan` dynamically streams open and responsive ports to a live table directly above the progress bar without interfering with progress updates. Retried or ambiguous candidates are deduplicated in memory so each port is displayed cleanly once.
 To disable the live table stream and display only the final summary table, pass `--no-live`.
 
+### Unified Accuracy Scoring Engine (`--explain` & `--min-confidence`)
+
+Rather than treating every responsive port as an opaque `open` state, `rayscan` computes an objective **Accuracy Score (0–100%)** grounded in 4 empirical criteria:
+
+1. **TCP Handshake (20%)**: Valid 3-way handshake established without truncation.
+2. **Application Banner / Payload (40%)**: Verified protocol handshake (SSH, HTTP, MySQL, Redis, SMB, etc.) or responsive application data.
+3. **Stack & OS Conformance (20%)**: TCP/IP options, TTL, and window scale match operating system fingerprinting norms.
+4. **Behavioral Stability (20%)**: Predictable RTT latency without packet loss retries or anomalous RST teardowns.
+
+```bash
+# Print comprehensive diagnostic evidence breakdown for port 22:
+sudo rayscan scan --syn --os --target 192.168.100.37 -p 22 --explain 22
+
+# Explain all open ports on target:
+sudo rayscan scan --syn --os --target 192.168.100.37 --explain
+
+# Filter out low-confidence/ambiguous candidates (require >= 90% confidence):
+rayscan scan --target 192.168.100.37 --min-confidence 90
+```
+
 Targets may be repeated and may be an IP, CIDR, range, hostname, file path, or
 `@file`:
 

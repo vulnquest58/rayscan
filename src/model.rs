@@ -149,12 +149,10 @@ pub struct PortResult {
     pub detail: Option<String>,
     pub service: Option<ServiceInfo>,
     pub banner: Option<String>,
-    /// Confidence in this result, 0.0–1.0.  Set by the SYN engine when a probe
-    /// was answered on a retry pass rather than the first pass, indicating
-    /// possible packet loss affected the measurement.  `None` means full
-    /// confidence (answered on the first attempt, or produced by the connect
-    /// engine which always verifies).
+    /// Confidence in this result, 0.0–1.0. Set by the accuracy scoring engine.
     pub confidence: Option<f32>,
+    /// Evidence string detailing why this result and confidence were reached.
+    pub evidence: Option<String>,
 }
 
 impl PortResult {
@@ -168,7 +166,13 @@ impl PortResult {
             service: None,
             banner: None,
             confidence: None,
+            evidence: None,
         }
+    }
+
+    pub fn with_evidence(mut self, evidence: impl Into<String>) -> Self {
+        self.evidence = Some(evidence.into());
+        self
     }
 
     pub fn with_detail(mut self, detail: impl Into<String>) -> Self {

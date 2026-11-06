@@ -40,49 +40,64 @@ impl OutputFormat {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn emit(
-    report: &ScanReport,
-    target: &str,
-    format: OutputFormat,
-    show: StateSet,
-    destination: Option<&Path>,
-    quiet: bool,
-    theme: Theme,
-    streamed: bool,
-) -> Result<(), AppError> {
+/// Options controlling scan report formatting and emission.
+#[derive(Clone, Copy, Debug)]
+pub struct EmitOptions<'a> {
+    pub format: OutputFormat,
+    pub show: StateSet,
+    pub destination: Option<&'a Path>,
+    pub quiet: bool,
+    pub theme: Theme,
+    pub streamed: bool,
+    pub min_confidence: Option<u8>,
+    pub explain: Option<u16>,
+}
+
+pub fn emit(report: &ScanReport, target: &str, options: EmitOptions<'_>) -> Result<(), AppError> {
+    let min_conf_ratio = options.min_confidence.map(|c| (c as f32) / 100.0);
     let mut selected: Vec<&PortResult> = report
         .results
         .iter()
-        .filter(|result| show.contains(result.state))
+        .filter(|result| {
+            if !options.show.contains(result.state) {
+                return false;
+            }
+            if let Some(min) = min_conf_ratio
+                && result.confidence.unwrap_or(1.0) < min
+            {
+                return false;
+            }
+            true
+        })
         .collect();
     selected.sort_by(|left, right| compare_results(left, right));
 
     let stdout_is_tty = std::io::stdout().is_terminal();
-    let contents = match format {
+    let contents = match options.format {
         OutputFormat::Table => render_table(
             report,
             &selected,
-            theme,
-            color_enabled(theme, stdout_is_tty) && destination.is_none(),
+            options.theme,
+            color_enabled(options.theme, stdout_is_tty) && options.destination.is_none(),
             stdout_is_tty,
+            options.explain,
         ),
-        OutputFormat::Json => render_json(report, target, show)?,
+        OutputFormat::Json => render_json(report, target, options.show, options.min_confidence)?,
         OutputFormat::Jsonl => render_jsonl(&selected)?,
         OutputFormat::Csv => render_csv(&selected),
         OutputFormat::NmapXml => render_nmap_xml(report, target, &selected),
         OutputFormat::Greppable => render_greppable(target, &selected),
     };
 
-    if let Some(path) = destination {
-        return write_destination(Some(path), &contents, quiet);
+    if let Some(path) = options.destination {
+        return write_destination(Some(path), &contents, options.quiet);
     }
 
-    if streamed && format == OutputFormat::Table && stdout_is_tty {
+    if options.streamed && options.format == OutputFormat::Table && stdout_is_tty {
         // Results were already streamed live to stdout. Output the summary footer & OS findings.
         println!(
             "{}",
-            format_live_divider(color_enabled(theme, stdout_is_tty))
+            format_live_divider(color_enabled(options.theme, stdout_is_tty))
         );
         if !report.os_fingerprints.is_empty() {
             println!("OS Fingerprint Evidence:");
@@ -103,6 +118,41 @@ pub fn emit(
             }
             println!();
         }
+        if let Some(exp_port) = options.explain {
+            println!("\nAccuracy & Evidence Explanations:");
+            println!("{}", "─".repeat(70));
+            let to_explain: Vec<&&PortResult> = if exp_port == 0 {
+                selected.iter().collect()
+            } else {
+                selected.iter().filter(|r| r.port == exp_port).collect()
+            };
+            if to_explain.is_empty() {
+                println!(
+                    "  No matching responsive port found to explain for port {}",
+                    exp_port
+                );
+            } else {
+                for res in to_explain {
+                    let guess = report.os_fingerprints.get(&res.host);
+                    let score = crate::accuracy::AccuracyScore::calculate(res, guess);
+                    let svc_desc = service_label(res);
+                    println!(
+                        "{}",
+                        score.explain(
+                            res.host,
+                            res.port,
+                            res.state,
+                            if svc_desc.is_empty() {
+                                None
+                            } else {
+                                Some(&svc_desc)
+                            }
+                        )
+                    );
+                }
+            }
+            println!();
+        }
         print!("{}", format_summary(report.counts, report.elapsed));
         println!(
             "  targets {}  ports {}  probes {}  workers {}",
@@ -111,7 +161,7 @@ pub fn emit(
         return Ok(());
     }
 
-    write_destination(None, &contents, quiet)
+    write_destination(None, &contents, options.quiet)
 }
 
 fn compare_results(left: &PortResult, right: &PortResult) -> std::cmp::Ordering {
@@ -126,6 +176,7 @@ fn render_table(
     theme: Theme,
     use_color: bool,
     dynamic_width: bool,
+    explain: Option<u16>,
 ) -> String {
     let has_os = !report.os_fingerprints.is_empty();
 
@@ -149,6 +200,7 @@ fn render_table(
         header("HOST"),
         header("PORT"),
         header("STATE"),
+        header("CONFIDENCE"),
         header("SERVICE"),
         header("LATENCY_MS"),
     ];
@@ -160,6 +212,7 @@ fn render_table(
         ColumnConstraint::LowerBoundary(Width::Fixed(15)),
         ColumnConstraint::LowerBoundary(Width::Fixed(6)),
         ColumnConstraint::LowerBoundary(Width::Fixed(10)),
+        ColumnConstraint::LowerBoundary(Width::Fixed(12)),
         ColumnConstraint::LowerBoundary(Width::Fixed(16)),
         ColumnConstraint::LowerBoundary(Width::Fixed(12)),
     ];
@@ -173,11 +226,31 @@ fn render_table(
             Some(color) if use_color => Cell::new(result.state.as_str()).fg(color),
             _ => Cell::new(result.state.as_str()),
         };
+        let conf_str = match result.confidence {
+            Some(conf) => format!("{:.0}%", conf * 100.0),
+            None => "-".to_string(),
+        };
+        let conf_cell = if use_color {
+            if let Some(conf) = result.confidence {
+                if conf >= 0.80 {
+                    Cell::new(conf_str).fg(comfy_table::Color::Green)
+                } else if conf >= 0.50 {
+                    Cell::new(conf_str).fg(comfy_table::Color::Yellow)
+                } else {
+                    Cell::new(conf_str).fg(comfy_table::Color::DarkGrey)
+                }
+            } else {
+                Cell::new(conf_str)
+            }
+        } else {
+            Cell::new(conf_str)
+        };
         let service_cell = Cell::new(service_label(result));
         let mut row = vec![
             Cell::new(result.host),
             Cell::new(result.port),
             state_cell,
+            conf_cell,
             service_cell,
             Cell::new(format!("{:.2}", result.latency.as_secs_f64() * 1000.0)),
         ];
@@ -215,6 +288,41 @@ fn render_table(
             ));
         }
     }
+
+    if let Some(exp_port) = explain {
+        output.push_str("\nAccuracy & Evidence Explanations:\n");
+        output.push_str(&"─".repeat(70));
+        output.push('\n');
+        let to_explain: Vec<&&PortResult> = if exp_port == 0 {
+            results.iter().collect()
+        } else {
+            results.iter().filter(|r| r.port == exp_port).collect()
+        };
+        if to_explain.is_empty() {
+            output.push_str(&format!(
+                "  No matching responsive port found to explain for port {}\n",
+                exp_port
+            ));
+        } else {
+            for res in to_explain {
+                let guess = report.os_fingerprints.get(&res.host);
+                let score = crate::accuracy::AccuracyScore::calculate(res, guess);
+                let svc_desc = service_label(res);
+                output.push_str(&score.explain(
+                    res.host,
+                    res.port,
+                    res.state,
+                    if svc_desc.is_empty() {
+                        None
+                    } else {
+                        Some(&svc_desc)
+                    },
+                ));
+                output.push('\n');
+            }
+        }
+    }
+
     output.push('\n');
     output.push_str(&format_summary(report.counts, report.elapsed));
     output.push_str(&format!(
@@ -251,12 +359,13 @@ pub fn format_live_header(theme: Theme, use_color: bool) -> String {
     let host = "HOST";
     let port = "PORT";
     let state = "STATE";
+    let conf = "CONF";
     let service = "SERVICE";
     let version = "VERSION";
     let latency = "LATENCY";
     let header = format!(
-        "{:<17} {:<6} {:<10} {:<18} {:<20} {:<8}",
-        host, port, state, service, version, latency
+        "{:<17} {:<6} {:<10} {:<6} {:<18} {:<20} {:<8}",
+        host, port, state, conf, service, version, latency
     );
     if use_color {
         format!("\x1b[1;{}m{}\x1b[0m", color_to_ansi(theme.accent()), header)
@@ -266,7 +375,7 @@ pub fn format_live_header(theme: Theme, use_color: bool) -> String {
 }
 
 pub fn format_live_divider(_use_color: bool) -> String {
-    "─".repeat(83)
+    "─".repeat(90)
 }
 
 pub fn format_live_row(result: &PortResult, theme: Theme, use_color: bool) -> String {
@@ -297,11 +406,33 @@ pub fn format_live_row(result: &PortResult, theme: Theme, use_color: bool) -> St
         format!("{:<10}", state_str)
     };
 
+    let conf_str = match result.confidence {
+        Some(c) => format!("{:.0}%", c * 100.0),
+        None => "-".to_string(),
+    };
+    let conf_col = if use_color {
+        if let Some(c) = result.confidence {
+            let color_code = if c >= 0.80 {
+                "32" // green
+            } else if c >= 0.50 {
+                "33" // yellow
+            } else {
+                "90" // dark grey
+            };
+            format!("\x1b[{}m{:<6}\x1b[0m", color_code, conf_str)
+        } else {
+            format!("{:<6}", conf_str)
+        }
+    } else {
+        format!("{:<6}", conf_str)
+    };
+
     format!(
-        "{:<17} {:<6} {} {:<18} {:<20} {:<8}",
+        "{:<17} {:<6} {} {} {:<18} {:<20} {:<8}",
         host,
         port,
         state_col,
+        conf_col,
         svc_name.chars().take(18).collect::<String>(),
         svc_ver.chars().take(20).collect::<String>(),
         lat
@@ -368,6 +499,8 @@ struct JsonResult {
     detail: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     confidence: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    evidence: Option<String>,
 }
 
 impl JsonResult {
@@ -381,15 +514,32 @@ impl JsonResult {
             service: result.service.clone(),
             detail: result.detail.clone(),
             confidence: result.confidence,
+            evidence: result.evidence.clone(),
         }
     }
 }
 
-fn render_json(report: &ScanReport, target: &str, show: StateSet) -> Result<String, AppError> {
+fn render_json(
+    report: &ScanReport,
+    target: &str,
+    show: StateSet,
+    min_confidence: Option<u8>,
+) -> Result<String, AppError> {
+    let min_conf_ratio = min_confidence.map(|c| (c as f32) / 100.0);
     let mut opens: Vec<&PortResult> = report
         .results
         .iter()
-        .filter(|result| result.state == PortState::Open)
+        .filter(|result| {
+            if result.state != PortState::Open {
+                return false;
+            }
+            if let Some(min) = min_conf_ratio
+                && result.confidence.unwrap_or(1.0) < min
+            {
+                return false;
+            }
+            true
+        })
         .collect();
     opens.sort_by(|left, right| compare_results(left, right));
 
@@ -400,7 +550,17 @@ fn render_json(report: &ScanReport, target: &str, show: StateSet) -> Result<Stri
     let mut selected: Vec<&PortResult> = report
         .results
         .iter()
-        .filter(|result| show.contains(result.state))
+        .filter(|result| {
+            if !show.contains(result.state) {
+                return false;
+            }
+            if let Some(min) = min_conf_ratio
+                && result.confidence.unwrap_or(1.0) < min
+            {
+                return false;
+            }
+            true
+        })
         .collect();
     selected.sort_by(|left, right| compare_results(left, right));
 
@@ -745,8 +905,9 @@ mod tests {
             .iter()
             .filter(|r| r.state == PortState::Open)
             .collect();
-        let output = render_table(&report, &results, Theme::Minimal, false, false);
+        let output = render_table(&report, &results, Theme::Minimal, false, false, None);
         assert!(output.contains("HOST"));
+        assert!(output.contains("CONFIDENCE"));
         assert!(output.contains("SERVICE"));
         assert!(output.contains("192.0.2.1"));
         assert!(output.contains("80"));
@@ -762,29 +923,60 @@ mod tests {
     fn dynamic_table_keeps_header_labels_intact() {
         let report = sample_report();
         let results: Vec<&PortResult> = report.results.iter().collect();
-        let output = render_table(&report, &results, Theme::Minimal, false, true);
+        let output = render_table(&report, &results, Theme::Minimal, false, true, None);
         assert!(output.contains("HOST"));
+        assert!(output.contains("CONFIDENCE"));
         assert!(output.contains("SERVICE"));
         assert!(output.contains("LATENCY_MS"));
     }
 
     #[test]
+    fn table_explain_renders_breakdown() {
+        let mut report = sample_report();
+        crate::accuracy::score_report(&mut report);
+        let results: Vec<&PortResult> = report.results.iter().collect();
+        let output = render_table(&report, &results, Theme::Minimal, false, false, Some(80));
+        assert!(output.contains("Accuracy & Evidence Explanations:"));
+        assert!(output.contains("Port 80/tcp on 192.0.2.1"));
+        assert!(output.contains("Criteria Breakdown:"));
+        assert!(output.contains("Evidence String:"));
+    }
+
+    #[test]
     fn json_contains_open_and_optional_results() {
-        let report = sample_report();
-        let output = render_json(&report, "192.0.2.1", StateSet::all()).unwrap();
+        let mut report = sample_report();
+        crate::accuracy::score_report(&mut report);
+        let output = render_json(&report, "192.0.2.1", StateSet::all(), None).unwrap();
         let payload: serde_json::Value = serde_json::from_str(&output).unwrap();
         assert_eq!(payload["open"][0]["port"], 80);
         assert_eq!(payload["open"][0]["service"]["name"], "http");
         assert_eq!(payload["open"][0]["service"]["product"], "rayscan-lab");
         assert_eq!(payload["open"][0]["banner"], "HTTP/1.1 200 OK");
+        assert!(payload["open"][0]["confidence"].as_f64().unwrap() > 0.0);
+        assert!(payload["open"][0]["evidence"].is_string());
         assert_eq!(payload["results"].as_array().unwrap().len(), 3);
         assert_eq!(payload["summary"]["filtered"], 1);
     }
 
     #[test]
+    fn json_min_confidence_filters_results() {
+        let mut report = sample_report();
+        crate::accuracy::score_report(&mut report);
+        // Port 80 should have high confidence (>80%)
+        let output_high = render_json(&report, "192.0.2.1", StateSet::open(), Some(80)).unwrap();
+        let payload_high: serde_json::Value = serde_json::from_str(&output_high).unwrap();
+        assert_eq!(payload_high["open"].as_array().unwrap().len(), 1);
+
+        // Filter requiring 101% (impossible)
+        let output_none = render_json(&report, "192.0.2.1", StateSet::open(), Some(101)).unwrap();
+        let payload_none: serde_json::Value = serde_json::from_str(&output_none).unwrap();
+        assert_eq!(payload_none["open"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
     fn default_json_omits_non_open_results() {
         let report = sample_report();
-        let output = render_json(&report, "192.0.2.1", StateSet::open()).unwrap();
+        let output = render_json(&report, "192.0.2.1", StateSet::open(), None).unwrap();
         let payload: serde_json::Value = serde_json::from_str(&output).unwrap();
         assert!(payload.get("results").is_none());
     }

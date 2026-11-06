@@ -1,3 +1,4 @@
+pub mod accuracy;
 pub mod anomaly;
 pub mod classify;
 pub mod cli;
@@ -110,7 +111,7 @@ pub(crate) async fn run_scan(args: ScanArgs, theme: Option<Theme>) -> Result<(),
             eprintln!("[resume] all ports already scanned — outputting saved results");
         }
         // Build a synthetic complete report from the saved state.
-        let report = crate::model::ScanReport {
+        let mut report = crate::model::ScanReport {
             targets: targets.len(),
             ports: all_ports.len(),
             jobs: (targets.len() as u64) * (all_ports.len() as u64),
@@ -122,15 +123,20 @@ pub(crate) async fn run_scan(args: ScanArgs, theme: Option<Theme>) -> Result<(),
             probed_ports: all_ports.clone(),
             partial: false,
         };
+        accuracy::score_report(&mut report);
         return output::emit(
             &report,
             &args.target_label(),
-            resolved.format,
-            resolved.show,
-            args.output.as_deref(),
-            args.quiet,
-            resolved.theme,
-            false,
+            output::EmitOptions {
+                format: resolved.format,
+                show: resolved.show,
+                destination: args.output.as_deref(),
+                quiet: args.quiet,
+                theme: resolved.theme,
+                streamed: false,
+                min_confidence: resolved.min_confidence,
+                explain: resolved.explain,
+            },
         );
     }
 
@@ -502,15 +508,21 @@ pub(crate) async fn run_scan(args: ScanArgs, theme: Option<Theme>) -> Result<(),
         eprintln!("[rayscan] partial results — scan was interrupted before completion");
     }
 
+    accuracy::score_report(&mut report);
+
     output::emit(
         &report,
         &target_label,
-        resolved.format,
-        resolved.show,
-        args.output.as_deref(),
-        args.quiet,
-        resolved.theme,
-        live_streamed.load(Ordering::Relaxed),
+        output::EmitOptions {
+            format: resolved.format,
+            show: resolved.show,
+            destination: args.output.as_deref(),
+            quiet: args.quiet,
+            theme: resolved.theme,
+            streamed: live_streamed.load(Ordering::Relaxed),
+            min_confidence: resolved.min_confidence,
+            explain: resolved.explain,
+        },
     )
 }
 
