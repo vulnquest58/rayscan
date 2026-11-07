@@ -1,0 +1,232 @@
+{
+  "target": "192.168.100.37",
+  "targets": 1,
+  "ports": 10000,
+  "jobs": 10000,
+  "workers": 2,
+  "open": [
+    {
+      "host": "192.168.100.37",
+      "port": 21,
+      "state": "open",
+      "latency_ms": 5.259,
+      "banner": "220 (vsFTPd 2.3.4)",
+      "service": {
+        "name": "ftp",
+        "product": "vsFTPd",
+        "version": "2.3.4"
+      },
+      "confidence": 1.0,
+      "evidence": "handshake:ok(20%) banner:ftp/vsFTPd(40%) stack:linux(20%) latency:5.3ms(20%)"
+    },
+    {
+      "host": "192.168.100.37",
+      "port": 22,
+      "state": "open",
+      "latency_ms": 7.55,
+      "banner": "SSH-2.0-OpenSSH_4.7p1 Debian-8ubuntu1",
+      "service": {
+        "name": "ssh",
+        "product": "OpenSSH",
+        "version": "4.7p1"
+      },
+      "confidence": 1.0,
+      "evidence": "handshake:ok(20%) banner:ssh/OpenSSH(40%) stack:linux(20%) latency:7.5ms(20%)"
+    },
+    {
+      "host": "192.168.100.37",
+      "port": 23,
+      "state": "open",
+      "latency_ms": 6.075,
+      "banner": "Telnet negotiation",
+      "service": {
+        "name": "telnet"
+      },
+      "confidence": 0.95,
+      "evidence": "handshake:ok(20%) banner:telnet(35%) stack:linux(20%) latency:6.1ms(20%)"
+    },
+    {
+      "host": "192.168.100.37",
+      "port": 80,
+      "state": "open",
+      "latency_ms": 6.053,
+      "banner": "HTTP/1.1 200 OK",
+      "service": {
+        "name": "http",
+        "product": "Apache",
+        "version": "2.2.8"
+      },
+      "confidence": 1.0,
+      "evidence": "handshake:ok(20%) banner:http/Apache(40%) stack:linux(20%) latency:6.1ms(20%)"
+    },
+    {
+      "host": "192.168.100.37",
+      "port": 111,
+      "state": "open",
+      "latency_ms": 6.037,
+      "confidence": 0.9,
+      "evidence": "handshake:ok(20%) banner:binary-protocol(30%) stack:linux(20%) latency:6.0ms(20%)"
+    },
+    {
+      "host": "192.168.100.37",
+      "port": 514,
+      "state": "open",
+      "latency_ms": 5.862,
+      "confidence": 0.88,
+      "evidence": "handshake:ok(20%) banner:listener-verified(28%) stack:linux(20%) latency:5.9ms(20%)"
+    },
+    {
+      "host": "192.168.100.37",
+      "port": 1524,
+      "state": "open",
+      "latency_ms": 5.837,
+      "banner": "root@metasploitable:/#",
+      "service": {
+        "name": "shell"
+      },
+      "confidence": 0.95,
+      "evidence": "handshake:ok(20%) banner:shell(35%) stack:linux(20%) latency:5.8ms(20%)"
+    },
+    {
+      "host": "192.168.100.37",
+      "port": 3306,
+      "state": "open",
+      "latency_ms": 6.424,
+      "banner": "5.0.51a-3ubuntu5",
+      "service": {
+        "name": "mysql",
+        "product": "MySQL",
+        "version": "5.0.51a-3ubuntu5"
+      },
+      "confidence": 1.0,
+      "evidence": "handshake:ok(20%) banner:mysql/MySQL(40%) stack:linux(20%) latency:6.4ms(20%)"
+    },
+    {
+      "host": "192.168.100.37",
+      "port": 3632,
+      "state": "open",
+      "latency_ms": 0.542,
+      "confidence": 0.9,
+      "evidence": "handshake:ok(20%) banner:binary-protocol(30%) stack:linux(20%) latency:0.5ms(20%)"
+    },
+    {
+      "host": "192.168.100.37",
+      "port": 5432,
+      "state": "open",
+      "latency_ms": 4.817,
+      "confidence": 0.9,
+      "evidence": "handshake:ok(20%) banner:binary-protocol(30%) stack:linux(20%) latency:4.8ms(20%)"
+    },
+    {
+      "host": "192.168.100.37",
+      "port": 5900,
+      "state": "open",
+      "latency_ms": 6.849,
+      "banner": "RFB 003.003",
+      "service": {
+        "name": "vnc",
+        "product": "VNC",
+        "version": "3.3"
+      },
+      "confidence": 1.0,
+      "evidence": "handshake:ok(20%) banner:vnc/VNC(40%) stack:linux(20%) latency:6.8ms(20%)"
+    },
+    {
+      "host": "192.168.100.37",
+      "port": 6000,
+      "state": "open",
+      "latency_ms": 4.895,
+      "confidence": 0.9,
+      "evidence": "handshake:ok(20%) banner:binary-protocol(30%) stack:linux(20%) latency:4.9ms(20%)"
+    },
+    {
+      "host": "192.168.100.37",
+      "port": 6667,
+      "state": "open",
+      "latency_ms": 6.569,
+      "banner": ":irc.Metasploitable.LAN NOTICE AUTH :*** Looking up your hostname...",
+      "service": {
+        "name": "irc"
+      },
+      "confidence": 0.95,
+      "evidence": "handshake:ok(20%) banner:irc(35%) stack:linux(20%) latency:6.6ms(20%)"
+    },
+    {
+      "host": "192.168.100.37",
+      "port": 6697,
+      "state": "open",
+      "latency_ms": 0.545,
+      "banner": ":irc.Metasploitable.LAN NOTICE AUTH :*** Looking up your hostname...",
+      "service": {
+        "name": "irc"
+      },
+      "confidence": 0.95,
+      "evidence": "handshake:ok(20%) banner:irc(35%) stack:linux(20%) latency:0.5ms(20%)"
+    },
+    {
+      "host": "192.168.100.37",
+      "port": 8009,
+      "state": "open",
+      "latency_ms": 0.609,
+      "confidence": 0.9,
+      "evidence": "handshake:ok(20%) banner:binary-protocol(30%) stack:linux(20%) latency:0.6ms(20%)"
+    },
+    {
+      "host": "192.168.100.37",
+      "port": 8180,
+      "state": "open",
+      "latency_ms": 1.794,
+      "banner": "HTTP/1.1 200 OK",
+      "service": {
+        "name": "http",
+        "product": "Apache-Coyote",
+        "version": "1.1"
+      },
+      "confidence": 1.0,
+      "evidence": "handshake:ok(20%) banner:http/Apache-Coyote(40%) stack:linux(20%) latency:1.8ms(20%)"
+    },
+    {
+      "host": "192.168.100.37",
+      "port": 8787,
+      "state": "open",
+      "latency_ms": 1.548,
+      "banner": "F o: DRb::DRbConnError : bt[ \"//usr/lib/ruby/1.8/drb/drb.rb:573:in `load'\"7/usr/lib/ruby/1.8/drb/drb.rb:612:in `recv_request'\"7/usr/lib/ruby/1.8/drb/drb.rb:911:",
+      "service": {
+        "name": "ruby-drb"
+      },
+      "confidence": 0.95,
+      "evidence": "handshake:ok(20%) banner:ruby-drb(35%) stack:linux(20%) latency:1.5ms(20%)"
+    }
+  ],
+  "os_fingerprints": {
+    "192.168.100.37": {
+      "family": "linux",
+      "detail": "Linux 2.6.x",
+      "confidence": 1.0,
+      "initial_ttl": 64,
+      "evidence": "TTL=63, Window=5840, MSS=1460, WScale=5, SACK=yes, DF=yes, Options=mss,nop,nop,sack,nop,wscale"
+    }
+  },
+  "defense": {
+    "192.168.100.37": {
+      "host": "192.168.100.37",
+      "defense_type": "multi_layer_defense",
+      "confidence": 0.95,
+      "summary": "Target is protected by a multi-layered defense (active SYN-proxy and TCP tarpits detected).",
+      "indicators": [
+        "2 port(s) returned SYN-ACK during discovery but were rejected or dropped upon connection verification",
+        "7 port(s) completed TCP handshakes but held connections mute without emitting application banners (tarpit behavior)"
+      ],
+      "recommended_action": "Use `--min-confidence 80` to discard tarpit artifacts, and `--probe-timeout-ms 2000` to probe deep services."
+    }
+  },
+  "summary": {
+    "open": 17,
+    "closed": 9976,
+    "filtered": 0,
+    "silent": 7,
+    "unreachable": 0,
+    "error": 0
+  },
+  "elapsed_ms": 55283.175
+}
