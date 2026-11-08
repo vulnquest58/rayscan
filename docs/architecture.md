@@ -147,8 +147,14 @@ small; the full target/port Cartesian product is never materialized.
 
 **Fallback:** when `CAP_NET_RAW` is absent, the engine prints one line to stderr
 and exits with code 1. The caller can then re-invoke without `--syn` to use the
-connect scanner. IPv6 raw SYN is not implemented; IPv6 targets return a usage
-error when `--syn` is requested.
+connect scanner.
+
+**IPv6:** IPv4 uses `AF_PACKET` with a classic BPF filter. IPv6 uses an
+`AF_INET6` raw socket for RX and `IPPROTO_RAW` for TX with a complete IPv6/TCP
+header, letting the kernel handle routing and neighbour discovery. SYN cookies
+bind the full 128-bit address. IPv4 decoys and fragmentation are not available
+for IPv6, and mixed-family target sets are partitioned and merged into a single
+report.
 
 ## Result semantics
 

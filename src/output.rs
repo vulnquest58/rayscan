@@ -12,6 +12,9 @@ use crate::model::{PortResult, PortState, ScanReport, StateCounts, StateSet};
 use crate::service::ServiceInfo;
 use crate::theme::{Theme, color_enabled};
 
+/// Maximum advisory rows rendered per port in human-readable output.
+const MAX_ADVISORY_LINES: usize = 10;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum OutputFormat {
@@ -25,6 +28,10 @@ pub enum OutputFormat {
     /// Greppable output — one line per host, Nmap -oG style.
     #[value(name = "greppable")]
     Greppable,
+    /// SARIF 2.1.0 report for code-scanning and vulnerability dashboards.
+    Sarif,
+    /// Human-readable Markdown report for tickets and pull requests.
+    Markdown,
 }
 
 impl OutputFormat {
@@ -36,6 +43,8 @@ impl OutputFormat {
             Self::Csv => "csv",
             Self::NmapXml => "nmap-xml",
             Self::Greppable => "greppable",
+            Self::Sarif => "sarif",
+            Self::Markdown => "markdown",
         }
     }
 }
@@ -52,6 +61,7 @@ pub struct EmitOptions<'a> {
     pub min_confidence: Option<u8>,
     pub explain: Option<u16>,
     pub defense: bool,
+    pub advisories: bool,
     pub diff: Option<&'a crate::diff::ScanDiff>,
 }
 
@@ -86,6 +96,7 @@ pub fn emit(report: &ScanReport, target: &str, options: EmitOptions<'_>) -> Resu
                 dynamic_width: stdout_is_tty,
                 explain: options.explain,
                 defense: options.defense,
+                advisories: options.advisories,
                 diff: options.diff,
             },
         ),
@@ -100,6 +111,8 @@ pub fn emit(report: &ScanReport, target: &str, options: EmitOptions<'_>) -> Resu
         OutputFormat::Csv => render_csv(&selected),
         OutputFormat::NmapXml => render_nmap_xml(report, target, &selected),
         OutputFormat::Greppable => render_greppable(target, &selected),
+        OutputFormat::Sarif => render_sarif(&selected)?,
+        OutputFormat::Markdown => render_markdown(report, target, &selected, options.diff),
     };
 
     if let Some(path) = options.destination {
@@ -165,6 +178,9 @@ pub fn emit(report: &ScanReport, target: &str, options: EmitOptions<'_>) -> Resu
                 println!();
             }
         }
+        if options.advisories {
+            print!("{}", render_advisory_section(&selected));
+        }
         if let Some(exp_port) = options.explain {
             println!("\nAccuracy & Evidence Explanations:");
             println!("{}", "─".repeat(70));
@@ -196,6 +212,9 @@ pub fn emit(report: &ScanReport, target: &str, options: EmitOptions<'_>) -> Resu
                             }
                         )
                     );
+                    for line in advisory_explain_lines(res) {
+                        println!("{line}");
+                    }
                 }
             }
             println!();
@@ -230,6 +249,7 @@ pub struct TableOptions<'a> {
     pub dynamic_width: bool,
     pub explain: Option<u16>,
     pub defense: bool,
+    pub advisories: bool,
     pub diff: Option<&'a crate::diff::ScanDiff>,
 }
 
@@ -258,8 +278,11 @@ fn render_table(report: &ScanReport, results: &[&PortResult], opts: TableOptions
         header("STATE"),
         header("CONFIDENCE"),
         header("SERVICE"),
-        header("LATENCY_MS"),
     ];
+    if opts.advisories {
+        headers.push(header("ADVISORIES"));
+    }
+    headers.push(header("LATENCY_MS"));
     if has_os {
         headers.push(header("OS"));
     }
@@ -270,8 +293,11 @@ fn render_table(report: &ScanReport, results: &[&PortResult], opts: TableOptions
         ColumnConstraint::LowerBoundary(Width::Fixed(10)),
         ColumnConstraint::LowerBoundary(Width::Fixed(12)),
         ColumnConstraint::LowerBoundary(Width::Fixed(16)),
-        ColumnConstraint::LowerBoundary(Width::Fixed(12)),
     ];
+    if opts.advisories {
+        constraints.push(ColumnConstraint::LowerBoundary(Width::Fixed(16)));
+    }
+    constraints.push(ColumnConstraint::LowerBoundary(Width::Fixed(12)));
     if has_os {
         constraints.push(ColumnConstraint::LowerBoundary(Width::Fixed(12)));
     }
@@ -308,8 +334,30 @@ fn render_table(report: &ScanReport, results: &[&PortResult], opts: TableOptions
             state_cell,
             conf_cell,
             service_cell,
-            Cell::new(format!("{:.2}", result.latency.as_secs_f64() * 1000.0)),
         ];
+        if opts.advisories {
+            let advisory_cell = if opts.use_color {
+                match result.advisories.first() {
+                    Some(advisory) => {
+                        let color = match advisory.severity {
+                            crate::advisory::Severity::Critical
+                            | crate::advisory::Severity::High => comfy_table::Color::Red,
+                            crate::advisory::Severity::Medium => comfy_table::Color::Yellow,
+                            crate::advisory::Severity::Low => comfy_table::Color::DarkGrey,
+                        };
+                        Cell::new(advisory_summary(result)).fg(color)
+                    }
+                    None => Cell::new(""),
+                }
+            } else {
+                Cell::new(advisory_summary(result))
+            };
+            row.push(advisory_cell);
+        }
+        row.push(Cell::new(format!(
+            "{:.2}",
+            result.latency.as_secs_f64() * 1000.0
+        )));
         if has_os {
             let os_label = report
                 .os_fingerprints
@@ -375,6 +423,10 @@ fn render_table(report: &ScanReport, results: &[&PortResult], opts: TableOptions
         }
     }
 
+    if opts.advisories {
+        output.push_str(&render_advisory_section(results));
+    }
+
     if let Some(exp_port) = opts.explain {
         output.push_str("\nAccuracy & Evidence Explanations:\n");
         output.push_str(&"─".repeat(70));
@@ -404,7 +456,10 @@ fn render_table(report: &ScanReport, results: &[&PortResult], opts: TableOptions
                         Some(&svc_desc)
                     },
                 ));
-                output.push('\n');
+                for line in advisory_explain_lines(res) {
+                    output.push_str(&line);
+                    output.push('\n');
+                }
             }
         }
     }
@@ -529,6 +584,87 @@ pub fn format_live_row(result: &PortResult, theme: Theme, use_color: bool) -> St
     )
 }
 
+fn advisory_summary(result: &PortResult) -> String {
+    let Some(first) = result.advisories.first() else {
+        return String::new();
+    };
+    if result.advisories.len() == 1 {
+        first.id.clone()
+    } else {
+        format!("{} +{}", first.id, result.advisories.len() - 1)
+    }
+}
+
+fn advisory_explain_lines(result: &PortResult) -> Vec<String> {
+    if result.advisories.is_empty() {
+        return vec!["  Advisory Matches:    none".to_string()];
+    }
+    let mut lines = vec!["  Advisory Matches:".to_string()];
+    for advisory in result.advisories.iter().take(MAX_ADVISORY_LINES) {
+        lines.push(format!(
+            "    [{}] {}  CVSS {:.1}  {}",
+            advisory.severity.label(),
+            advisory.id,
+            advisory.cvss,
+            advisory.title
+        ));
+    }
+    if result.advisories.len() > MAX_ADVISORY_LINES {
+        lines.push(format!(
+            "    ... and {} more (see JSON output for the full list)",
+            result.advisories.len() - MAX_ADVISORY_LINES
+        ));
+    }
+    lines
+}
+
+fn render_advisory_section(results: &[&PortResult]) -> String {
+    let hits: Vec<&&PortResult> = results
+        .iter()
+        .filter(|result| !result.advisories.is_empty())
+        .collect();
+    if hits.is_empty() {
+        return String::new();
+    }
+
+    let total: usize = hits.iter().map(|result| result.advisories.len()).sum();
+    let mut output = String::from("\nVulnerability Advisory Correlation:\n");
+    output.push_str(&"─".repeat(70));
+    output.push('\n');
+    for result in &hits {
+        let label = service_label(result);
+        let suffix = if label.is_empty() {
+            String::new()
+        } else {
+            format!(" ({label})")
+        };
+        output.push_str(&format!(
+            "  {}:{}/tcp{}\n",
+            result.host, result.port, suffix
+        ));
+        for advisory in result.advisories.iter().take(MAX_ADVISORY_LINES) {
+            output.push_str(&format!(
+                "    [{}] {}  CVSS {:.1}  {}\n",
+                advisory.severity.label(),
+                advisory.id,
+                advisory.cvss,
+                advisory.title
+            ));
+        }
+        if result.advisories.len() > MAX_ADVISORY_LINES {
+            output.push_str(&format!(
+                "    ... and {} more (see JSON output for the full list)\n",
+                result.advisories.len() - MAX_ADVISORY_LINES
+            ));
+        }
+    }
+    output.push_str(&format!(
+        "\n  {total} advisory match(es) across {} open service(s); offline CVE correlation (curated + local NVD database) — verify against vendor advisories.\n",
+        hits.len()
+    ));
+    output
+}
+
 fn service_label(result: &PortResult) -> String {
     let Some(service) = &result.service else {
         return String::new();
@@ -595,6 +731,10 @@ struct JsonResult {
     confidence: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     evidence: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    advisories: Vec<crate::advisory::AdvisoryMatch>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tls: Option<crate::tls::TlsInfo>,
 }
 
 impl JsonResult {
@@ -609,6 +749,8 @@ impl JsonResult {
             detail: result.detail.clone(),
             confidence: result.confidence,
             evidence: result.evidence.clone(),
+            advisories: result.advisories.clone(),
+            tls: result.tls.clone(),
         }
     }
 }
@@ -702,7 +844,7 @@ fn render_jsonl(results: &[&PortResult]) -> Result<String, AppError> {
 
 fn render_csv(results: &[&PortResult]) -> String {
     let mut output = String::from(
-        "host,port,state,latency_ms,service,product,version,banner,detail,confidence\n",
+        "host,port,state,latency_ms,service,product,version,banner,detail,confidence,tls_version,tls_subject,tls_days_remaining\n",
     );
     for result in results {
         let service = result.service.as_ref();
@@ -719,8 +861,24 @@ fn render_csv(results: &[&PortResult]) -> String {
             .confidence
             .map(|c| format!("{c:.3}"))
             .unwrap_or_default();
+        let tls_version = result
+            .tls
+            .as_ref()
+            .map(|tls| tls.version.as_str())
+            .unwrap_or("");
+        let tls_subject = result
+            .tls
+            .as_ref()
+            .and_then(|tls| tls.subject.as_deref())
+            .unwrap_or("");
+        let tls_days = result
+            .tls
+            .as_ref()
+            .and_then(|tls| tls.days_remaining)
+            .map(|days| days.to_string())
+            .unwrap_or_default();
         output.push_str(&format!(
-            "{},{},{},{:.3},{},{},{},{},{},{}\n",
+            "{},{},{},{:.3},{},{},{},{},{},{},{},{},{}\n",
             result.host,
             result.port,
             result.state.as_str(),
@@ -730,7 +888,10 @@ fn render_csv(results: &[&PortResult]) -> String {
             csv_field(version),
             csv_field(banner),
             csv_field(detail),
-            confidence
+            confidence,
+            csv_field(tls_version),
+            csv_field(tls_subject),
+            tls_days
         ));
     }
     output
@@ -917,6 +1078,312 @@ fn render_greppable(target: &str, results: &[&PortResult]) -> String {
     output
 }
 
+fn render_sarif(results: &[&PortResult]) -> Result<String, AppError> {
+    use serde_json::{Value, json};
+
+    let mut rules: std::collections::BTreeMap<String, Value> = std::collections::BTreeMap::new();
+    let mut findings: Vec<Value> = Vec::new();
+
+    for result in results
+        .iter()
+        .filter(|result| result.state == PortState::Open)
+    {
+        for advisory in &result.advisories {
+            let level = match advisory.severity {
+                crate::advisory::Severity::Critical | crate::advisory::Severity::High => "error",
+                crate::advisory::Severity::Medium => "warning",
+                crate::advisory::Severity::Low => "note",
+            };
+            rules.entry(advisory.id.clone()).or_insert_with(|| {
+                json!({
+                    "id": advisory.id,
+                    "name": advisory.id,
+                    "shortDescription": {"text": advisory.title},
+                    "fullDescription": {"text": format!("{} (source: {})", advisory.title, advisory.source)},
+                    "defaultConfiguration": {"level": level},
+                    "properties": {
+                        "severity": advisory.severity.label(),
+                        "cvss": advisory.cvss,
+                        "source": advisory.source,
+                    }
+                })
+            });
+            let service = Some(service_label(result)).filter(|label| !label.is_empty());
+            findings.push(json!({
+                "ruleId": advisory.id,
+                "level": level,
+                "message": {
+                    "text": format!(
+                        "{}:{} is affected by {} (CVSS {:.1}, {}): {}",
+                        result.host,
+                        result.port,
+                        advisory.id,
+                        advisory.cvss,
+                        advisory.severity.label(),
+                        advisory.title
+                    )
+                },
+                "locations": [{
+                    "physicalLocation": {
+                        "artifactLocation": {"uri": format!("tcp://{}:{}", result.host, result.port)}
+                    }
+                }],
+                "properties": {
+                    "host": result.host.to_string(),
+                    "port": result.port,
+                    "service": service,
+                    "confidence": result.confidence,
+                    "tls": result.tls.as_ref().map(|tls| tls.version.clone()),
+                }
+            }));
+        }
+    }
+
+    let payload = json!({
+        "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+        "version": "2.1.0",
+        "runs": [{
+            "tool": {
+                "driver": {
+                    "name": "rayscan",
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "rules": rules.into_values().collect::<Vec<_>>()
+                }
+            },
+            "results": findings,
+            "invocations": [{"executionSuccessful": true}]
+        }]
+    });
+    serde_json::to_string_pretty(&payload)
+        .map(|mut json| {
+            json.push('\n');
+            json
+        })
+        .map_err(|error| AppError::runtime(format!("cannot encode SARIF report: {error}")))
+}
+
+fn md_cell(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('|', "\\|")
+        .replace(['\r', '\n'], " ")
+}
+
+fn render_markdown(
+    report: &ScanReport,
+    target: &str,
+    results: &[&PortResult],
+    diff: Option<&crate::diff::ScanDiff>,
+) -> String {
+    let mut out = String::new();
+    out.push_str("# rayscan scan report\n\n");
+    out.push_str(&format!("**Target:** `{}`  \n", md_cell(target)));
+    out.push_str(&format!(
+        "**Elapsed:** {:.2}s · **Workers:** {} · **Probes:** {}\n\n",
+        report.elapsed.as_secs_f64(),
+        report.workers,
+        report.jobs
+    ));
+
+    out.push_str("## Summary\n\n");
+    out.push_str("| Open | Closed | Filtered | Silent | Unreachable | Error | Total |\n");
+    out.push_str("|---:|---:|---:|---:|---:|---:|---:|\n");
+    out.push_str(&format!(
+        "| {} | {} | {} | {} | {} | {} | {} |\n\n",
+        report.counts.open,
+        report.counts.closed,
+        report.counts.filtered,
+        report.counts.silent,
+        report.counts.unreachable,
+        report.counts.error,
+        report.counts.total()
+    ));
+
+    if !report.os_fingerprints.is_empty() {
+        out.push_str("## Operating Systems\n\n");
+        out.push_str("| Host | Family | Detail | Confidence | Evidence |\n");
+        out.push_str("|---|---|---|---:|---|\n");
+        let mut hosts: Vec<_> = report.os_fingerprints.iter().collect();
+        hosts.sort_by_key(|(host, _)| *host);
+        for (host, guess) in hosts {
+            out.push_str(&format!(
+                "| {} | {} | {} | {:.0}% | {} |\n",
+                host,
+                md_cell(&guess.family.to_string()),
+                md_cell(&guess.detail),
+                guess.confidence * 100.0,
+                md_cell(guess.evidence.as_deref().unwrap_or(""))
+            ));
+        }
+        out.push('\n');
+    }
+
+    out.push_str("## Services\n\n");
+    if results.is_empty() {
+        out.push_str("_No results matched the selected state filters._\n\n");
+    } else {
+        out.push_str("| Host | Port | State | Service | Version | Confidence | TLS |\n");
+        out.push_str("|---|---:|---|---|---|---:|---|\n");
+        for result in results {
+            let service = result
+                .service
+                .as_ref()
+                .map(|service| service.name.clone())
+                .unwrap_or_default();
+            let version = service_label(result);
+            let confidence = result
+                .confidence
+                .map(|value| format!("{:.0}%", value * 100.0))
+                .unwrap_or_default();
+            let tls = result
+                .tls
+                .as_ref()
+                .map(|tls| tls.version.clone())
+                .unwrap_or_default();
+            out.push_str(&format!(
+                "| {} | {} | {} | {} | {} | {} | {} |\n",
+                result.host,
+                result.port,
+                result.state.as_str(),
+                md_cell(&service),
+                md_cell(&version),
+                confidence,
+                md_cell(&tls)
+            ));
+        }
+        out.push('\n');
+    }
+
+    let vulnerable: Vec<_> = results
+        .iter()
+        .filter(|result| !result.advisories.is_empty())
+        .collect();
+    out.push_str("## Vulnerabilities\n\n");
+    if vulnerable.is_empty() {
+        out.push_str("_No advisory matches._\n\n");
+    } else {
+        out.push_str("| Host | Port | Advisory | Severity | CVSS | Title |\n");
+        out.push_str("|---|---:|---|---|---:|---|\n");
+        for result in vulnerable {
+            for advisory in &result.advisories {
+                out.push_str(&format!(
+                    "| {} | {} | {} | {} | {:.1} | {} |\n",
+                    result.host,
+                    result.port,
+                    md_cell(&advisory.id),
+                    advisory.severity.label(),
+                    advisory.cvss,
+                    md_cell(&advisory.title)
+                ));
+            }
+        }
+        out.push('\n');
+    }
+
+    let tls_results: Vec<_> = results
+        .iter()
+        .filter(|result| result.tls.is_some())
+        .collect();
+    if !tls_results.is_empty() {
+        out.push_str("## TLS Certificates\n\n");
+        out.push_str("| Host | Port | Version | Subject | Issuer | Expires In | Flags |\n");
+        out.push_str("|---|---:|---|---|---|---:|---|\n");
+        for result in tls_results {
+            let Some(tls) = &result.tls else {
+                continue;
+            };
+            let mut flags = Vec::new();
+            if tls.expired {
+                flags.push("expired");
+            }
+            if tls.not_yet_valid {
+                flags.push("not-yet-valid");
+            }
+            if tls.self_signed {
+                flags.push("self-signed");
+            }
+            if !tls.hostname_matches {
+                flags.push("hostname-mismatch");
+            }
+            let expires = tls
+                .days_remaining
+                .map(|days| format!("{days} days"))
+                .unwrap_or_default();
+            out.push_str(&format!(
+                "| {} | {} | {} | {} | {} | {} | {} |\n",
+                result.host,
+                result.port,
+                md_cell(&tls.version),
+                md_cell(tls.subject.as_deref().unwrap_or("")),
+                md_cell(tls.issuer.as_deref().unwrap_or("")),
+                expires,
+                flags.join(", ")
+            ));
+        }
+        out.push('\n');
+    }
+
+    let defenses = crate::defense::analyze_defenses(report);
+    if !defenses.is_empty() {
+        out.push_str("## Defense Posture\n\n");
+        out.push_str("| Host | Posture | Confidence | Summary |\n");
+        out.push_str("|---|---|---:|---|\n");
+        let mut hosts: Vec<_> = defenses.iter().collect();
+        hosts.sort_by_key(|(host, _)| *host);
+        for (host, assessment) in hosts {
+            out.push_str(&format!(
+                "| {} | {} | {:.0}% | {} |\n",
+                host,
+                assessment.defense_type.badge(),
+                assessment.confidence * 100.0,
+                md_cell(&assessment.summary)
+            ));
+        }
+        out.push('\n');
+    }
+
+    if let Some(diff) = diff {
+        out.push_str("## Differential Analysis\n\n");
+        out.push_str(&format!(
+            "Baseline: `{}` · {} new, {} gone, {} modified, {} unchanged, {} posture, {} new critical advisories.\n\n",
+            md_cell(&diff.baseline_source),
+            diff.summary.new_ports,
+            diff.summary.gone_ports,
+            diff.summary.modified_ports,
+            diff.summary.unchanged_ports,
+            diff.summary.posture_changes,
+            diff.summary.critical_advisories
+        ));
+        if !diff.port_changes.is_empty() {
+            out.push_str("| Change | Host:Port | Detail |\n");
+            out.push_str("|---|---|---|\n");
+            for change in &diff.port_changes {
+                out.push_str(&format!(
+                    "| {} | {}:{} | {} |\n",
+                    change.kind.tag(),
+                    change.host,
+                    change.port,
+                    md_cell(&change.summary)
+                ));
+            }
+            out.push('\n');
+        }
+        if !diff.posture_changes.is_empty() {
+            out.push_str("| Posture Change | Host | Detail |\n");
+            out.push_str("|---|---|---|\n");
+            for change in &diff.posture_changes {
+                out.push_str(&format!(
+                    "| {} | {} | {} → {} |\n",
+                    "[~] POSTURE", change.host, change.old_posture, change.new_posture
+                ));
+            }
+            out.push('\n');
+        }
+    }
+
+    out
+}
+
 fn write_destination(
     destination: Option<&Path>,
     contents: &str,
@@ -1083,6 +1550,148 @@ mod tests {
         assert!(output.contains("Defense & Middlebox Intelligence:"));
         assert!(output.contains("Target 192.0.2.1:"));
         assert!(output.contains("Posture:"));
+    }
+
+    #[test]
+    fn table_advisories_render_column_and_section() {
+        let mut report = sample_report();
+        report.results[0].service = Some(ServiceInfo {
+            name: "ftp".to_string(),
+            product: Some("vsFTPd".to_string()),
+            version: Some("2.3.4".to_string()),
+        });
+        report.results[0].banner = Some("220 (vsFTPd 2.3.4)".to_string());
+        crate::accuracy::score_report(&mut report);
+        crate::advisory::apply_advisories(&mut report);
+
+        let results: Vec<&PortResult> = report.results.iter().collect();
+        let output = render_table(
+            &report,
+            &results,
+            TableOptions {
+                theme: Theme::Minimal,
+                advisories: true,
+                ..Default::default()
+            },
+        );
+        assert!(output.contains("ADVISORIES"));
+        assert!(output.contains("CVE-2011-2523"));
+        assert!(output.contains("Vulnerability Advisory Correlation:"));
+        assert!(output.contains("CRITICAL"));
+    }
+
+    #[test]
+    fn table_advisories_truncate_long_lists() {
+        let mut report = sample_report();
+        report.results[0].advisories = (0..12)
+            .map(|index| crate::advisory::AdvisoryMatch {
+                id: format!("CVE-2026-{index:04}"),
+                title: "synthetic advisory".to_string(),
+                severity: crate::advisory::Severity::High,
+                cvss: 7.5,
+                source: "nvd",
+            })
+            .collect();
+        let results: Vec<&PortResult> = report.results.iter().collect();
+        let output = render_table(
+            &report,
+            &results,
+            TableOptions {
+                theme: Theme::Minimal,
+                advisories: true,
+                ..Default::default()
+            },
+        );
+        assert!(output.contains("... and 2 more"));
+        assert!(!output.contains("CVE-2026-0011"));
+    }
+
+    #[test]
+    fn json_includes_correlated_advisories() {
+        let mut report = sample_report();
+        report.results[0].service = Some(ServiceInfo {
+            name: "ftp".to_string(),
+            product: Some("vsFTPd".to_string()),
+            version: Some("2.3.4".to_string()),
+        });
+        report.results[0].banner = Some("220 (vsFTPd 2.3.4)".to_string());
+        crate::accuracy::score_report(&mut report);
+        crate::advisory::apply_advisories(&mut report);
+
+        let output = render_json(&report, "192.0.2.1", StateSet::all(), None, None).unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(payload["open"][0]["advisories"][0]["id"], "CVE-2011-2523");
+        assert_eq!(payload["open"][0]["advisories"][0]["severity"], "critical");
+    }
+
+    #[test]
+    fn sarif_contains_rules_and_locations() {
+        let mut report = sample_report();
+        report.results[0].service = Some(ServiceInfo {
+            name: "ftp".to_string(),
+            product: Some("vsFTPd".to_string()),
+            version: Some("2.3.4".to_string()),
+        });
+        report.results[0].banner = Some("220 (vsFTPd 2.3.4)".to_string());
+        crate::advisory::apply_advisories(&mut report);
+
+        let results: Vec<&PortResult> = report.results.iter().collect();
+        let output = render_sarif(&results).unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(payload["version"], "2.1.0");
+        assert_eq!(payload["runs"][0]["tool"]["driver"]["name"], "rayscan");
+        assert_eq!(payload["runs"][0]["results"][0]["ruleId"], "CVE-2011-2523");
+        assert_eq!(payload["runs"][0]["results"][0]["level"], "error");
+        assert!(
+            payload["runs"][0]["results"][0]["locations"][0]["physicalLocation"]
+                ["artifactLocation"]["uri"]
+                .as_str()
+                .unwrap()
+                .starts_with("tcp://")
+        );
+        assert_eq!(
+            payload["runs"][0]["tool"]["driver"]["rules"][0]["id"],
+            "CVE-2011-2523"
+        );
+    }
+
+    #[test]
+    fn markdown_includes_services_vulnerabilities_and_tls() {
+        let mut report = sample_report();
+        report.results[0].service = Some(ServiceInfo {
+            name: "ftp".to_string(),
+            product: Some("vsFTPd".to_string()),
+            version: Some("2.3.4".to_string()),
+        });
+        report.results[0].banner = Some("220 (vsFTPd 2.3.4)".to_string());
+        report.results[0].tls = Some(crate::tls::TlsInfo {
+            version: "TLSv1.3".to_string(),
+            cipher: "TLS13_AES_256_GCM_SHA384".to_string(),
+            subject: Some("CN=example.test".to_string()),
+            issuer: Some("CN=example.test".to_string()),
+            san: Vec::new(),
+            serial: None,
+            not_before: None,
+            not_after: None,
+            days_remaining: Some(30),
+            expired: false,
+            not_yet_valid: false,
+            self_signed: true,
+            hostname_matches: false,
+            chain_len: 1,
+            starttls: None,
+        });
+        crate::advisory::apply_advisories(&mut report);
+
+        let results: Vec<&PortResult> = report.results.iter().collect();
+        let output = render_markdown(&report, "192.0.2.1", &results, None);
+        assert!(output.contains("# rayscan scan report"));
+        assert!(output.contains("## Services"));
+        assert!(output.contains("CVE-2011-2523"));
+        assert!(output.contains("## TLS Certificates"));
+        assert!(output.contains("TLSv1.3"));
+        assert!(output.contains("self-signed"));
+        assert!(output.contains("hostname-mismatch"));
     }
 
     #[test]

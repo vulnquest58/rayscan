@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use async_channel::Sender;
+use rand::Rng;
 use rand::seq::SliceRandom;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -78,6 +79,8 @@ pub struct ScanOptions {
     pub connect_only: bool,
     pub service_detection: bool,
     pub retain: StateSet,
+    /// Maximum random delay before each probe. Zero disables jitter.
+    pub jitter: Duration,
     /// When set to `true` by an external signal handler, workers stop picking
     /// new jobs and the scan returns a partial report instead of an error.
     pub shutdown: Arc<AtomicBool>,
@@ -278,6 +281,7 @@ async fn verify_candidate(
 
     loop {
         limiter.acquire().await;
+        apply_jitter(options.jitter).await;
         let started = Instant::now();
         let outcome = tokio::time::timeout(options.timeout, TcpStream::connect(address)).await;
         let elapsed = started.elapsed();
@@ -367,12 +371,24 @@ async fn run_worker(shared: Arc<Shared>, next: Arc<AtomicU64>, sender: Sender<Ve
     }
 }
 
+async fn apply_jitter(jitter: Duration) {
+    if jitter.is_zero() {
+        return;
+    }
+    let max_millis = jitter.as_millis().min(u128::from(u64::MAX)) as u64;
+    let delay = rand::thread_rng().gen_range(0..=max_millis);
+    if delay > 0 {
+        tokio::time::sleep(Duration::from_millis(delay)).await;
+    }
+}
+
 async fn probe(shared: &Shared, target_index: usize, host: IpAddr, port: u16) -> PortResult {
     let address = SocketAddr::new(host, port);
     let mut attempt = 0u32;
 
     loop {
         shared.limiter.acquire().await;
+        apply_jitter(shared.options.jitter).await;
         let timeout = current_timeout(shared, target_index);
         let attempt_started = Instant::now();
         let outcome = tokio::time::timeout(timeout, TcpStream::connect(address)).await;
@@ -637,6 +653,7 @@ mod tests {
             connect_only,
             service_detection: true,
             retain: StateSet::all(),
+            jitter: Duration::ZERO,
             shutdown: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -733,6 +750,8 @@ mod tests {
                 .write_all(b"HTTP/1.1 200 OK\r\nServer: retry-lab\r\nContent-Length: 0\r\n\r\n")
                 .await
                 .unwrap();
+            let mut drain = [0u8; 128];
+            let _ = tokio::time::timeout(Duration::from_millis(500), second.read(&mut drain)).await;
         });
         (port, task)
     }

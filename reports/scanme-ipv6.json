@@ -1,0 +1,64 @@
+{
+  "target": "2600:3c01::f03c:91ff:fe18:bb2f",
+  "targets": 1,
+  "ports": 5,
+  "jobs": 5,
+  "workers": 5,
+  "open": [],
+  "results": [
+    {
+      "host": "2600:3c01::f03c:91ff:fe18:bb2f",
+      "port": 22,
+      "state": "filtered",
+      "latency_ms": 1501.141,
+      "detail": "connect timed out after 1500ms",
+      "confidence": 0.0,
+      "evidence": "handshake:none(0%) banner:none(0%) stack:none(0%) latency:none(0%)"
+    },
+    {
+      "host": "2600:3c01::f03c:91ff:fe18:bb2f",
+      "port": 80,
+      "state": "filtered",
+      "latency_ms": 1501.291,
+      "detail": "connect timed out after 1500ms",
+      "confidence": 0.0,
+      "evidence": "handshake:none(0%) banner:none(0%) stack:none(0%) latency:none(0%)"
+    },
+    {
+      "host": "2600:3c01::f03c:91ff:fe18:bb2f",
+      "port": 443,
+      "state": "filtered",
+      "latency_ms": 1501.213,
+      "detail": "connect timed out after 1500ms",
+      "confidence": 0.0,
+      "evidence": "handshake:none(0%) banner:none(0%) stack:none(0%) latency:none(0%)"
+    },
+    {
+      "host": "2600:3c01::f03c:91ff:fe18:bb2f",
+      "port": 9929,
+      "state": "filtered",
+      "latency_ms": 1501.158,
+      "detail": "connect timed out after 1500ms",
+      "confidence": 0.0,
+      "evidence": "handshake:none(0%) banner:none(0%) stack:none(0%) latency:none(0%)"
+    },
+    {
+      "host": "2600:3c01::f03c:91ff:fe18:bb2f",
+      "port": 31337,
+      "state": "filtered",
+      "latency_ms": 1501.169,
+      "detail": "connect timed out after 1500ms",
+      "confidence": 0.0,
+      "evidence": "handshake:none(0%) banner:none(0%) stack:none(0%) latency:none(0%)"
+    }
+  ],
+  "summary": {
+    "open": 0,
+    "closed": 0,
+    "filtered": 5,
+    "silent": 0,
+    "unreachable": 0,
+    "error": 0
+  },
+  "elapsed_ms": 1501.421
+}

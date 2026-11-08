@@ -14,6 +14,7 @@ use std::net::IpAddr;
 
 use serde::Serialize;
 
+use crate::accuracy::is_known_binary_port;
 use crate::model::{PortResult, PortState, ScanReport};
 
 /// Categorical classification of the defensive posture of a target host.
@@ -101,6 +102,7 @@ fn assess_host(
 ) -> HostDefenseAssessment {
     let mut open_count = 0usize;
     let mut silent_count = 0usize;
+    let mut expected_silent_count = 0usize;
     let mut reclassified_closed = 0usize;
     let mut service_identified_count = 0usize;
 
@@ -113,13 +115,24 @@ fn assess_host(
                 }
             }
             PortState::Silent => {
-                silent_count += 1;
+                // Client-first / binary protocol listeners (RPC, PostgreSQL,
+                // X11, AJP, ...) legitimately hold the connection mute until
+                // the client speaks first.  Silence there is protocol
+                // behavior, not tarpit evidence.
+                if is_known_binary_port(r.port) {
+                    expected_silent_count += 1;
+                } else {
+                    silent_count += 1;
+                }
             }
+            // Verification sends an HTTP probe to mute ports; a binary
+            // listener may reject it and look like a back-end failure.
             PortState::Closed
-                if r.detail.as_deref().is_some_and(|detail| {
-                    detail.contains("connection closed during verification")
-                        || detail.contains("anomaly:")
-                }) =>
+                if !is_known_binary_port(r.port)
+                    && r.detail.as_deref().is_some_and(|detail| {
+                        detail.contains("connection closed during verification")
+                            || detail.contains("anomaly:")
+                    }) =>
             {
                 reclassified_closed += 1;
             }
@@ -128,6 +141,11 @@ fn assess_host(
     }
 
     let mut indicators = Vec::new();
+    if expected_silent_count > 0 {
+        indicators.push(format!(
+            "{expected_silent_count} client-first listener(s) (e.g. RPC, PostgreSQL, X11, AJP) held mute as expected; silence on known binary ports is not treated as tarpit evidence"
+        ));
+    }
     let mut is_syn_proxy = false;
     let mut is_tarpit = false;
     let mut is_rate_limited = false;
@@ -151,11 +169,11 @@ fn assess_host(
     }
 
     // Check 3: Anomaly threshold / Honeypot sweep
-    if results
-        .first()
-        .and_then(|first| first.detail.as_deref())
-        .is_some_and(|detail| detail.contains("anomaly:"))
-    {
+    if results.iter().any(|r| {
+        r.detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("anomaly:"))
+    }) {
         is_tarpit = true;
         indicators.push(
             "Host triggered high-density SYN-open anomaly threshold (tarpit/honeypot farm)"
@@ -164,10 +182,15 @@ fn assess_host(
     }
 
     // Check 4: Rate-limiting detection
-    // Probes that required retries or were marked with low retry confidence
+    // Low-accuracy results beyond what expected client-first silence explains.
+    // Known binary ports score low by design and must not count as retries.
     let retried_count = results
         .iter()
-        .filter(|r| r.confidence.unwrap_or(1.0) < 0.85)
+        .filter(|r| {
+            r.state != PortState::Silent
+                && !is_known_binary_port(r.port)
+                && r.confidence.unwrap_or(1.0) < 0.85
+        })
         .count();
     if retried_count >= 4 {
         is_rate_limited = true;
@@ -310,6 +333,139 @@ mod tests {
         let assess = assessments.get(&host).unwrap();
         assert_eq!(assess.defense_type, DefenseType::Tarpit);
         assert!(assess.confidence >= 0.90);
+    }
+
+    #[test]
+    fn binary_client_first_listeners_are_not_tarpit_evidence() {
+        let host: IpAddr = "192.168.100.37".parse().unwrap();
+        let mut results = Vec::new();
+
+        for port in [111u16, 3632, 5432, 6000, 8009] {
+            let mut silent =
+                PortResult::new(host, port, PortState::Silent, Duration::from_millis(4));
+            silent.confidence = Some(0.40);
+            results.push(silent);
+        }
+        for port in [
+            21u16, 22, 23, 25, 80, 1524, 3306, 5900, 6667, 6697, 8180, 8787,
+        ] {
+            let mut open = PortResult::new(host, port, PortState::Open, Duration::from_millis(4));
+            open.service = Some(ServiceInfo {
+                name: "service".to_string(),
+                product: Some("product".to_string()),
+                version: None,
+            });
+            open.confidence = Some(1.0);
+            results.push(open);
+        }
+
+        let report = ScanReport {
+            targets: 1,
+            ports: results.len(),
+            jobs: results.len() as u64,
+            workers: 2,
+            elapsed: Duration::from_millis(100),
+            counts: crate::model::StateCounts {
+                open: 12,
+                silent: 5,
+                ..Default::default()
+            },
+            results,
+            os_fingerprints: HashMap::new(),
+            probed_ports: Vec::new(),
+            partial: false,
+            defense_observations: Vec::new(),
+        };
+
+        let assessments = analyze_defenses(&report);
+        let assess = assessments.get(&host).unwrap();
+        assert_eq!(assess.defense_type, DefenseType::DirectHost);
+        assert!(
+            assess.indicators.iter().any(|i| i.contains("client-first")),
+            "expected client-first indicator, got {:?}",
+            assess.indicators
+        );
+    }
+
+    #[test]
+    fn binary_verification_failures_do_not_imply_syn_proxy() {
+        let host: IpAddr = "192.168.100.37".parse().unwrap();
+        let mut results = Vec::new();
+
+        for port in [111u16, 8009] {
+            let mut closed =
+                PortResult::new(host, port, PortState::Closed, Duration::from_millis(5));
+            closed.confidence = Some(0.0);
+            closed.detail =
+                Some("connection closed during verification: connection reset by peer".to_string());
+            results.push(closed);
+        }
+        for port in [22u16, 80] {
+            let mut open = PortResult::new(host, port, PortState::Open, Duration::from_millis(2));
+            open.service = Some(ServiceInfo {
+                name: "service".to_string(),
+                product: Some("product".to_string()),
+                version: None,
+            });
+            open.confidence = Some(1.0);
+            results.push(open);
+        }
+
+        let report = ScanReport {
+            targets: 1,
+            ports: results.len(),
+            jobs: results.len() as u64,
+            workers: 2,
+            elapsed: Duration::from_millis(50),
+            counts: crate::model::StateCounts {
+                open: 2,
+                closed: 2,
+                ..Default::default()
+            },
+            results,
+            os_fingerprints: HashMap::new(),
+            probed_ports: Vec::new(),
+            partial: false,
+            defense_observations: Vec::new(),
+        };
+
+        let assessments = analyze_defenses(&report);
+        let assess = assessments.get(&host).unwrap();
+        assert_eq!(assess.defense_type, DefenseType::DirectHost);
+    }
+
+    #[test]
+    fn anomaly_detail_outside_first_result_is_detected() {
+        let host: IpAddr = "10.0.0.9".parse().unwrap();
+        let mut closed = PortResult::new(host, 9000, PortState::Closed, Duration::from_millis(5));
+        closed.detail = Some("connection refused".to_string());
+        let mut anomaly = PortResult::new(host, 9001, PortState::Open, Duration::from_millis(1));
+        anomaly.detail = Some(
+            "anomaly: host has 2000 SYN-open ports (threshold 1000); sampling 10 ports for verification"
+                .to_string(),
+        );
+
+        let report = ScanReport {
+            targets: 1,
+            ports: 2,
+            jobs: 2,
+            workers: 1,
+            elapsed: Duration::from_millis(10),
+            counts: crate::model::StateCounts {
+                open: 1,
+                closed: 1,
+                ..Default::default()
+            },
+            results: vec![closed, anomaly],
+            os_fingerprints: HashMap::new(),
+            probed_ports: Vec::new(),
+            partial: false,
+            defense_observations: Vec::new(),
+        };
+
+        let assessments = analyze_defenses(&report);
+        let assess = assessments.get(&host).unwrap();
+        assert_eq!(assess.defense_type, DefenseType::Tarpit);
     }
 
     #[test]

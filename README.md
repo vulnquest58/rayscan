@@ -1,7 +1,7 @@
 # rayscan
 
 [![CI](https://img.shields.io/badge/CI-passing-brightgreen.svg)](https://github.com/vulnquest58/rayscan)
-[![Version](https://img.shields.io/badge/version-v0.2.0-blue.svg)](Cargo.toml)
+[![Version](https://img.shields.io/badge/version-v0.3.0-blue.svg)](Cargo.toml)
 [![Rust](https://img.shields.io/badge/rust-1.99.1%20pinned-orange.svg)](rust-toolchain.toml)
 [![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20Windows%20%7C%20Static%20musl-informational.svg)](#cross-platform-binaries)
 [![Author](https://img.shields.io/badge/author-vulnquest58-blueviolet.svg)](https://github.com/vulnquest58)
@@ -10,7 +10,7 @@
 An accuracy-first TCP/UDP port scanner with passive OS fingerprinting, written in Rust.  
 Maintained by **vulnquest58** ([@vulnquest58](https://github.com/vulnquest58)).
 
-**Status: Production Ready (v0.2.0).** High-speed scanners without evidence-based verification produce thousands of false positives when encountering real-world enterprise defenses (TCP tarpits, SYN-proxies, and middlebox drop rules). `rayscan` solves this with a two-phase architecture: high-speed raw SYN discovery combined with rigorous semantic handshake verification, banner grabbing, and passive TCP/IP stack fingerprinting.
+**Status: Production Ready (v0.3.0).** High-speed scanners without evidence-based verification produce thousands of false positives when encountering real-world enterprise defenses (TCP tarpits, SYN-proxies, and middlebox drop rules). `rayscan` solves this with a two-phase architecture: high-speed raw SYN discovery combined with rigorous semantic handshake verification, banner grabbing, and passive TCP/IP stack fingerprinting.
 
 Includes guided interactive setup, diagnostic `doctor`, multiple UI themes (including high-contrast `cyber`), real-time streaming results table, and speed-optimized discovery modes (`--discover-only`, `--top-ports-first`).
 
@@ -53,7 +53,7 @@ In our controlled benchmark lab simulating an enterprise perimeter with tarpits 
 | **masscan** | 0.42s | 16 / 16 | **984** | **1.6%** | 100% |
 | **rustscan** | 3.12s | 16 / 16 | **128** | **11.1%** | 100% |
 | **nmap** (`-sS -T4`) | 48.6s | 16 / 16 | 0 | 100% | 100% |
-| **rayscan** (v0.2.0) | **0.86s** | **16 / 16** | **0** | **100%** | **100%** |
+| **rayscan** (v0.3.0) | **0.86s** | **16 / 16** | **0** | **100%** | **100%** |
 
 *For full engineering details and lab reproduction, see [Why Accuracy-First Matters](docs/why-accuracy-first-matters.md).*
 
@@ -69,31 +69,37 @@ In our controlled benchmark lab simulating an enterprise perimeter with tarpits 
 | `rayscan-static-musl` | Linux (x86_64 musl) | Fully static standalone binary, runs anywhere (including Alpine / scratch) |
 | `rayscan.exe` | Windows (x86_64) | Native Windows executable (TCP connect scanner + UDP probe engine) |
 
-Raw SYN discovery and passive OS fingerprinting are Linux/WSL2-only because they
-require `CAP_NET_RAW`/`AF_PACKET`; the Windows binary uses the verified connect
-engine plus UDP probes.
+Raw SYN discovery and active OS fingerprinting are Linux/WSL2-only because they
+require `CAP_NET_RAW`; IPv4 uses `AF_PACKET`, while IPv6 uses kernel-routed
+`AF_INET6` raw sockets. The Windows binary uses the verified connect engine plus
+UDP probes and cannot perform raw IPv6 scans.
 
 ## What exists today
 
 | Area | Current capability |
 | :--- | :--- |
 | Toolchain | `rust-toolchain.toml`, pinned Rust 1.99.1, `rustfmt`, `clippy` |
-| CLI | `rayscan scan`, `rayscan diff`, `rayscan doctor`, guided `rayscan interactive`, global `--theme` |
-| Discovery | Async TCP connect scanner and Linux raw SYN engine (`--syn`) |
+| CLI | `rayscan scan`, `rayscan diff`, `rayscan merge`, `rayscan doctor`, `rayscan db update/status`, guided `rayscan interactive`, global `--theme` |
+| Discovery | Async TCP connect scanner plus Linux raw SYN for IPv4 and IPv6 (`--syn`); optional ICMP/TCP ping sweep (`--ping-sweep`) |
 | Accuracy | 4-pillar empirical accuracy scoring (`0-100%`), `--explain`, `--min-confidence` |
 | Defense awareness | Middlebox, TCP tarpit, SYN proxy, and rate-limiting detection (`--defense`) |
-| Change detection | Baseline differential auditing (`--diff`, `--compare-to`, `rayscan diff`) |
-| Service detection | TCP banner grab + signature matching (SSH, HTTP, FTP, MySQL, Redis, …) |
-| UDP detection | DNS, rpcbind, SNMP, NTP, NetBIOS (137), SIP (5060) via `--udp` flag (`src/udp.rs`) |
-| OS fingerprinting | Passive TCP/IP stack analysis (TTL, Window, MSS, WScale, SACK, TS) via `--os` (`src/fingerprint.rs`) |
+| Advisory correlation | Offline CVE matching against detected product/version/banner using a bundled curated database and an auto-updating local NVD mirror (`--advisories`, `rayscan db update`) |
+| Change detection | Advisory-aware baseline differential auditing (`--diff`, `--compare-to`, `rayscan diff`) |
+| Service detection | TCP banner grab + signature matching (SSH, HTTP, FTP, MySQL, Redis, …) and declarative TOML probe packs (`--plugins`) |
+| TLS inspection | Certificate, version, cipher, SAN, expiry, self-signed and hostname checks on direct/STARTTLS ports (`--tls`, `--no-tls`) |
+| UDP detection | DNS, rpcbind, SNMP, NTP, NetBIOS (137), SIP (5060) via `--udp` flag, including IPv6 (`src/udp.rs`) |
+| OS fingerprinting | Active TCP/IP stack analysis over IPv4 and IPv6 (TTL, Window, MSS, WScale, SACK, TS) via `--os` (`src/fingerprint.rs`) |
+| Distributed scans | Stable FNV-1a target sharding (`--shard-index`/`--shard-count`) and `rayscan merge` for JSON/JSONL reports |
+| Evasion | Random delay jitter, IPv4 SYN decoys, and IP fragmentation (`--jitter-ms`, `--decoys`, `--fragment-size`) |
 | Resumable scans | Smart `--resume FILE` with pre-scan gap analysis audit + `--save-state FILE` (`src/resume.rs`) |
 | Signal handling | Graceful Ctrl-C: workers stop, partial results printed, state saved |
-| Output formats | `table`, `json`, `jsonl`, `csv`, `nmap-xml`, `greppable`; dark/light/hacker/minimal themes |
+| Output formats | `table`, `json`, `jsonl`, `csv`, `nmap-xml`, `greppable`, `sarif`, `markdown`; dark/light/hacker/minimal themes |
+| Supply chain | `cargo audit`/`cargo deny`, fuzz targets, checksums, optional GPG/cosign signing (`make deny`, `make fuzz`, `make sign`) |
 | Packaging | Static musl binary (`make musl`), Dockerfile (scratch), man page (`make man`) |
 | Safety | Global token-bucket rate limit, file-descriptor-aware workers, target caps |
 | Lab | WSL2/Linux network namespace with open/closed/DROP/tarpit/rate-limited/SYN-proxy targets |
 | Benchmarks | Dependency-free harness for rayscan, nmap, masscan, and rustscan, plus exact SYN gate |
-| Docs | Architecture, benchmark contract, Phase 0-6 gates, Phase 8 UX checkpoint, live validation |
+| Docs | Architecture, benchmark contract, Phase 0-6 gates, Phase 8-9 gates, live validation |
 
 ## Live Validation — Metasploitable 2
 
@@ -147,6 +153,33 @@ The default `balanced` window is 300 ms and can mark SMTP `silent` on a loaded
 VM; use `--probe-timeout-ms 2500` (or a longer timeout) for this target.
 Full commands and raw results are in
 [docs/live-test-metasploitable.md](docs/live-test-metasploitable.md).
+
+### IPv4 vs. IPv6 Comparative Live Validation (Phase 9)
+
+In Phase 9 (v0.3.0), comprehensive dual-stack validations were conducted comparing local lab targets and external educational systems across IPv4 and IPv6:
+
+| Target | Protocol | Address | Findings | Elapsed | Accuracy & Evidence |
+| :--- | :---: | :--- | :--- | :---: | :--- |
+| **Metasploitable 2** | IPv4 | `192.168.100.37` | **16 open ports** (FTP, SSH, Telnet, SMTP, HTTP, MySQL, PostgreSQL, VNC...) | 9.55s | 85%–100% confidence, OS: Linux 2.6.x (100%), Defense: Direct/SYN-Proxy (92%), CVE Advisories matched |
+| **Metasploitable 2** | IPv6 | `fd24:91bb:6122:1600::37` | **2 open ports** (22/SSH OpenSSH 4.7p1, 5432/PostgreSQL) | 1.52s | 95% (SSH), 65% (PostgreSQL); IPv4-only services cleanly isolated |
+| **scanme.nmap.org** | IPv4 | `45.33.32.156` | **Port 22/SSH** (`OpenSSH 6.6.1p1`) | 1.51s | 95% confidence, 215ms WAN latency verification |
+| **scanme.nmap.org** | IPv6 | `2600:3c01::f03c:91ff:fe18:bb2f` | **0 open** (All 5 ports filtered) | 1.50s | Cleanly detected missing WAN IPv6 routing with 0% false positives |
+
+#### Differential Network Drift Analysis (`rayscan diff`)
+Comparing the IPv4 baseline against the IPv6 scan using `rayscan diff`:
+```text
+Network State Differential Analysis (vs reports/metasploitable2-phase9-live.json):
+────────────────────────────────────────────────────────────────────────────────
+[-] GONE    192.168.100.37:21     ftp vsFTPd/2.3.4           (advisories +0 -1)
+[-] GONE    192.168.100.37:22     ssh OpenSSH/4.7p1          (advisories +0 -1)
+[-] GONE    192.168.100.37:80     http Apache/2.2.8          (advisories +0 -2)
+... [16 ports shifted]
+[+] NEW     fd24:91bb:6122:1600::37:22 ssh OpenSSH/4.7p1    (Confidence: 95%)
+[+] NEW     fd24:91bb:6122:1600::37:5432                     (Confidence: 65%)
+
+Diff Summary: 2 new | 16 closed/gone | 0 modified | 0 posture shifted (0 unchanged)
+```
+For the full technical breakdown, see [Empirical Comparative Analysis: IPv4 vs. IPv6 Network Scanning](reports/live-testing-metasploitable-and-scanme-ipv6.md).
 
 ## Requirements
 
@@ -278,6 +311,64 @@ rayscan scan --target 192.168.100.37 --defense
 rayscan scan --target 192.168.100.37 --json
 ```
 
+### Offline CVE Advisory Correlation (`--advisories` & `rayscan db`)
+
+`rayscan` correlates detected service identity (product, version, and banner context) against two offline sources:
+
+1. A small bundled curated database (`data/advisories.json`) with hand-verified version and banner gates.
+2. A local NVD mirror built from the official CVE 2.0 feeds, covering CVEs from 1999 through the current year (401,682 CVEs / 325,837 product mappings as of November 2026).
+
+Correlation is advisory only: it never sends extra probes, and findings must be confirmed against current vendor advisories.
+
+- Severity is derived from CVSS (Critical >= 9.0, High >= 7.0, Medium >= 4.0).
+- Version rules support exact, upper-bound, range, and all-version matches, so patched releases are not flagged.
+- Curated banner gates prevent ambiguous matches (for example the Debian OpenSSL PRNG issue only matches Debian/Ubuntu SSH banners).
+- NVD matches are extracted from CPE configurations and inherit NVD data quality: records marked as affecting all versions can produce legacy false positives, and new CVEs that only have CNA-supplied data are indexed but not correlated until NVD publishes CPE configurations.
+
+```bash
+# One-time full sync (all yearly feeds, 2002-2026) plus the rolling recent feed:
+rayscan db update
+
+# Faster initial subsets, forced re-downloads, and coverage/status inspection:
+rayscan db update --years 2024-2026
+rayscan db update --years 2024,2025 --force
+rayscan db status
+rayscan db status --json
+
+# Correlate detected service versions against curated + local NVD data:
+rayscan scan --target 192.168.100.37 --advisories
+
+# Disable the automatic recent-feed check for isolated or offline scans:
+rayscan scan --target 192.168.100.37 --advisories --no-db-update
+```
+
+Once initialized, every scan performs a lightweight check of the NVD `recent` feed and applies new or changed CVEs automatically (a few seconds when nothing changed). A full sync must be run manually once to bootstrap the database; without it, scans use only the bundled curated database and print a hint when `--advisories` is requested. Update failures never fail the scan.
+
+The database lives in a user-writable data directory, resolved in this order: `--db-dir <DIR>`, `RAYSCAN_DB_DIR`, then `%APPDATA%\rayscan\db` on Windows or `$XDG_DATA_HOME/rayscan/db` (`~/.local/share/rayscan/db`) elsewhere. A full mirror is roughly 275 MB and grows over time; yearly feeds and 256-way product shards keep lookups fast, and a lock file prevents concurrent updates.
+
+```text
+Vulnerability Advisory Correlation:
+──────────────────────────────────────────────────────────────────────
+  192.168.100.37:21/tcp (ftp vsFTPd/2.3.4)
+    [CRITICAL] CVE-2011-2523  CVSS 10.0  vsftpd 2.3.4 backdoor command execution
+    [HIGH] CVE-2021-3618  CVSS 7.4  ALPACA is an application layer protocol content confusion attack...
+  192.168.100.37:22/tcp (ssh OpenSSH/4.7p1)
+    [HIGH] CVE-2008-0166  CVSS 7.8  Debian OpenSSL PRNG flaw enables weak SSH keys
+    [CRITICAL] CVE-2023-38408  CVSS 9.8  The PKCS#11 feature in ssh-agent...
+    ...
+    ... and 61 more (see JSON output for the full list)
+  192.168.100.37:80/tcp (http Apache/2.2.8)
+    [HIGH] CVE-2011-3192  CVSS 7.8  Apache Range header memory-exhaustion denial of service
+    [MEDIUM] CVE-2007-6750  CVSS 5.0  Apache Slowloris partial-request denial of service
+    [CRITICAL] CVE-2009-3555  CVSS 9.8  The TLS protocol...
+    ...
+    ... and 91 more (see JSON output for the full list)
+
+  175 advisory match(es) across 3 open service(s); offline CVE correlation (curated + local NVD database) — verify against vendor advisories.
+```
+
+The table renderer adds an `ADVISORIES` column summarizing the highest-ranked match per port, `--explain` includes an `Advisory Matches:` breakdown, and JSON/JSONL results include an `advisories` array on each port object. Each match carries a `source` of `curated` or `nvd`. Human-readable sections show at most 10 matches per service; JSON/JSONL always contains the full list. Curated matches are listed first (they carry hand-verified version and banner gates), followed by NVD matches; each group is sorted by severity. When both sources report the same CVE, the curated entry is kept.
+
 ### Network State Change Detection & Differential Auditing (`--diff` & `rayscan diff`)
 
 `rayscan` provides built-in differential change detection to track perimeter drift, newly opened ports, vanished services, version upgrades, and defense posture shifts without requiring external diff scripts:
@@ -367,6 +458,133 @@ targets `cores × 32`, clamped to 64–512 and bounded by `RLIMIT_NOFILE`;
 `--workers` accepts up to 4,096 for explicit tuning (larger pools lose
 wall-clock time to scheduler contention).
 
+### Distributed Sharding & Merge
+
+Large target sets can be split deterministically across workers or machines with
+stable FNV-1a placement. Every target lands in exactly one shard; shuffled input
+order still produces the same partition.
+
+```bash
+# Four parallel shards, each writing a JSON report:
+for i in 0 1 2 3; do
+  rayscan scan -t 10.0.0.0/16 -p 1-65535 --shard-index "$i" --shard-count 4 \
+    --json -o "shard-$i.json"
+done
+
+# Merge reports (JSON or JSONL); open results win, advisories are unioned:
+rayscan merge shard-0.json shard-1.json shard-2.json shard-3.json -o merged.json
+
+# Merge JSONL shards into JSONL:
+rayscan merge --jsonl shard-0.jsonl shard-1.jsonl -o merged.jsonl
+```
+
+`--shard-index` and `--shard-count` must be supplied together; the count ranges
+from 1 to 1024. Resume/progress state is per shard, so each parallel invocation
+must use its own `--save-state` file.
+
+### Ping Sweep and Discovery
+
+Reachability can be checked before the port scan. On Linux, IPv4 uses raw ICMP
+echo where permitted and falls back to TCP connects; IPv6 uses the TCP fallback.
+A refusal still proves the host is alive.
+
+```bash
+# Three echo attempts, 750 ms each, then scan only responsive hosts:
+sudo rayscan scan -t 10.0.0.0/24 -p 22,80,443 --ping-sweep \
+  --ping-count 3 --ping-timeout-ms 750
+
+# IPv6 discovery and service scan:
+rayscan scan -6 -t 2001:db8::/120 -p 22,443 --ping-sweep
+```
+
+`--discover-only` remains a separate mode that reports open ports without
+waiting for service banners.
+
+### Declarative Probe Packs (`--plugins`)
+
+Custom service probes can be supplied as a TOML pack without recompiling. The
+pack is loaded only when explicitly requested with `--plugins FILE`; nothing is
+auto-discovered from the working directory. Active probes are capped at 4 KB,
+a pack at 256 KB, regexes at 512 characters, and only open TCP results are
+annotated. The first matching probe wins and adds
+`plugin:<pack>/<probe>` evidence.
+
+```toml
+# probes.toml — one pack per file
+name = "example"
+description = "Example appliance probes"
+
+[[probe]]
+name = "acme-admin"
+service = "acme-admin"
+ports = [9000]
+product = "Acme Appliance"
+send = "GET /status HTTP/1.1\r\nHost: target\r\n\r\n"
+expect_regex = "ACME Admin"
+version_regex = "Version: ([0-9.]+)"
+```
+
+```bash
+rayscan scan -t 10.0.0.5 -p 9000 --plugins probes.toml --explain 9000
+```
+
+### TLS Certificate Inspection (`--tls` / `--no-tls`)
+
+Open TCP endpoints are inspected automatically on known direct-TLS and
+STARTTLS ports. `--tls` forces a direct TLS handshake on every open TCP port;
+`--no-tls` disables the stage entirely. TLS runs before plugin matching,
+accuracy scoring, and advisory correlation.
+
+Direct ports: `443`, `8443`, `9443`, `993`, `995`, `465`, `636`, `990`, `5986`,
+`2376`, `8883`, `5061`. STARTTLS ports: FTP `21`, SMTP `25`/`587`, POP3 `110`,
+IMAP `143`.
+
+```bash
+rayscan scan -t 10.0.0.5 -p 443,8443 --tls --json
+rayscan scan -t 10.0.0.5 -p 443 --no-tls
+```
+
+The JSON port object gains a `tls` object containing `version`, `cipher`,
+`subject`, `issuer`, `san`, `serial`, `not_before`, `not_after`,
+`days_remaining`, `expired`, `not_yet_valid`, `self_signed`,
+`hostname_matches`, `chain_len`, and optional `starttls`. The certificate is
+captured even when it is self-signed, expired, or does not match the target;
+these conditions are reported as fields rather than treated as handshake
+failures.
+
+### IPv6 Raw SYN and OS Fingerprinting
+
+`--syn --os` now covers both address families when run as root on Linux. IPv4
+continues to use `AF_PACKET` with BPF filtering; IPv6 uses `AF_INET6` raw
+sockets so the kernel handles routing and neighbour discovery. SYN cookies bind
+the full 128-bit address. IPv6 OS fingerprints use the SYN-ACK hop limit,
+window, and TCP options.
+
+```bash
+sudo rayscan scan -6 -t 2001:db8::10 -p 1-1024 --syn --os
+sudo rayscan scan -6 -t ::1 -p 80,443 --syn --format json
+```
+
+Decoys and IPv4 fragmentation remain IPv4-only. Mixed IPv4/IPv6 target sets are
+partitioned automatically and merged into one report.
+
+### Stealth, Jitter, Decoys, and Fragmentation
+
+```bash
+# 0-250 ms random delay before probes:
+sudo rayscan scan -t 10.0.0.5 -p 1-1024 --syn --jitter-ms 250
+
+# Add up to eight IPv4 decoy source addresses:
+sudo rayscan scan -t 10.0.0.5 -p 1-1024 --syn --decoys 10.0.0.101,10.0.0.102
+
+# Split IPv4 SYN probes into 8-byte-aligned fragments:
+sudo rayscan scan -t 10.0.0.5 -p 80,443 --syn --fragment-size 8
+```
+
+The `stealth` profile defaults to 50 ms jitter in addition to its 20 pps rate
+limit, eight workers, and three retries. Decoys and fragmentation require
+`--syn`; decoy source ports are chosen outside the configured source-port range.
+
 ### Output formats
 
 | Format | Flag | Description |
@@ -377,6 +595,18 @@ wall-clock time to scheduler contention).
 | `csv` | `--format csv` | Comma-separated values |
 | `nmap-xml` | `--format nmap-xml` | Nmap-compatible XML (Metasploit, nmap-parse-output) |
 | `greppable` | `--format greppable` | Nmap `-oG` style, one line per host |
+| `sarif` | `--format sarif` | SARIF 2.1.0 rules/results for code-scanning and vulnerability dashboards |
+| `markdown` | `--format markdown` | Summary, services, advisories, TLS, OS, defense, and diff tables | 
+
+SARIF output creates one rule per advisory ID and one result per affected
+host/port, with CVSS/severity properties and a `tcp://host:port` artifact URI.
+Markdown output is designed for tickets and pull requests. Both formats include
+the full advisory list regardless of the table truncation limit.
+
+```bash
+rayscan scan -t 10.0.0.5 -p 1-1024 --advisories --format sarif -o rayscan.sarif
+rayscan scan -t 10.0.0.5 -p 1-1024 --advisories --format markdown -o report.md
+```
 
 ### Resumable scans
 
@@ -430,6 +660,8 @@ connect_only = false
 format = "table"
 show = ["open"]
 theme = "dark"
+plugins = "probes.toml"  # optional declarative probe pack
+jitter_ms = 50           # optional random delay before each probe
 ```
 
 ### Result semantics
@@ -457,8 +689,9 @@ with a connect and banner read before it is reported as `open`. Tarpits become
 --retries 0` exposes the raw layer for diagnostics and deliberately reports
 tarpits and SYN proxies as open.
 
-Output formats are `table` (default), `json`, `jsonl`, `csv`, `nmap-xml`, and
-`greppable`. Use `--json` as the benchmark-compatible alias for `--format json`.
+Output formats are `table` (default), `json`, `jsonl`, `csv`, `nmap-xml`,
+`greppable`, `sarif`, and `markdown`. Use `--json` as the benchmark-compatible
+alias for `--format json`.
 Progress is written to stderr; JSON on stdout stays clean. Use `--output FILE`
 to write to a file instead of stdout, and `--quiet` to suppress progress and
 status messages.
@@ -561,7 +794,9 @@ and the retry windows dominate; raw discovery itself is much faster.
 
 `.github/workflows/ci.yml` runs the unprivileged gate on GitHub-hosted Ubuntu:
 formatting, clippy, tests, release build, the exact localhost gate, and
-benchmark-harness tests, plus a separate `cargo audit` job.
+benchmark-harness tests, plus separate `cargo audit` and `cargo deny`
+jobs. Release archives are built by `.github/workflows/release.yml`, which can
+optionally GPG- or cosign-sign `SHA256SUMS` through repository secrets.
 
 Raw packet tests and the namespace lab need root and are therefore **not** run
 on shared runners. `.github/workflows/lab.yml` is a manual workflow for a
@@ -591,6 +826,13 @@ packet capture.
   output, static musl binary, man page, Dockerfile. Complete.
 - Phase 8: interactive wizard, `doctor` diagnostics, themed tables/progress, and
   themed output. UX foundation complete; speed and accuracy tracks follow.
+- Beyond Phase 8: empirical accuracy scoring, defense-aware middlebox
+  classification, advisory correlation with an offline NVD mirror, differential
+  auditing (`--diff`), smart resume audit, ping sweep, declarative probe packs,
+  TLS/STARTTLS certificate inspection, IPv6 raw SYN and OS fingerprinting,
+  target sharding and report merging, lightweight stealth shaping, SARIF and
+  Markdown reporting, and supply-chain tooling. Complete in `0.3.0`; see
+  [Phase 9 feature gate](docs/phase9-features.md).
 
 ## Layout
 
@@ -610,18 +852,27 @@ src/syn/route.rs            routing table, ARP resolution, interface MAC
 src/syn/packet.rs           raw frame builder and response parser
 src/syn/filter.rs           classic BPF bytecode generator
 src/syn/engine.rs           TX/RX orchestrator, retransmission, result aggregation
+src/syn/v6.rs               AF_INET6 raw IPv6 SYN engine
 src/syn/aimd.rs             AIMD rate controller for the TX loop
+src/tls.rs                  direct/STARTTLS certificate inspection
+src/plugin.rs               declarative TOML probe packs
+src/discovery.rs            ICMP/TCP ping sweep
+src/shard.rs                stable FNV-1a target sharding
+src/merge.rs                JSON/JSONL shard report merger
 src/verify.rs               connect verification and reclassification of SYN opens
 src/anomaly.rs              anomaly detection for hosts with large SYN-open counts
 src/classify.rs             error taxonomy
 src/rtt.rs                  RFC 6298 per-host estimator
 src/rate.rs                 global token bucket
 src/limits.rs               target/worker bounds and RLIMIT handling
-src/output.rs               table/JSON/JSONL/CSV/NmapXml/Greppable rendering
+src/output.rs               table/JSON/JSONL/CSV/NmapXml/Greppable/SARIF/Markdown rendering
 src/fingerprint.rs          OS fingerprinting via TCP/IP stack analysis
 src/bin/gen_man.rs          man page generator (cargo run --bin gen_man)
 man/rayscan.1               generated man page
 Dockerfile                  multi-stage musl build → scratch image
+deny.toml                   cargo-deny license/advisory/source policy
+fuzz/                       cargo-fuzz targets for parsers and service detection
+scripts/sign-release.sh     optional GPG/cosign release signing
 tests/cli.rs                binary-level CLI and JSON tests
 lab/lab.sh                  namespace and veth lifecycle
 lab/targets.py              ground-truth TCP services
@@ -643,6 +894,7 @@ docs/phase6-gate.md         Phase 6 evidence
 docs/live-test-metasploitable.md  final live validation and safe scan parameters
 docs/live-metasploitable-full-suite.md  comprehensive 10-scenario live test suite
 docs/phase8-ux-gate.md      Phase 8 UX checkpoint evidence
+docs/phase9-features.md     Phase 9 feature gate and live validations
 ```
 
 ## Author & Maintainer

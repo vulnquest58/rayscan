@@ -1,7 +1,9 @@
-//! Raw Ethernet, IPv4, and TCP frame construction and parsing.
+//! Raw Ethernet, IPv4/IPv6, and TCP frame construction and parsing.
 //!
 //! Provides zero-copy packet generation for TCP SYN probes and safe parsing
 //! for incoming SYN-ACK, RST, and ICMP Destination Unreachable frames.
+
+use std::net::Ipv6Addr;
 
 /// Parsed representation of an incoming network frame relevant to SYN scanning.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,6 +97,139 @@ pub fn tcp_checksum(src_ip: u32, dst_ip: u32, tcp_segment: &[u8]) -> u16 {
     if res == 0 { 0xffff } else { res }
 }
 
+/// Computes the TCP checksum over an IPv6 pseudo-header and TCP segment.
+#[inline]
+pub fn tcp6_checksum(src_ip: &Ipv6Addr, dst_ip: &Ipv6Addr, tcp_segment: &[u8]) -> u16 {
+    let mut sum: u32 = 0;
+    for chunk in src_ip.octets().as_chunks::<2>().0 {
+        sum = sum.wrapping_add(u16::from_be_bytes(*chunk) as u32);
+    }
+    for chunk in dst_ip.octets().as_chunks::<2>().0 {
+        sum = sum.wrapping_add(u16::from_be_bytes(*chunk) as u32);
+    }
+    sum = sum.wrapping_add((tcp_segment.len() as u32) >> 16);
+    sum = sum.wrapping_add((tcp_segment.len() as u32) & 0xffff);
+    sum = sum.wrapping_add(6);
+
+    let (chunks, remainder) = tcp_segment.as_chunks::<2>();
+    for chunk in chunks {
+        sum = sum.wrapping_add(u16::from_be_bytes(*chunk) as u32);
+    }
+    if let Some(&rem) = remainder.first() {
+        sum = sum.wrapping_add((rem as u32) << 8);
+    }
+    while (sum >> 16) != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    let result = !(sum as u16);
+    if result == 0 { 0xffff } else { result }
+}
+
+/// Builds a raw IPv6 + TCP packet for `IPPROTO_RAW`/`IPV6_HDRINCL` sockets.
+///
+/// `tcp_options` must be zero or a multiple of four bytes.
+pub fn build_ipv6_tcp_packet(
+    src_ip: &Ipv6Addr,
+    dst_ip: &Ipv6Addr,
+    src_port: u16,
+    dst_port: u16,
+    seq: u32,
+    tcp_options: &[u8],
+) -> Vec<u8> {
+    let tcp_len = 20 + tcp_options.len();
+    let mut packet = vec![0u8; 40 + tcp_len];
+
+    packet[0] = 0x60;
+    packet[4..6].copy_from_slice(&(tcp_len as u16).to_be_bytes());
+    packet[6] = 6;
+    packet[7] = 64;
+    packet[8..24].copy_from_slice(&src_ip.octets());
+    packet[24..40].copy_from_slice(&dst_ip.octets());
+
+    let tcp = &mut packet[40..];
+    tcp[0..2].copy_from_slice(&src_port.to_be_bytes());
+    tcp[2..4].copy_from_slice(&dst_port.to_be_bytes());
+    tcp[4..8].copy_from_slice(&seq.to_be_bytes());
+    tcp[12] = (((20 + tcp_options.len()) / 4) as u8) << 4;
+    tcp[13] = 0x02;
+    tcp[14..16].copy_from_slice(&1024u16.to_be_bytes());
+    tcp[20..].copy_from_slice(tcp_options);
+
+    let checksum = tcp6_checksum(src_ip, dst_ip, tcp);
+    tcp[16..18].copy_from_slice(&checksum.to_be_bytes());
+    packet
+}
+
+/// Builds a plain IPv6 SYN packet without TCP options.
+pub fn build_ipv6_syn_packet(
+    src_ip: &Ipv6Addr,
+    dst_ip: &Ipv6Addr,
+    src_port: u16,
+    dst_port: u16,
+    seq: u32,
+) -> Vec<u8> {
+    build_ipv6_tcp_packet(src_ip, dst_ip, src_port, dst_port, seq, &[])
+}
+
+/// Parsed IPv6/TCP response relevant to the raw SYN scanner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParsedV6Frame {
+    SynAck {
+        src_ip: Ipv6Addr,
+        src_port: u16,
+        dst_port: u16,
+        ack: u32,
+    },
+    Rst {
+        src_ip: Ipv6Addr,
+        src_port: u16,
+        dst_port: u16,
+    },
+    Other,
+}
+
+/// Parses a raw IPv6 socket payload, accepting either a full IPv6 header or a
+/// bare TCP segment. `fallback_src` supplies the peer address from `recvfrom`.
+pub fn parse_ipv6_tcp(data: &[u8], fallback_src: Option<Ipv6Addr>) -> ParsedV6Frame {
+    let (src_ip, tcp) = if data.len() >= 40 && (data[0] >> 4) == 6 {
+        if data[6] != 6 {
+            return ParsedV6Frame::Other;
+        }
+        let mut octets = [0u8; 16];
+        octets.copy_from_slice(&data[8..24]);
+        (Ipv6Addr::from(octets), &data[40..])
+    } else if let Some(src) = fallback_src {
+        (src, data)
+    } else {
+        return ParsedV6Frame::Other;
+    };
+
+    if tcp.len() < 20 {
+        return ParsedV6Frame::Other;
+    }
+    let src_port = u16::from_be_bytes([tcp[0], tcp[1]]);
+    let dst_port = u16::from_be_bytes([tcp[2], tcp[3]]);
+    let ack = u32::from_be_bytes([tcp[8], tcp[9], tcp[10], tcp[11]]);
+    let flags = tcp[13];
+
+    if (flags & 0x12) == 0x12 {
+        ParsedV6Frame::SynAck {
+            src_ip,
+            src_port,
+            dst_port,
+            ack,
+        }
+    } else if (flags & 0x04) != 0 {
+        ParsedV6Frame::Rst {
+            src_ip,
+            src_port,
+            dst_port,
+        }
+    } else {
+        ParsedV6Frame::Other
+    }
+}
+
 /// Builds a 54-byte raw Ethernet/IPv4/TCP SYN frame.
 ///
 /// Header structure:
@@ -147,6 +282,49 @@ pub fn build_syn_frame(
     frame[50..52].copy_from_slice(&tcp_ck.to_be_bytes());
 
     frame
+}
+
+/// Split a raw Ethernet/IPv4/TCP SYN frame into IPv4 fragments.
+///
+/// `fragment_size` is the maximum IP payload (TCP bytes) per fragment and must
+/// be a multiple of 8.  The TCP checksum is calculated once over the complete
+/// segment and remains in the first fragment; every fragment gets its own IP
+/// header checksum, identification value, and fragment offset.
+pub fn fragment_syn_frame(frame: &[u8], fragment_size: usize) -> Vec<Vec<u8>> {
+    const ETHERNET_LEN: usize = 14;
+    const IP_LEN: usize = 20;
+
+    if frame.len() < ETHERNET_LEN + IP_LEN || fragment_size == 0 || !fragment_size.is_multiple_of(8)
+    {
+        return vec![frame.to_vec()];
+    }
+
+    let payload = &frame[ETHERNET_LEN + IP_LEN..];
+    if payload.len() <= fragment_size {
+        return vec![frame.to_vec()];
+    }
+
+    let mut fragments = Vec::with_capacity(payload.len().div_ceil(fragment_size));
+    let mut offset = 0;
+    while offset < payload.len() {
+        let chunk_len = (payload.len() - offset).min(fragment_size);
+        let mut fragment = Vec::with_capacity(ETHERNET_LEN + IP_LEN + chunk_len);
+        fragment.extend_from_slice(&frame[..ETHERNET_LEN + IP_LEN]);
+        fragment[16..18].copy_from_slice(&(IP_LEN as u16 + chunk_len as u16).to_be_bytes());
+
+        let mut flags_offset = ((offset / 8) as u16) & 0x1fff;
+        if offset + chunk_len < payload.len() {
+            flags_offset |= 0x2000; // More Fragments
+        }
+        fragment[20..22].copy_from_slice(&flags_offset.to_be_bytes());
+        fragment[24..26].copy_from_slice(&[0, 0]);
+        let checksum = ip_checksum(&fragment[ETHERNET_LEN..ETHERNET_LEN + IP_LEN]);
+        fragment[24..26].copy_from_slice(&checksum.to_be_bytes());
+        fragment.extend_from_slice(&payload[offset..offset + chunk_len]);
+        fragments.push(fragment);
+        offset += chunk_len;
+    }
+    fragments
 }
 
 /// Parses an incoming Ethernet frame and extracts TCP/ICMP probe responses.
@@ -367,6 +545,88 @@ mod tests {
                 assert_eq!(dst_port, 22);
             }
             _ => panic!("Expected IcmpUnreachable, got {:?}", parsed),
+        }
+    }
+
+    #[test]
+    fn fragments_preserve_payload_and_offsets() {
+        let frame = build_syn_frame(
+            &[1, 2, 3, 4, 5, 6],
+            &[7, 8, 9, 10, 11, 12],
+            0x0a000001,
+            0x0a000002,
+            61234,
+            80,
+            0x12345678,
+        );
+        let fragments = fragment_syn_frame(&frame, 8);
+        assert_eq!(fragments.len(), 3); // 20-byte TCP segment -> 8 + 8 + 4
+        let mut payload = Vec::new();
+        for (index, fragment) in fragments.iter().enumerate() {
+            assert_eq!(fragment.len(), 34 + if index < 2 { 8 } else { 4 });
+            assert_eq!(ip_checksum(&fragment[14..34]), 0);
+            let flags_offset = u16::from_be_bytes([fragment[20], fragment[21]]);
+            assert_eq!(flags_offset & 0x1fff, index as u16);
+            assert_eq!(flags_offset & 0x2000 != 0, index < 2);
+            assert_eq!(
+                u16::from_be_bytes([fragment[16], fragment[17]]) as usize,
+                fragment.len() - 14
+            );
+            payload.extend_from_slice(&fragment[34..]);
+        }
+        assert_eq!(payload, frame[34..]);
+    }
+
+    #[test]
+    fn tiny_or_unaligned_fragment_sizes_are_ignored() {
+        let frame = build_syn_frame(&[1; 6], &[2; 6], 0x0a000001, 0x0a000002, 61234, 80, 1);
+        assert_eq!(fragment_syn_frame(&frame, 0).len(), 1);
+        assert_eq!(fragment_syn_frame(&frame, 7).len(), 1);
+        assert_eq!(fragment_syn_frame(&frame, 64).len(), 1);
+    }
+
+    #[test]
+    fn ipv6_packet_has_valid_lengths_and_checksum() {
+        let src: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let dst: Ipv6Addr = "2001:db8::2".parse().unwrap();
+        let packet = build_ipv6_syn_packet(&src, &dst, 61000, 443, 0x1234_5678);
+        assert_eq!(packet.len(), 60);
+        assert_eq!(packet[0] >> 4, 6);
+        assert_eq!(u16::from_be_bytes([packet[4], packet[5]]), 20);
+        assert_eq!(packet[6], 6);
+        assert_eq!(&packet[8..24], &src.octets());
+        assert_eq!(&packet[24..40], &dst.octets());
+        assert_eq!(&packet[40..42], &61000u16.to_be_bytes());
+        assert_eq!(&packet[42..44], &443u16.to_be_bytes());
+        assert_ne!(u16::from_be_bytes([packet[56], packet[57]]), 0);
+    }
+
+    #[test]
+    fn parses_ipv6_syn_ack_with_and_without_header() {
+        let src: Ipv6Addr = "2001:db8::2".parse().unwrap();
+        let dst: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let mut packet = build_ipv6_syn_packet(&src, &dst, 443, 61000, 99);
+        packet[40 + 13] = 0x12;
+        packet[40 + 8..40 + 12].copy_from_slice(&100u32.to_be_bytes());
+
+        match parse_ipv6_tcp(&packet, None) {
+            ParsedV6Frame::SynAck {
+                src_ip,
+                src_port,
+                dst_port,
+                ack,
+            } => {
+                assert_eq!(src_ip, src);
+                assert_eq!(src_port, 443);
+                assert_eq!(dst_port, 61000);
+                assert_eq!(ack, 100);
+            }
+            other => panic!("expected IPv6 SYN-ACK, got {other:?}"),
+        }
+
+        match parse_ipv6_tcp(&packet[40..], Some(src)) {
+            ParsedV6Frame::SynAck { src_ip, .. } => assert_eq!(src_ip, src),
+            other => panic!("expected headerless IPv6 SYN-ACK, got {other:?}"),
         }
     }
 }

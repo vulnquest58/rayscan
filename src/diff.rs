@@ -31,6 +31,8 @@ pub enum ChangeKind {
     StateChanged,
     /// Noticeable confidence shift
     ConfidenceChanged,
+    /// Advisory findings added, resolved, or re-scored
+    AdvisoryChanged,
 }
 
 impl ChangeKind {
@@ -41,6 +43,27 @@ impl ChangeKind {
             Self::ServiceChanged => "[*] CHANGED",
             Self::StateChanged => "[*] CHANGED",
             Self::ConfidenceChanged => "[*] CHANGED",
+            Self::AdvisoryChanged => "[*] CHANGED",
+        }
+    }
+}
+
+/// Stable advisory identity retained in baselines and differential output.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AdvisoryRef {
+    pub id: String,
+    #[serde(default)]
+    pub severity: String,
+    #[serde(default)]
+    pub cvss: f32,
+}
+
+impl AdvisoryRef {
+    fn from_match(advisory: &crate::advisory::AdvisoryMatch) -> Self {
+        Self {
+            id: advisory.id.clone(),
+            severity: advisory.severity.label().to_ascii_lowercase(),
+            cvss: advisory.cvss,
         }
     }
 }
@@ -63,6 +86,10 @@ pub struct PortChange {
     pub old_confidence: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub new_confidence: Option<f32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub new_advisories: Vec<AdvisoryRef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resolved_advisories: Vec<AdvisoryRef>,
     pub summary: String,
 }
 
@@ -84,6 +111,8 @@ pub struct DiffSummary {
     pub modified_ports: usize,
     pub unchanged_ports: usize,
     pub posture_changes: usize,
+    #[serde(default)]
+    pub critical_advisories: usize,
 }
 
 /// Complete differential analysis report.
@@ -102,6 +131,7 @@ pub struct BaselineEntry {
     pub state: PortState,
     pub service_label: Option<String>,
     pub confidence: Option<f32>,
+    pub advisories: Vec<AdvisoryRef>,
 }
 
 /// Baseline snapshot encompassing ports and defensive posture.
@@ -123,6 +153,7 @@ impl BaselineSnapshot {
                     state: res.state,
                     service_label: if svc.is_empty() { None } else { Some(svc) },
                     confidence: res.confidence,
+                    advisories: res.advisories.iter().map(AdvisoryRef::from_match).collect(),
                 },
             );
         }
@@ -176,10 +207,13 @@ impl ScanDiff {
                             new_service: svc.clone(),
                             old_confidence: None,
                             new_confidence: curr.confidence,
+                            new_advisories: curr.advisories.clone(),
+                            resolved_advisories: Vec::new(),
                             summary: format!(
-                                "{} (Confidence: {:.0}%)",
+                                "{} (Confidence: {:.0}%){}",
                                 svc.as_deref().unwrap_or("open port"),
-                                conf * 100.0
+                                conf * 100.0,
+                                advisory_note(&[], &curr.advisories)
                             ),
                         });
                     }
@@ -198,9 +232,12 @@ impl ScanDiff {
                             new_service: None,
                             old_confidence: base.confidence,
                             new_confidence: None,
+                            new_advisories: Vec::new(),
+                            resolved_advisories: base.advisories.clone(),
                             summary: format!(
-                                "{} (Was: open)",
-                                base.service_label.as_deref().unwrap_or("open port")
+                                "{} (Was: open){}",
+                                base.service_label.as_deref().unwrap_or("open port"),
+                                advisory_note(&base.advisories, &[])
                             ),
                         });
                     }
@@ -222,10 +259,13 @@ impl ScanDiff {
                             new_service: curr.service_label.clone(),
                             old_confidence: base.confidence,
                             new_confidence: curr.confidence,
+                            new_advisories: Vec::new(),
+                            resolved_advisories: base.advisories.clone(),
                             summary: format!(
-                                "open → {} ({})",
+                                "open → {} ({}){}",
                                 curr.state.as_str(),
-                                base.service_label.as_deref().unwrap_or("unknown")
+                                base.service_label.as_deref().unwrap_or("unknown"),
+                                advisory_note(&base.advisories, &[])
                             ),
                         });
                     } else if base.state != PortState::Open && curr.state == PortState::Open {
@@ -247,14 +287,17 @@ impl ScanDiff {
                             },
                             old_confidence: base.confidence,
                             new_confidence: curr.confidence,
+                            new_advisories: curr.advisories.clone(),
+                            resolved_advisories: Vec::new(),
                             summary: format!(
-                                "{} (Was: {})",
+                                "{} (Was: {}){}",
                                 if curr_svc.is_empty() {
                                     "open"
                                 } else {
                                     &curr_svc
                                 },
-                                base.state.as_str()
+                                base.state.as_str(),
+                                advisory_note(&[], &curr.advisories)
                             ),
                         });
                     } else if base.state == PortState::Open && curr.state == PortState::Open {
@@ -264,25 +307,43 @@ impl ScanDiff {
                             (Some(b), Some(c)) => (b - c).abs() >= 0.20,
                             _ => false,
                         };
+                        let (new_advisories, resolved_advisories) =
+                            advisory_delta(&base.advisories, &curr.advisories);
+                        let advisory_diff =
+                            !new_advisories.is_empty() || !resolved_advisories.is_empty();
+                        let advisory_text = advisory_note(&resolved_advisories, &new_advisories);
 
-                        if svc_diff {
+                        if svc_diff || conf_diff || advisory_diff {
+                            let (kind, summary) = if svc_diff {
+                                (
+                                    ChangeKind::ServiceChanged,
+                                    format!("{} → {}{}", base_svc, curr_svc, advisory_text),
+                                )
+                            } else if conf_diff {
+                                (
+                                    ChangeKind::ConfidenceChanged,
+                                    format!(
+                                        "confidence: {:.0}% → {:.0}%{}",
+                                        base.confidence.unwrap_or(1.0) * 100.0,
+                                        curr.confidence.unwrap_or(1.0) * 100.0,
+                                        advisory_text
+                                    ),
+                                )
+                            } else {
+                                (
+                                    ChangeKind::AdvisoryChanged,
+                                    format!(
+                                        "advisories: {} → {}{}",
+                                        base.advisories.len(),
+                                        curr.advisories.len(),
+                                        advisory_text
+                                    ),
+                                )
+                            };
                             port_changes.push(PortChange {
                                 host,
                                 port,
-                                kind: ChangeKind::ServiceChanged,
-                                old_state: Some(base.state),
-                                new_state: Some(curr.state),
-                                old_service: Some(base_svc.clone()),
-                                new_service: Some(curr_svc.clone()),
-                                old_confidence: base.confidence,
-                                new_confidence: curr.confidence,
-                                summary: format!("{} → {}", base_svc, curr_svc),
-                            });
-                        } else if conf_diff {
-                            port_changes.push(PortChange {
-                                host,
-                                port,
-                                kind: ChangeKind::ConfidenceChanged,
+                                kind,
                                 old_state: Some(base.state),
                                 new_state: Some(curr.state),
                                 old_service: if base_svc.is_empty() {
@@ -297,11 +358,9 @@ impl ScanDiff {
                                 },
                                 old_confidence: base.confidence,
                                 new_confidence: curr.confidence,
-                                summary: format!(
-                                    "confidence: {:.0}% → {:.0}%",
-                                    base.confidence.unwrap_or(1.0) * 100.0,
-                                    curr.confidence.unwrap_or(1.0) * 100.0
-                                ),
+                                new_advisories,
+                                resolved_advisories,
+                                summary,
                             });
                         } else {
                             unchanged_ports += 1;
@@ -347,10 +406,16 @@ impl ScanDiff {
                     ChangeKind::ServiceChanged
                         | ChangeKind::StateChanged
                         | ChangeKind::ConfidenceChanged
+                        | ChangeKind::AdvisoryChanged
                 )
             })
             .count();
         let posture_count = posture_changes.len();
+        let critical_advisories = port_changes
+            .iter()
+            .flat_map(|change| &change.new_advisories)
+            .filter(|advisory| advisory.severity.eq_ignore_ascii_case("critical"))
+            .count();
 
         let summary = DiffSummary {
             new_ports,
@@ -358,6 +423,7 @@ impl ScanDiff {
             modified_ports,
             unchanged_ports,
             posture_changes: posture_count,
+            critical_advisories,
         };
 
         Self {
@@ -415,7 +481,12 @@ impl ScanDiff {
                     _ => "",
                 };
 
-                if c.kind == ChangeKind::ServiceChanged || c.kind == ChangeKind::StateChanged {
+                if matches!(
+                    c.kind,
+                    ChangeKind::ServiceChanged
+                        | ChangeKind::StateChanged
+                        | ChangeKind::AdvisoryChanged
+                ) {
                     out.push_str(&format!(
                         "{:<11} {:<21} {}\n",
                         styled_tag, target_str, c.summary
@@ -454,8 +525,61 @@ impl ScanDiff {
             self.summary.posture_changes,
             self.summary.unchanged_ports
         ));
+        if self.summary.critical_advisories > 0 {
+            out.push_str(&format!(
+                "New critical advisories: {}\n",
+                self.summary.critical_advisories
+            ));
+        }
 
         out
+    }
+}
+
+fn advisory_delta(
+    baseline: &[AdvisoryRef],
+    current: &[AdvisoryRef],
+) -> (Vec<AdvisoryRef>, Vec<AdvisoryRef>) {
+    let base_by_id: HashMap<&str, &AdvisoryRef> = baseline
+        .iter()
+        .map(|advisory| (advisory.id.as_str(), advisory))
+        .collect();
+    let current_by_id: HashMap<&str, &AdvisoryRef> = current
+        .iter()
+        .map(|advisory| (advisory.id.as_str(), advisory))
+        .collect();
+
+    let mut added = Vec::new();
+    let mut resolved = Vec::new();
+    for advisory in current {
+        match base_by_id.get(advisory.id.as_str()) {
+            None => added.push(advisory.clone()),
+            Some(old) if advisory_materially_changed(old, advisory) => {
+                resolved.push((*old).clone());
+                added.push(advisory.clone());
+            }
+            Some(_) => {}
+        }
+    }
+    for advisory in baseline {
+        if !current_by_id.contains_key(advisory.id.as_str()) {
+            resolved.push(advisory.clone());
+        }
+    }
+    added.sort_by(|left, right| left.id.cmp(&right.id));
+    resolved.sort_by(|left, right| left.id.cmp(&right.id));
+    (added, resolved)
+}
+
+fn advisory_materially_changed(old: &AdvisoryRef, new: &AdvisoryRef) -> bool {
+    !old.severity.eq_ignore_ascii_case(&new.severity) || (old.cvss - new.cvss).abs() >= 0.1
+}
+
+fn advisory_note(resolved: &[AdvisoryRef], added: &[AdvisoryRef]) -> String {
+    if resolved.is_empty() && added.is_empty() {
+        String::new()
+    } else {
+        format!("; advisories +{} -{}", added.len(), resolved.len())
     }
 }
 
@@ -565,12 +689,35 @@ pub fn load_baseline(path: &Path) -> Result<BaselineSnapshot, AppError> {
                     .and_then(|v| v.as_f64())
                     .map(|f| f as f32);
 
+                let advisories = item
+                    .get("advisories")
+                    .and_then(|v| v.as_array())
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(|advisory| {
+                                let id = advisory.get("id")?.as_str()?.to_string();
+                                let severity = advisory
+                                    .get("severity")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("unknown")
+                                    .to_string();
+                                let cvss =
+                                    advisory.get("cvss").and_then(|v| v.as_f64()).unwrap_or(0.0)
+                                        as f32;
+                                Some(AdvisoryRef { id, severity, cvss })
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
                 snapshot.ports.insert(
                     (host, port as u16),
                     BaselineEntry {
                         state,
                         service_label,
                         confidence,
+                        advisories,
                     },
                 );
             }
@@ -634,6 +781,7 @@ pub fn load_baseline(path: &Path) -> Result<BaselineSnapshot, AppError> {
                         state: st,
                         service_label: r.service,
                         confidence: None,
+                        advisories: Vec::new(),
                     },
                 );
             }
@@ -676,6 +824,7 @@ pub fn run_cli(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::advisory::AdvisoryMatch;
     use crate::model::StateCounts;
     use crate::service::ServiceInfo;
     use std::time::Duration;
@@ -692,6 +841,7 @@ mod tests {
                 state: PortState::Open,
                 service_label: Some("ftp vsftpd/2.3.4".to_string()),
                 confidence: Some(1.0),
+                advisories: Vec::new(),
             },
         );
         baseline.ports.insert(
@@ -700,6 +850,7 @@ mod tests {
                 state: PortState::Open,
                 service_label: Some("ssh OpenSSH/7.4".to_string()),
                 confidence: Some(1.0),
+                advisories: Vec::new(),
             },
         );
 
@@ -753,5 +904,76 @@ mod tests {
         assert!(rendered.contains("192.168.1.10:21"));
         assert!(rendered.contains("[*] CHANGED"));
         assert!(rendered.contains("OpenSSH/7.4 → ssh OpenSSH/8.9"));
+    }
+
+    #[test]
+    fn advisory_changes_are_reported_and_counted() {
+        let host: IpAddr = "192.0.2.5".parse().unwrap();
+        let mut baseline = BaselineSnapshot::default();
+        baseline.ports.insert(
+            (host, 443),
+            BaselineEntry {
+                state: PortState::Open,
+                service_label: Some("https nginx/1.18.0".to_string()),
+                confidence: Some(1.0),
+                advisories: vec![AdvisoryRef {
+                    id: "CVE-2021-0001".to_string(),
+                    severity: "medium".to_string(),
+                    cvss: 5.0,
+                }],
+            },
+        );
+
+        let mut result = PortResult::new(host, 443, PortState::Open, Duration::from_millis(1));
+        result.service = Some(ServiceInfo {
+            name: "https".to_string(),
+            product: Some("nginx".to_string()),
+            version: Some("1.18.0".to_string()),
+        });
+        result.confidence = Some(1.0);
+        result.advisories = vec![
+            AdvisoryMatch {
+                id: "CVE-2021-0001".to_string(),
+                title: "rescored".to_string(),
+                severity: crate::advisory::Severity::High,
+                cvss: 8.1,
+                source: "nvd",
+            },
+            AdvisoryMatch {
+                id: "CVE-2024-9999".to_string(),
+                title: "new critical issue".to_string(),
+                severity: crate::advisory::Severity::Critical,
+                cvss: 9.8,
+                source: "nvd",
+            },
+        ];
+
+        let report = ScanReport {
+            targets: 1,
+            ports: 1,
+            jobs: 1,
+            workers: 1,
+            elapsed: Duration::from_millis(5),
+            counts: StateCounts {
+                open: 1,
+                ..Default::default()
+            },
+            results: vec![result],
+            os_fingerprints: HashMap::new(),
+            probed_ports: vec![443],
+            partial: false,
+            defense_observations: Vec::new(),
+        };
+
+        let diff = ScanDiff::compute("baseline.json", "192.0.2.5", &baseline, &report);
+        assert_eq!(diff.summary.modified_ports, 1);
+        assert_eq!(diff.summary.critical_advisories, 1);
+        let change = &diff.port_changes[0];
+        assert_eq!(change.kind, ChangeKind::AdvisoryChanged);
+        assert_eq!(change.new_advisories.len(), 2);
+        assert_eq!(change.resolved_advisories.len(), 1);
+        let rendered = diff.render_terminal(false);
+        assert!(rendered.contains("advisories +2 -1"));
+        assert!(rendered.contains("New critical advisories: 1"));
     }
 }

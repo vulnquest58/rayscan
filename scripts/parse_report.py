@@ -28,6 +28,14 @@ for r in open_ports:
     rtt = f"{r.get('latency_ms', 0):.2f}ms"
     ev = r.get("evidence", "")
     print(f"{port:<9} {state:<7} {conf:<7} {sname:<12} {pv:<25} {rtt:<9} {ev}")
+    tls = r.get("tls")
+    if tls:
+        print(f"         └─ TLS: {tls.get('version')} {tls.get('cipher')} | Subject: {tls.get('subject')}")
+    advs = r.get("advisories", [])
+    for a in advs:
+        cve_id = a.get("id") or a.get("cve")
+        title = a.get("title") or a.get("summary")
+        print(f"         └─ Advisory: {cve_id} [{a.get('severity')}] (CVSS {a.get('cvss')}): {title}")
 
 print("-" * 100)
 os_fps = d.get("os_fingerprints") or d.get("os")

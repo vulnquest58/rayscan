@@ -34,3 +34,4 @@
 
 ### 3. Cross-Platform Parity
 - Tested both Windows native `rayscan.exe` and Linux `rayscan` (raw SYN via WSL2). Both produce identical JSON output structure, consistent accuracy classifications, and sub-second parsing times for change detection (`--diff`).
+

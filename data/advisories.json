@@ -1,0 +1,73 @@
+[
+  {
+    "id": "CVE-2011-2523",
+    "title": "vsftpd 2.3.4 backdoor command execution",
+    "cvss": 10.0,
+    "products": ["vsftpd"],
+    "version": { "op": "eq", "value": "2.3.4" }
+  },
+  {
+    "id": "CVE-2007-2447",
+    "title": "Samba username map script remote command execution",
+    "cvss": 10.0,
+    "products": ["samba"],
+    "version": { "op": "range", "min": "3.0.0", "max_exclusive": "3.0.25" }
+  },
+  {
+    "id": "CVE-2010-2075",
+    "title": "UnrealIRCd 3.2.8.1 backdoor command execution",
+    "cvss": 10.0,
+    "products": ["unrealircd"],
+    "version": { "op": "eq", "value": "3.2.8.1" }
+  },
+  {
+    "id": "CVE-2008-0166",
+    "title": "Debian OpenSSL PRNG flaw enables weak SSH keys",
+    "cvss": 7.8,
+    "products": ["openssh"],
+    "version": { "op": "range", "min": "4.3", "max_exclusive": "4.8" },
+    "banner_any": ["debian", "ubuntu"]
+  },
+  {
+    "id": "CVE-2007-6750",
+    "title": "Apache Slowloris partial-request denial of service",
+    "cvss": 5.0,
+    "products": ["apache", "httpd"],
+    "version": { "op": "lt", "value": "2.2.15" }
+  },
+  {
+    "id": "CVE-2011-3192",
+    "title": "Apache Range header memory-exhaustion denial of service",
+    "cvss": 7.8,
+    "products": ["apache", "httpd"],
+    "version": { "op": "lt", "value": "2.2.20" }
+  },
+  {
+    "id": "CVE-2021-41773",
+    "title": "Apache HTTP Server 2.4.49 path traversal and file disclosure",
+    "cvss": 9.8,
+    "products": ["apache", "httpd"],
+    "version": { "op": "eq", "value": "2.4.49" }
+  },
+  {
+    "id": "CVE-2021-42013",
+    "title": "Apache HTTP Server 2.4.50 path traversal (incomplete fix)",
+    "cvss": 9.8,
+    "products": ["apache", "httpd"],
+    "version": { "op": "eq", "value": "2.4.50" }
+  },
+  {
+    "id": "CVE-2019-10149",
+    "title": "Exim remote command execution (\"The Return of the WIZard\")",
+    "cvss": 9.8,
+    "products": ["exim"],
+    "version": { "op": "range", "min": "4.87", "max_exclusive": "4.92" }
+  },
+  {
+    "id": "CVE-2004-2687",
+    "title": "distccd remote command execution",
+    "cvss": 9.3,
+    "products": ["distcc", "distccd"],
+    "version": { "op": "lt", "value": "3.0" }
+  }
+]

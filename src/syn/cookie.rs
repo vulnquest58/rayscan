@@ -40,6 +40,22 @@ impl CookieKey {
     pub fn validate(&self, dst_ip: u32, dst_port: u16, src_port: u16, ack: u32) -> bool {
         ack.wrapping_sub(1) == self.encode(dst_ip, dst_port, src_port)
     }
+
+    /// Encode an IPv6 target and source metadata into a 32-bit ISN.
+    pub fn encode_v6(&self, dst_ip: &[u8; 16], dst_port: u16, src_port: u16) -> u32 {
+        let mut hasher = SipHasher13::new_with_key(&self.0);
+        hasher.write_u8(6);
+        hasher.write(dst_ip);
+        hasher.write_u16(dst_port);
+        hasher.write_u16(src_port);
+        let hash = hasher.finish();
+        (hash as u32) ^ ((hash >> 32) as u32)
+    }
+
+    /// Validate an IPv6 SYN-ACK acknowledgment number.
+    pub fn validate_v6(&self, dst_ip: &[u8; 16], dst_port: u16, src_port: u16, ack: u32) -> bool {
+        ack.wrapping_sub(1) == self.encode_v6(dst_ip, dst_port, src_port)
+    }
 }
 
 #[cfg(test)]
@@ -69,5 +85,23 @@ mod tests {
         assert!(!key.validate(dst_ip, dst_port + 1, src_port, ack));
         assert!(!key.validate(dst_ip, dst_port, src_port + 1, ack));
         assert!(!key.validate(dst_ip + 1, dst_port, src_port, ack));
+    }
+
+    #[test]
+    fn ipv6_cookie_binds_full_address_and_ports() {
+        let key = CookieKey::from_bytes([7; 16]);
+        let dst: [u8; 16] = "2001:db8::42"
+            .parse::<std::net::Ipv6Addr>()
+            .unwrap()
+            .octets();
+        let seq = key.encode_v6(&dst, 443, 61000);
+        assert!(key.validate_v6(&dst, 443, 61000, seq.wrapping_add(1)));
+        assert!(!key.validate_v6(&dst, 443, 61000, seq));
+        assert!(!key.validate_v6(&dst, 444, 61000, seq.wrapping_add(1)));
+        assert!(!key.validate_v6(&dst, 443, 61001, seq.wrapping_add(1)));
+
+        let mut other = dst;
+        other[15] ^= 1;
+        assert!(!key.validate_v6(&other, 443, 61000, seq.wrapping_add(1)));
     }
 }

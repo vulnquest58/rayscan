@@ -1,0 +1,32 @@
+{
+  "target": "45.33.32.156",
+  "targets": 1,
+  "ports": 5,
+  "jobs": 5,
+  "workers": 5,
+  "open": [
+    {
+      "host": "45.33.32.156",
+      "port": 22,
+      "state": "open",
+      "latency_ms": 215.034,
+      "banner": "SSH-2.0-OpenSSH_6.6.1p1 Ubuntu-2ubuntu2.13",
+      "service": {
+        "name": "ssh",
+        "product": "OpenSSH",
+        "version": "6.6.1p1"
+      },
+      "confidence": 0.95,
+      "evidence": "handshake:ok(20%) banner:ssh/OpenSSH(40%) stack:standard(15%) latency:215.0ms(20%)"
+    }
+  ],
+  "summary": {
+    "open": 1,
+    "closed": 0,
+    "filtered": 2,
+    "silent": 2,
+    "unreachable": 0,
+    "error": 0
+  },
+  "elapsed_ms": 1512.978
+}

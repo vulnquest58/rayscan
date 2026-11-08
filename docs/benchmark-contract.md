@@ -9,7 +9,7 @@ unless the harness and its tests are changed in the same commit.
 rayscan scan --target <host-or-cidr> --ports <list> --json
 ```
 
-- `--target` is one IPv4 address, CIDR, or range.
+- `--target` is one IPv4 or IPv6 address, CIDR, range, or file of targets.
 - `--ports` is a comma-separated list (`80,443,8000-8100`).
 - `--json` writes one JSON object to stdout and nothing else to stdout.
 - Progress and diagnostics go to stderr.
@@ -40,6 +40,13 @@ non-open state is selected with `--show` or `--all-states`; its entries carry
 `state`, so non-open entries are ignored by the harness. A JSON-lines stream is
 also accepted for streaming experiments (`--format jsonl`).
 
+Port objects may carry additive optional fields (`service`, `version`,
+`accuracy`, `advisories`, `tls`, and existing metadata). The harness ignores
+unknown fields. `tls` is present only when TLS inspection succeeded and includes
+`version`, `cipher`, certificate identity/validity, and trust flags.
+`--format sarif` and `--format markdown` are human/dashboard outputs and are not
+consumed by the benchmark harness.
+
 The scanner's default verified mode waits briefly for a banner after a
 successful handshake. A tarpit or SYN proxy that never supplies a banner is
 `silent` or `closed`, not `open`. `--connect-only` disables that verification
@@ -48,7 +55,8 @@ and restores handshake-only behaviour.
 ## SYN mode
 
 `--syn` uses the same command and JSON contract. It requires Linux
-root/`CAP_NET_RAW` and is Linux-only. Raw SYN-ACKs are candidates: by default
+root/`CAP_NET_RAW` and is Linux-only. IPv4 and IPv6 targets are supported; mixed
+families are partitioned and merged into one result. Raw SYN-ACKs are candidates: by default
 each candidate is connect-verified before it appears in `open`. For raw
 diagnostics, `--syn --connect-only` reports the layer-3/4 result directly.
 `--retries N` controls both raw retransmission and connect-verification retries.

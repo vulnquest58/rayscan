@@ -5,10 +5,10 @@ MUSL_TARGET := x86_64-unknown-linux-musl
 PREFIX      ?= /usr/local
 DESTDIR     ?=
 
-.PHONY: all build release test fmt lint audit ci \
+.PHONY: all build release test fmt lint audit deny fuzz sign ci \
         lab lab-down lab-check bench bench-test localhost-gate \
         syn-gate service-gate syn-service-gate \
-        musl install docker man clean
+        musl install docker man dist clean
 
 all: build
 
@@ -29,6 +29,22 @@ lint:
 
 audit:
 	$(CARGO) audit
+
+## License, advisory, source, and dependency-duplication policy.
+## Install once: cargo install cargo-deny --locked
+deny:
+	$(CARGO) deny check
+
+## Run a libFuzzer target for 60 seconds (default: service_inspect).
+## Install once: cargo install cargo-fuzz --locked && rustup toolchain install nightly
+FUZZ_TARGET ?= service_inspect
+FUZZ_SECONDS ?= 60
+fuzz:
+	$(CARGO) +nightly fuzz run $(FUZZ_TARGET) -- -max_total_time=$(FUZZ_SECONDS)
+
+## Sign dist/SHA256SUMS with GPG and/or cosign (see scripts/sign-release.sh).
+sign:
+	bash scripts/sign-release.sh
 
 ci: fmt lint test bench-test release
 
@@ -75,13 +91,18 @@ dist: man
 	@cp rayscan-static-musl /tmp/rayscan-dist-linux/bin/
 	@cp man/rayscan.1 /tmp/rayscan-dist-linux/share/man/man1/
 	@cp README.md CHANGELOG.md LICENSE /tmp/rayscan-dist-linux/
-	@tar -czf dist/rayscan-0.2.0-linux-x86_64.tar.gz -C /tmp/rayscan-dist-linux .
+	@tar -czf dist/rayscan-0.3.0-linux-x86_64.tar.gz -C /tmp/rayscan-dist-linux .
 	@cp rayscan.exe /tmp/rayscan-dist-win/bin/
 	@cp README.md CHANGELOG.md LICENSE /tmp/rayscan-dist-win/
-	@python3 -c "import os, zipfile; base = '/tmp/rayscan-dist-win'; zf = zipfile.ZipFile('dist/rayscan-0.2.0-windows-x86_64.zip', 'w', zipfile.ZIP_DEFLATED); [zf.write(os.path.join(r, f), os.path.relpath(os.path.join(r, f), base)) for r, _, fs in os.walk(base) for f in fs]; zf.close()"
-	@cd dist && sha256sum rayscan-0.2.0-linux-x86_64.tar.gz rayscan-0.2.0-windows-x86_64.zip > SHA256SUMS
+	@python3 -c "import os, zipfile; base = '/tmp/rayscan-dist-win'; zf = zipfile.ZipFile('dist/rayscan-0.3.0-windows-x86_64.zip', 'w', zipfile.ZIP_DEFLATED); [zf.write(os.path.join(r, f), os.path.relpath(os.path.join(r, f), base)) for r, _, fs in os.walk(base) for f in fs]; zf.close()"
+	@cd dist && sha256sum rayscan-0.3.0-linux-x86_64.tar.gz rayscan-0.3.0-windows-x86_64.zip > SHA256SUMS
 	@echo "Release archives created in dist/:"
 	@cat dist/SHA256SUMS
+	@if [ -n "$${RAYSCAN_GPG_KEY:-}" ] || [ -n "$${RAYSCAN_COSIGN_KEY:-}" ]; then \
+		bash scripts/sign-release.sh; \
+	else \
+		echo "no signing key configured; run 'make sign' with RAYSCAN_GPG_KEY or RAYSCAN_COSIGN_KEY"; \
+	fi
 
 # ── Lab / gate targets ────────────────────────────────────────────────────────
 

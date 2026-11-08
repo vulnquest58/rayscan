@@ -2,6 +2,70 @@
 
 All notable changes to rayscan are documented here.
 
+## [0.3.0] - 2026-11-08
+
+### Added
+
+- **TLS inspection** (`--tls`, `--no-tls`, `src/tls.rs`): Direct and STARTTLS
+  handshakes on known ports capture protocol version, cipher, certificate
+  subject/issuer/SANs/serial/validity, days remaining, self-signed and hostname
+  status, chain length, and STARTTLS protocol. Certificates are captured even
+  when untrusted; metadata appears in JSON, CSV, and Markdown output.
+- **SARIF 2.1.0 and Markdown output** (`--format sarif`, `--format markdown`):
+  Advisory rules and findings with CVSS/severity properties and host:port
+  locations, plus human-readable summary, services, vulnerabilities, TLS, OS,
+  defense, and differential sections.
+- **Advisory-aware diffs** (`src/diff.rs`): Baselines retain
+  `{id, severity, cvss}` advisories. Diffs report added/resolved/re-scored
+  findings, advisory counts in change summaries, and new critical advisories.
+- **Declarative probe packs** (`--plugins FILE`, `src/plugin.rs`): TOML packs
+  with passive or active payloads, literal/regex expectations, version capture,
+  bounded resource limits, and first-match-wins semantics.
+- **ICMP/TCP ping sweep** (`--ping-sweep`, `--ping-count`, `--ping-timeout-ms`,
+  `src/discovery.rs`): Linux IPv4 raw ICMP with TCP fallback; IPv6 TCP fallback.
+  Connection refusals count as alive, target order is preserved, and work is
+  chunked across hosts.
+- **Raw IPv6 SYN scanning and IPv6 OS fingerprinting** (`src/syn/v6.rs`): Linux
+  `AF_INET6` raw sockets, full 128-bit SYN cookies, retries, rate limiting, and
+  SYN-ACK option classification. Mixed IPv4/IPv6 target sets are scanned and
+  merged transparently.
+- **Distributed target sharding** (`--shard-index`, `--shard-count`,
+  `src/shard.rs`): Stable FNV-1a placement with family-aware hashing and
+  validation up to 1,024 shards.
+- **Report merge command** (`rayscan merge`, `src/merge.rs`): Merge JSON or JSONL
+  reports, deduplicate host:port results with open-wins precedence, union
+  advisories, merge OS/defense maps, and adjust summaries.
+- **Stealth traffic shaping** (`--jitter-ms`, `--decoys`, `--fragment-size`):
+  Random delay before scanner probes and SYN batches, up to eight IPv4 decoy
+  source addresses, and 8-byte-aligned IPv4 SYN fragmentation. The stealth
+  profile now defaults to 50 ms jitter.
+- **Supply-chain tooling**: `deny.toml`, `cargo-fuzz` targets for service, UDP,
+  and packet parsers, `make deny`/`make fuzz`/`make sign`, optional GPG/cosign
+  signing in `make dist`, a CI deny job, and a tag-triggered release workflow for
+  musl Linux and Windows GNU archives.
+
+### Changed
+
+- Version bumped to `0.3.0` across `Cargo.toml`, archives, README, and man page.
+- Phase 9 feature gate documented in `docs/phase9-features.md`, including live
+  STARTTLS and Metasploitable 2 validations.
+- JSON port objects now include an optional `tls` object; CSV gains
+  `tls_version`, `tls_subject`, and `tls_days_remaining` columns.
+- Raw SYN target handling now accepts IPv4 and IPv6 in the same invocation.
+- UDP probing binds `[::]:0` for IPv6 targets instead of an IPv4 wildcard.
+- `--ping-count` and `--ping-timeout-ms` require `--ping-sweep`; `--decoys` and
+  `--fragment-size` require `--syn`.
+- Output format enum now includes `sarif` and `markdown`.
+
+### Fixed
+
+- `rayscan merge` no longer duplicates open-only JSON entries into a redundant
+  `results` array; `results` is emitted only when an input supplied one or the
+  inputs are JSONL.
+- UDP service probing against IPv6 targets no longer fails on an IPv4-only bind.
+- SMTP STARTTLS negotiation now handles a bare `250` response terminator.
+- Clippy warnings in checksum, plugin hex parsing, and packet tests.
+
 ## [0.2.0] - 2026-11-07
 
 ### Added
@@ -31,12 +95,20 @@ All notable changes to rayscan are documented here.
 - **Live Results Table & In-Memory Deduplication** (`src/lib.rs`): Streams responsive ports cleanly above the progress bar with `HashSet<(IpAddr, u16)>` deduplication during retries.
 - **Cyber High-Contrast Theme** (`--theme cyber`): Enhanced terminal visibility palette for modern terminals.
 - **Standalone Native Windows Subcommand Execution**: `rayscan.exe diff` supported natively alongside connect scanning.
+- **Offline CVE Advisory Correlation** (`--advisories`, `src/advisory.rs`, `data/advisories.json`): Detected service product/version/banner tuples are matched against a bundled curated CVE database (vsftpd 2.3.4 backdoor, Samba 3.0.x, UnrealIRCd 3.2.8.1, Debian OpenSSH PRNG, Apache 2.2.x DoS and 2.4.49/2.4.50 path traversal, Exim 4.87-4.91, distccd). Findings attach to port results and render as an `ADVISORIES` table column, a severity-sorted correlation section, `--explain` breakdowns, and `advisories` arrays in JSON/JSONL output. Correlation is fully offline and advisory only; no additional target traffic is generated.
+- **Local NVD CVE Advisory Database** (`rayscan db update`, `rayscan db status`, `src/db/`): A user-maintained mirror built from the official NVD CVE 2.0 feeds covering 1999 through 2026 (over 400k CVEs and 325k product mappings at release). Feed processing is streamed and digest-verified, and the mirror is stored as compact yearly records plus 256-way product shards with atomic manifest updates and a concurrency lock. Manual refreshes support `--years SPEC` subsets and `--force`; `db status [--json]` reports coverage, age, and staleness. Every scan checks the rolling `recent` feed and applies changes automatically unless `--no-db-update` is passed, and update failures never fail a scan. NVD matches merge with curated findings and are tagged with `source: "nvd"`; curated findings rank first and each source is severity-sorted, while human-readable advisory sections cap at 10 rows per service and JSON keeps the full list. Database location follows `--db-dir`, `RAYSCAN_DB_DIR`, or the platform data directory.
 
 ### Changed
 
+- Scans now perform an automatic lightweight NVD `recent`-feed check by default; use `--no-db-update` to disable it.
 - Updated version to `v0.2.0` across `Cargo.toml`, `Makefile`, `README.md`, man pages, and distribution archives.
 - Streamlined `render_table` with `TableOptions` parameter struct.
 - Hardened test assertions against package version macros.
+
+### Fixed
+
+- **Defense Awareness false positives on client-first services** (`src/defense.rs`): known binary-protocol ports (rpcbind 111, distccd 3632, PostgreSQL 5432, X11 6000, AJP 8009, ...) that hold connections mute are no longer counted as TCP-tarpit evidence, verification failures on those ports no longer imply a SYN proxy, and their low accuracy scores no longer suggest rate-limiting. Expected client-first listeners are reported as a neutral indicator instead.
+- Anomaly annotations (`anomaly:`) are now detected on any result for a host instead of only the first result, so tarpit/honeypot farms cannot be missed by result ordering.
 
 ## [0.1.0] - 2026-11-03
 

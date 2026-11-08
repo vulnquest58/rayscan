@@ -1,0 +1,259 @@
+{
+  "target": "192.168.100.37",
+  "targets": 1,
+  "ports": 1034,
+  "jobs": 1034,
+  "workers": 2,
+  "open": [
+    {
+      "host": "192.168.100.37",
+      "port": 21,
+      "state": "open",
+      "latency_ms": 12.279,
+      "banner": "220 (vsFTPd 2.3.4)",
+      "service": {
+        "name": "ftp",
+        "product": "vsFTPd",
+        "version": "2.3.4"
+      },
+      "confidence": 1.0,
+      "evidence": "handshake:ok(20%) banner:ftp/vsFTPd(40%) stack:linux(20%) latency:12.3ms(20%)",
+      "advisories": [
+        {
+          "id": "CVE-2011-2523",
+          "title": "vsftpd 2.3.4 backdoor command execution",
+          "severity": "critical",
+          "cvss": 10.0,
+          "source": "curated"
+        }
+      ]
+    },
+    {
+      "host": "192.168.100.37",
+      "port": 22,
+      "state": "open",
+      "latency_ms": 1011.357,
+      "banner": "SSH-2.0-OpenSSH_4.7p1 Debian-8ubuntu1",
+      "service": {
+        "name": "ssh",
+        "product": "OpenSSH",
+        "version": "4.7p1"
+      },
+      "confidence": 0.95,
+      "evidence": "handshake:ok(20%) banner:ssh/OpenSSH(40%) stack:linux(20%) latency:1011.4ms(15%)",
+      "advisories": [
+        {
+          "id": "CVE-2008-0166",
+          "title": "Debian OpenSSL PRNG flaw enables weak SSH keys",
+          "severity": "high",
+          "cvss": 7.8,
+          "source": "curated"
+        }
+      ]
+    },
+    {
+      "host": "192.168.100.37",
+      "port": 23,
+      "state": "open",
+      "latency_ms": 1010.87,
+      "banner": "Telnet negotiation",
+      "service": {
+        "name": "telnet"
+      },
+      "confidence": 0.9,
+      "evidence": "handshake:ok(20%) banner:telnet(35%) stack:linux(20%) latency:1010.9ms(15%)"
+    },
+    {
+      "host": "192.168.100.37",
+      "port": 25,
+      "state": "open",
+      "latency_ms": 1.986,
+      "banner": "220 metasploitable.localdomain ESMTP Postfix (Ubuntu)",
+      "service": {
+        "name": "smtp",
+        "product": "Postfix"
+      },
+      "confidence": 1.0,
+      "evidence": "handshake:ok(20%) banner:smtp/Postfix(40%) stack:linux(20%) latency:2.0ms(20%)"
+    },
+    {
+      "host": "192.168.100.37",
+      "port": 80,
+      "state": "open",
+      "latency_ms": 1.416,
+      "banner": "HTTP/1.1 200 OK",
+      "service": {
+        "name": "http",
+        "product": "Apache",
+        "version": "2.2.8"
+      },
+      "confidence": 1.0,
+      "evidence": "handshake:ok(20%) banner:http/Apache(40%) stack:linux(20%) latency:1.4ms(20%)",
+      "advisories": [
+        {
+          "id": "CVE-2011-3192",
+          "title": "Apache Range header memory-exhaustion denial of service",
+          "severity": "high",
+          "cvss": 7.8,
+          "source": "curated"
+        },
+        {
+          "id": "CVE-2007-6750",
+          "title": "Apache Slowloris partial-request denial of service",
+          "severity": "medium",
+          "cvss": 5.0,
+          "source": "curated"
+        }
+      ]
+    },
+    {
+      "host": "192.168.100.37",
+      "port": 111,
+      "state": "open",
+      "latency_ms": 1011.369,
+      "confidence": 0.85,
+      "evidence": "handshake:ok(20%) banner:binary-protocol(30%) stack:linux(20%) latency:1011.4ms(15%)"
+    },
+    {
+      "host": "192.168.100.37",
+      "port": 512,
+      "state": "open",
+      "latency_ms": 0.921,
+      "banner": "Where are you?",
+      "service": {
+        "name": "exec"
+      },
+      "confidence": 0.95,
+      "evidence": "handshake:ok(20%) banner:exec(35%) stack:linux(20%) latency:0.9ms(20%)"
+    },
+    {
+      "host": "192.168.100.37",
+      "port": 514,
+      "state": "open",
+      "latency_ms": 1.601,
+      "confidence": 0.88,
+      "evidence": "handshake:ok(20%) banner:listener-verified(28%) stack:linux(20%) latency:1.6ms(20%)"
+    },
+    {
+      "host": "192.168.100.37",
+      "port": 1524,
+      "state": "open",
+      "latency_ms": 1.235,
+      "banner": "root@metasploitable:/#",
+      "service": {
+        "name": "shell"
+      },
+      "confidence": 0.95,
+      "evidence": "handshake:ok(20%) banner:shell(35%) stack:linux(20%) latency:1.2ms(20%)"
+    },
+    {
+      "host": "192.168.100.37",
+      "port": 3306,
+      "state": "open",
+      "latency_ms": 1010.422,
+      "banner": "5.0.51a-3ubuntu5",
+      "service": {
+        "name": "mysql",
+        "product": "MySQL",
+        "version": "5.0.51a-3ubuntu5"
+      },
+      "confidence": 0.95,
+      "evidence": "handshake:ok(20%) banner:mysql/MySQL(40%) stack:linux(20%) latency:1010.4ms(15%)"
+    },
+    {
+      "host": "192.168.100.37",
+      "port": 5432,
+      "state": "open",
+      "latency_ms": 0.64,
+      "confidence": 0.9,
+      "evidence": "handshake:ok(20%) banner:binary-protocol(30%) stack:linux(20%) latency:0.6ms(20%)"
+    },
+    {
+      "host": "192.168.100.37",
+      "port": 5900,
+      "state": "open",
+      "latency_ms": 1010.81,
+      "banner": "RFB 003.003",
+      "service": {
+        "name": "vnc",
+        "product": "VNC",
+        "version": "3.3"
+      },
+      "confidence": 0.95,
+      "evidence": "handshake:ok(20%) banner:vnc/VNC(40%) stack:linux(20%) latency:1010.8ms(15%)"
+    },
+    {
+      "host": "192.168.100.37",
+      "port": 6000,
+      "state": "open",
+      "latency_ms": 1.57,
+      "confidence": 0.9,
+      "evidence": "handshake:ok(20%) banner:binary-protocol(30%) stack:linux(20%) latency:1.6ms(20%)"
+    },
+    {
+      "host": "192.168.100.37",
+      "port": 6667,
+      "state": "open",
+      "latency_ms": 1.912,
+      "banner": ":irc.Metasploitable.LAN NOTICE AUTH :*** Looking up your hostname...",
+      "service": {
+        "name": "irc"
+      },
+      "confidence": 0.95,
+      "evidence": "handshake:ok(20%) banner:irc(35%) stack:linux(20%) latency:1.9ms(20%)"
+    },
+    {
+      "host": "192.168.100.37",
+      "port": 8009,
+      "state": "open",
+      "latency_ms": 0.979,
+      "confidence": 0.9,
+      "evidence": "handshake:ok(20%) banner:binary-protocol(30%) stack:linux(20%) latency:1.0ms(20%)"
+    },
+    {
+      "host": "192.168.100.37",
+      "port": 8180,
+      "state": "open",
+      "latency_ms": 1.098,
+      "banner": "HTTP/1.1 200 OK",
+      "service": {
+        "name": "http",
+        "product": "Apache-Coyote",
+        "version": "1.1"
+      },
+      "confidence": 1.0,
+      "evidence": "handshake:ok(20%) banner:http/Apache-Coyote(40%) stack:linux(20%) latency:1.1ms(20%)"
+    }
+  ],
+  "os_fingerprints": {
+    "192.168.100.37": {
+      "family": "linux",
+      "detail": "Linux 2.6.x",
+      "confidence": 1.0,
+      "initial_ttl": 64,
+      "evidence": "TTL=63, Window=5840, MSS=1460, WScale=5, SACK=yes, DF=yes, Options=mss,nop,nop,sack,nop,wscale"
+    }
+  },
+  "defense": {
+    "192.168.100.37": {
+      "host": "192.168.100.37",
+      "defense_type": "syn_proxy",
+      "confidence": 0.92,
+      "summary": "Target is shielded by a SYN Proxy middlebox (e.g. iptables SYNPROXY, F5 BIG-IP, or DDoS protection).",
+      "indicators": [
+        "2 client-first listener(s) (e.g. RPC, PostgreSQL, X11, AJP) held mute as expected; silence on known binary ports is not treated as tarpit evidence",
+        "1 port(s) returned SYN-ACK during discovery but were rejected or dropped upon connection verification"
+      ],
+      "recommended_action": "Raw SYN discovery produces phantom candidates; verified scan mode (`rayscan scan`) confirms true backend listeners."
+    }
+  },
+  "summary": {
+    "open": 16,
+    "closed": 1014,
+    "filtered": 0,
+    "silent": 4,
+    "unreachable": 0,
+    "error": 0
+  },
+  "elapsed_ms": 9548.665
+}

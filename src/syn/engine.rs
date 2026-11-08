@@ -51,6 +51,12 @@ pub struct SynScanOptions {
     pub aimd: bool,
     /// AIMD minimum rate floor in packets per second.
     pub aimd_min_pps: u64,
+    /// Maximum random delay inserted before each packet batch, in milliseconds.
+    pub jitter_ms: u64,
+    /// Spoofed source addresses for decoy probes (IPv4 only).
+    pub decoys: Vec<Ipv4Addr>,
+    /// Maximum IPv4 payload bytes per fragment (multiple of 8). `None` disables.
+    pub fragment_size: Option<usize>,
 }
 
 impl Default for SynScanOptions {
@@ -67,6 +73,9 @@ impl Default for SynScanOptions {
             retain: StateSet::all(),
             aimd: true,
             aimd_min_pps: 100,
+            jitter_ms: 0,
+            decoys: Vec::new(),
+            fragment_size: None,
         }
     }
 }
@@ -90,6 +99,13 @@ struct TargetRoute {
     src_mac: [u8; 6],
     dst_mac: [u8; 6],
     src_ip: u32,
+}
+
+/// One outbound frame with an optional probe key used for latency tracking.
+struct TxFrame {
+    frame: Vec<u8>,
+    sll: libc::sockaddr_ll,
+    key: Option<(Ipv4Addr, u16)>,
 }
 
 /// Incoming probe response message sent from the RX thread to the coordinator.
@@ -169,14 +185,14 @@ fn resolve_target_route(
 }
 
 /// Lightweight token bucket pacer for transmit pacing.
-struct Pacer {
+pub(super) struct Pacer {
     rate_pps: u64,
     tokens: f64,
     last: Instant,
 }
 
 impl Pacer {
-    fn new(rate_pps: u64) -> Self {
+    pub(super) fn new(rate_pps: u64) -> Self {
         Self {
             rate_pps,
             tokens: if rate_pps > 0 {
@@ -188,7 +204,7 @@ impl Pacer {
         }
     }
 
-    fn wait_for_batch(&mut self, batch_count: usize) {
+    pub(super) fn wait_for_batch(&mut self, batch_count: usize) {
         if self.rate_pps == 0 || batch_count == 0 {
             return;
         }
@@ -220,10 +236,7 @@ impl Pacer {
 }
 
 /// Sends a batch of raw Ethernet frames using `sendmmsg(2)`.
-fn send_frames_batch(
-    fd: i32,
-    batch: &[([u8; 54], libc::sockaddr_ll, (Ipv4Addr, u16))],
-) -> Result<(), io::Error> {
+fn send_frames_batch(fd: i32, batch: &[TxFrame]) -> Result<(), io::Error> {
     if batch.is_empty() {
         return Ok(());
     }
@@ -231,7 +244,7 @@ fn send_frames_batch(
     let mut iovs: Vec<libc::iovec> = Vec::with_capacity(batch.len());
     let mut msgs: Vec<libc::mmsghdr> = Vec::with_capacity(batch.len());
 
-    for (frame, sll, _) in batch {
+    for TxFrame { frame, sll, .. } in batch {
         let iov = libc::iovec {
             iov_base: frame.as_ptr() as *mut libc::c_void,
             iov_len: frame.len(),
@@ -279,21 +292,52 @@ fn send_frames_batch(
 fn flush_batch(
     fd: i32,
     pacer: &mut Pacer,
-    batch: &mut Vec<([u8; 54], libc::sockaddr_ll, (Ipv4Addr, u16))>,
+    batch: &mut Vec<TxFrame>,
     tx_times: &mut HashMap<(Ipv4Addr, u16), Instant>,
+    jitter_ms: u64,
 ) -> Result<(), io::Error> {
     if batch.is_empty() {
         return Ok(());
     }
 
     pacer.wait_for_batch(batch.len());
+    if jitter_ms > 0 {
+        use rand::Rng;
+        let delay = rand::thread_rng().gen_range(0..=jitter_ms);
+        if delay > 0 {
+            std::thread::sleep(Duration::from_millis(delay));
+        }
+    }
     let now = Instant::now();
-    for (_, _, key) in batch.iter() {
-        tx_times.insert(*key, now);
+    for entry in batch.iter() {
+        if let Some(key) = entry.key {
+            tx_times.insert(key, now);
+        }
     }
     send_frames_batch(fd, batch)?;
     batch.clear();
     Ok(())
+}
+
+fn decoy_source_port(index: usize, sport_lo: u16, sport_hi: u16) -> u16 {
+    let mut candidate = 1024_u16.wrapping_add(index as u16);
+    for _ in 0..128 {
+        if candidate != 0 && !(sport_lo..=sport_hi).contains(&candidate) {
+            return candidate;
+        }
+        candidate = candidate.wrapping_add(1001);
+    }
+    if sport_lo > 1024 { 1023 } else { 65535 }
+}
+
+fn make_sll(if_idx: i32, dst_mac: &[u8; 6]) -> libc::sockaddr_ll {
+    let mut sll: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
+    sll.sll_family = libc::AF_PACKET as u16;
+    sll.sll_protocol = (libc::ETH_P_IP as u16).to_be();
+    sll.sll_ifindex = if_idx;
+    sll.sll_halen = 6;
+    sll.sll_addr[..6].copy_from_slice(dst_mac);
+    sll
 }
 
 /// The continuous receive loop executed on the dedicated RX worker thread.
@@ -432,8 +476,62 @@ fn wait_for_responses(
     }
 }
 
-/// Executes a raw SYN port scan against the specified target hosts and ports.
+/// Executes a raw SYN port scan against IPv4 and IPv6 targets.
 pub fn syn_scan(
+    opts: SynScanOptions,
+    progress: Option<ProgressCallback>,
+) -> Result<ScanReport, AppError> {
+    if opts.targets.is_empty() || opts.ports.is_empty() {
+        return Err(AppError::usage(
+            "scan needs at least one target and one port",
+        ));
+    }
+    let v4_targets: Vec<Ipv4Addr> = opts
+        .targets
+        .iter()
+        .filter_map(|target| match target {
+            IpAddr::V4(v4) => Some(*v4),
+            IpAddr::V6(_) => None,
+        })
+        .collect();
+    let v6_targets: Vec<std::net::Ipv6Addr> = opts
+        .targets
+        .iter()
+        .filter_map(|target| match target {
+            IpAddr::V6(v6) => Some(*v6),
+            IpAddr::V4(_) => None,
+        })
+        .collect();
+
+    if v6_targets.is_empty() {
+        return syn_scan_v4(opts, progress);
+    }
+    if v4_targets.is_empty() {
+        return super::v6::scan_v6(&v6_targets, &opts, progress.as_ref());
+    }
+
+    let started = Instant::now();
+    let mut v4_opts = opts.clone();
+    v4_opts.targets = v4_targets.iter().copied().map(IpAddr::V4).collect();
+    let v4_report = syn_scan_v4(v4_opts, progress.clone())?;
+    let mut report = super::v6::scan_v6(&v6_targets, &opts, progress.as_ref())?;
+
+    report.targets += v4_report.targets;
+    report.jobs += v4_report.jobs;
+    report.elapsed = started.elapsed();
+    report.counts.open += v4_report.counts.open;
+    report.counts.closed += v4_report.counts.closed;
+    report.counts.filtered += v4_report.counts.filtered;
+    report.counts.silent += v4_report.counts.silent;
+    report.counts.unreachable += v4_report.counts.unreachable;
+    report.counts.error += v4_report.counts.error;
+    report.results.extend(v4_report.results);
+    report.os_fingerprints.extend(v4_report.os_fingerprints);
+    report.partial |= v4_report.partial;
+    Ok(report)
+}
+
+fn syn_scan_v4(
     opts: SynScanOptions,
     progress: Option<ProgressCallback>,
 ) -> Result<ScanReport, AppError> {
@@ -446,18 +544,15 @@ pub fn syn_scan(
     // 1. Verify raw socket privilege (CAP_NET_RAW or root)
     check_raw_privilege()?;
 
-    // 2. Filter and extract IPv4 targets
-    let mut v4_targets = Vec::with_capacity(opts.targets.len());
-    for target in &opts.targets {
-        match target {
-            IpAddr::V4(v4) => v4_targets.push(*v4),
-            IpAddr::V6(_) => {
-                return Err(AppError::usage(
-                    "raw SYN scanning currently supports IPv4 targets only",
-                ));
-            }
-        }
-    }
+    // 2. Extract IPv4 targets (IPv6 is handled by the AF_INET6 engine).
+    let v4_targets: Vec<Ipv4Addr> = opts
+        .targets
+        .iter()
+        .filter_map(|target| match target {
+            IpAddr::V4(v4) => Some(*v4),
+            IpAddr::V6(_) => None,
+        })
+        .collect();
 
     let total_probes = (v4_targets.len() as u64)
         .checked_mul(opts.ports.len() as u64)
@@ -570,8 +665,7 @@ pub fn syn_scan(
     let mut pacer = Pacer::new(opts.rate_pps);
     let mut tx_times: HashMap<(Ipv4Addr, u16), Instant> = HashMap::new();
     let mut responses: HashMap<(Ipv4Addr, u16), (PortState, Duration)> = HashMap::new();
-    let mut batch: Vec<([u8; 54], libc::sockaddr_ll, (Ipv4Addr, u16))> =
-        Vec::with_capacity(opts.batch_size.max(1));
+    let mut batch: Vec<TxFrame> = Vec::with_capacity(opts.batch_size.max(1));
 
     let sport_lo = opts.sport_range.0;
     let sport_hi = opts.sport_range.1;
@@ -635,20 +729,48 @@ pub fn syn_scan(
                 seq,
             );
 
-            let mut sll: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
-            sll.sll_family = libc::AF_PACKET as u16;
-            sll.sll_protocol = (libc::ETH_P_IP as u16).to_be();
-            sll.sll_ifindex = rt.if_idx;
-            sll.sll_halen = 6;
-            sll.sll_addr[..6].copy_from_slice(&rt.dst_mac);
+            let real_frames = match opts.fragment_size {
+                Some(size) => packet::fragment_syn_frame(&frame, size),
+                None => vec![frame.to_vec()],
+            };
+            for frame in real_frames {
+                batch.push(TxFrame {
+                    frame,
+                    sll: make_sll(rt.if_idx, &rt.dst_mac),
+                    key: Some((target_ip, target_port)),
+                });
+            }
 
-            batch.push((frame, sll, (target_ip, target_port)));
+            for (decoy_index, decoy) in opts.decoys.iter().enumerate() {
+                let decoy_port = decoy_source_port(decoy_index, sport_lo, sport_hi);
+                let decoy_frame = packet::build_syn_frame(
+                    &rt.src_mac,
+                    &rt.dst_mac,
+                    u32::from(*decoy),
+                    u32::from(target_ip),
+                    decoy_port,
+                    target_port,
+                    seq.wrapping_add(decoy_index as u32 + 1),
+                );
+                let decoy_frames = match opts.fragment_size {
+                    Some(size) => packet::fragment_syn_frame(&decoy_frame, size),
+                    None => vec![decoy_frame.to_vec()],
+                };
+                for frame in decoy_frames {
+                    batch.push(TxFrame {
+                        frame,
+                        sll: make_sll(rt.if_idx, &rt.dst_mac),
+                        key: None,
+                    });
+                }
+            }
             sent_any = true;
 
             if batch.len() >= opts.batch_size.max(1) {
-                flush_batch(tx_fd, &mut pacer, &mut batch, &mut tx_times)
+                let flushed = batch.len() as u64;
+                flush_batch(tx_fd, &mut pacer, &mut batch, &mut tx_times, opts.jitter_ms)
                     .map_err(|e| AppError::runtime(format!("TX send failed: {e}")))?;
-                pass_sent += opts.batch_size as u64;
+                pass_sent += flushed;
             }
 
             let prev_responses = responses.len() as u64;
@@ -669,7 +791,7 @@ pub fn syn_scan(
             }
         }
 
-        flush_batch(tx_fd, &mut pacer, &mut batch, &mut tx_times)
+        flush_batch(tx_fd, &mut pacer, &mut batch, &mut tx_times, opts.jitter_ms)
             .map_err(|e| AppError::runtime(format!("TX send failed: {e}")))?;
 
         wait_for_responses(

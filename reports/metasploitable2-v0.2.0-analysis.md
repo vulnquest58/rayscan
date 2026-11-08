@@ -90,3 +90,4 @@ Target 192.168.100.37:
 ## 4. Conclusion & Next Step
 The scan proves that `rayscan v0.2.0` combines the raw speed of packet-level scanners with the analytical depth of an empirical vulnerability profiler.
 The next step is to scan a live, authorized educational target on the public Internet (`scanme.nmap.org` at `45.33.32.156`) to evaluate behavior across real-world WAN latency, routing hops, and public firewall middleboxes.
+

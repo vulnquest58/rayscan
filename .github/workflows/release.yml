@@ -1,0 +1,119 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  linux:
+    name: linux (musl)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.1
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - name: Install musl tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Build static binary
+        run: cargo build --release --locked --target x86_64-unknown-linux-musl
+      - name: Generate man page
+        run: cargo run --locked --bin gen_man
+      - name: Package
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          mkdir -p "dist/rayscan-${version}-linux-x86_64/bin"
+          mkdir -p "dist/rayscan-${version}-linux-x86_64/share/man/man1"
+          cp target/x86_64-unknown-linux-musl/release/rayscan \
+            "dist/rayscan-${version}-linux-x86_64/bin/"
+          cp man/rayscan.1 "dist/rayscan-${version}-linux-x86_64/share/man/man1/"
+          cp README.md CHANGELOG.md LICENSE "dist/rayscan-${version}-linux-x86_64/"
+          tar -czf "dist/rayscan-${version}-linux-x86_64.tar.gz" \
+            -C "dist/rayscan-${version}-linux-x86_64" .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: dist/*.tar.gz
+
+  windows:
+    name: windows (gnu)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.1
+          targets: x86_64-pc-windows-gnu
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release --locked --target x86_64-pc-windows-gnu
+      - name: Package
+        shell: pwsh
+        run: |
+          $version = $env:GITHUB_REF_NAME -replace '^v', ''
+          $dir = "dist/rayscan-$version-windows-x86_64"
+          New-Item -ItemType Directory -Force -Path "$dir/bin" | Out-Null
+          Copy-Item "target/x86_64-pc-windows-gnu/release/rayscan.exe" "$dir/bin/"
+          Copy-Item README.md,CHANGELOG.md,LICENSE $dir
+          Compress-Archive -Path "$dir/*" -DestinationPath "dist/rayscan-$version-windows-x86_64.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/*.zip
+
+  publish:
+    name: publish
+    runs-on: ubuntu-latest
+    needs: [linux, windows]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: cd dist && sha256sum * > SHA256SUMS
+      - name: Sign checksums (GPG, optional)
+        if: ${{ secrets.GPG_PRIVATE_KEY != '' }}
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          echo "$GPG_PRIVATE_KEY" | gpg --batch --import
+          if [ -n "$GPG_PASSPHRASE" ]; then
+            gpg --batch --yes --pinentry-mode loopback \
+              --passphrase "$GPG_PASSPHRASE" \
+              --armor --detach-sign --output dist/SHA256SUMS.asc dist/SHA256SUMS
+          else
+            gpg --batch --yes --armor --detach-sign \
+              --output dist/SHA256SUMS.asc dist/SHA256SUMS
+          fi
+      - name: Sign checksums (cosign, optional)
+        if: ${{ secrets.COSIGN_PRIVATE_KEY != '' }}
+        env:
+          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if ! command -v cosign >/dev/null; then
+            curl -sSfL -o /usr/local/bin/cosign \
+              https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64
+            chmod +x /usr/local/bin/cosign
+          fi
+          printf '%s' "$COSIGN_PRIVATE_KEY" > /tmp/cosign.key
+          cosign sign-blob --yes --key /tmp/cosign.key \
+            --bundle dist/SHA256SUMS.cosign.bundle dist/SHA256SUMS
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true

@@ -1,3 +1,4 @@
+use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -10,6 +11,7 @@ use crate::model::StateSet;
 use crate::output::OutputFormat;
 use crate::targets::AddressFamily;
 use crate::theme::Theme;
+use crate::tls::TlsMode;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -33,6 +35,10 @@ pub struct Cli {
     #[arg(long, global = true, value_enum, value_name = "THEME")]
     pub theme: Option<Theme>,
 
+    /// Directory for the local NVD advisory database.
+    #[arg(long, global = true, value_name = "DIR")]
+    pub db_dir: Option<PathBuf>,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -44,10 +50,50 @@ pub enum Command {
     Scan(ScanArgs),
     /// Compare two previous scan reports or state files to display differences.
     Diff(DiffArgs),
+    /// Merge reports from distributed/sharded scans into one report.
+    Merge(MergeArgs),
     /// Check permissions, terminal support, and scan capabilities.
     Doctor(DoctorArgs),
+    /// Manage the local NVD CVE advisory database.
+    Db(DbArgs),
     /// Set up and run a scan with guided prompts.
     Interactive,
+}
+
+#[derive(Debug, Args)]
+pub struct DbArgs {
+    #[command(subcommand)]
+    pub action: DbAction,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum DbAction {
+    /// Download, verify, and index the latest NVD CVE feeds.
+    Update(DbUpdateArgs),
+    /// Show local advisory database status and coverage.
+    Status(DbStatusArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct DbUpdateArgs {
+    /// Re-download feeds even when their published digest matches.
+    #[arg(long)]
+    pub force: bool,
+
+    /// Year selection: all (default), 2002-2026, or 2024,2025,2026.
+    #[arg(long, value_name = "SPEC")]
+    pub years: Option<String>,
+
+    /// Suppress progress output.
+    #[arg(long)]
+    pub quiet: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct DbStatusArgs {
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -63,6 +109,21 @@ pub struct DiffArgs {
     /// Output differences in JSON format.
     #[arg(long)]
     pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct MergeArgs {
+    /// Input scan reports in JSON or JSONL format. Repeatable.
+    #[arg(value_name = "FILE", required = true)]
+    pub inputs: Vec<PathBuf>,
+
+    /// Write the merged report to a file instead of stdout.
+    #[arg(short, long, value_name = "FILE")]
+    pub output: Option<PathBuf>,
+
+    /// Emit one JSON result per line instead of a single report object.
+    #[arg(long)]
+    pub jsonl: bool,
 }
 
 #[derive(Debug, Args)]
@@ -152,6 +213,20 @@ pub struct ScanArgs {
     #[arg(long)]
     pub sequential: bool,
 
+    /// Maximum random delay before each probe, in milliseconds (0-5000).
+    #[arg(long, value_name = "MS")]
+    pub jitter_ms: Option<u64>,
+
+    /// Spoofed source addresses for decoy probes, comma-separated (max 8).
+    /// Requires --syn.
+    #[arg(long, requires = "syn", value_name = "IP,IP")]
+    pub decoys: Option<String>,
+
+    /// Fragment raw SYN probes into IP fragments of this payload size
+    /// (multiple of 8, 8-1480). Requires --syn.
+    #[arg(long, requires = "syn", value_name = "BYTES")]
+    pub fragment_size: Option<usize>,
+
     /// Scan most common ports first to minimize time-to-first-result.
     #[arg(long, conflicts_with = "randomize")]
     pub top_ports_first: bool,
@@ -187,6 +262,14 @@ pub struct ScanArgs {
     /// Disable UDP active probe; only perform the initial passive banner read.
     #[arg(long)]
     pub no_udp_probe: bool,
+
+    /// Inspect TLS on every open TCP port (certificate, version, cipher).
+    #[arg(long, conflicts_with = "no_tls")]
+    pub tls: bool,
+
+    /// Disable automatic TLS inspection of known TLS/STARTTLS ports.
+    #[arg(long)]
+    pub no_tls: bool,
 
     /// Enable OS fingerprinting via TCP/IP stack analysis (requires root/CAP_NET_RAW).
     /// Sends one raw SYN probe per discovered host and classifies the SYN-ACK reply.
@@ -258,9 +341,41 @@ pub struct ScanArgs {
     #[arg(long)]
     pub defense: bool,
 
+    /// Correlate detected service versions against the local and bundled CVE advisory databases.
+    #[arg(long)]
+    pub advisories: bool,
+
+    /// Skip the automatic NVD advisory database refresh check before scanning.
+    #[arg(long)]
+    pub no_db_update: bool,
+
     /// Compare scan results against a previous scan JSON report or state file to detect changes.
     #[arg(long, visible_alias = "compare-to", value_name = "FILE")]
     pub diff: Option<PathBuf>,
+
+    /// Discover responsive hosts with ICMP echo/TCP ping before scanning.
+    #[arg(long)]
+    pub ping_sweep: bool,
+
+    /// Ping probes per host (1-10). Requires --ping-sweep.
+    #[arg(long, value_name = "N", requires = "ping_sweep")]
+    pub ping_count: Option<u8>,
+
+    /// Per-ping timeout in milliseconds (50-10000). Requires --ping-sweep.
+    #[arg(long, value_name = "MS", requires = "ping_sweep")]
+    pub ping_timeout_ms: Option<u64>,
+
+    /// Directory or TOML file with declarative probe packs.
+    #[arg(long, value_name = "PATH")]
+    pub plugins: Option<PathBuf>,
+
+    /// Scan only this shard of the target list (0-based). Requires --shard-count.
+    #[arg(long, value_name = "N")]
+    pub shard_index: Option<usize>,
+
+    /// Split targets into N deterministic shards for distributed scans. Requires --shard-index.
+    #[arg(long, value_name = "N")]
+    pub shard_count: Option<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -303,12 +418,35 @@ pub struct ResolvedConfig {
     pub explain: Option<u16>,
     /// Display defense and middlebox intelligence assessment.
     pub defense: bool,
+    /// Correlate detected service versions against the local and bundled advisory databases.
+    pub advisories: bool,
+    /// Skip the automatic database refresh check before scanning.
+    pub no_db_update: bool,
     /// Path to baseline report file to compute diff against.
     pub diff_file: Option<PathBuf>,
+    /// Optional probe pack file or directory.
+    pub plugins: Option<PathBuf>,
+    /// Discover responsive hosts before scanning.
+    pub ping_sweep: bool,
+    /// ICMP/TCP ping probes per host.
+    pub ping_count: u8,
+    /// Per-ping timeout.
+    pub ping_timeout: Duration,
+    /// Maximum random delay before each probe.
+    pub jitter: Duration,
+    /// Spoofed decoy source addresses for raw SYN scans.
+    pub decoys: Vec<Ipv4Addr>,
+    /// IPv4 payload size per fragment for raw SYN scans.
+    pub fragment_size: Option<usize>,
+    /// TLS inspection policy.
+    pub tls_mode: TlsMode,
+    /// Optional `(index, count)` target shard selection.
+    pub shard: Option<(usize, usize)>,
 }
 
 impl ScanArgs {
     pub fn resolve(&self) -> Result<ResolvedConfig, AppError> {
+        let shard = crate::shard::validate(self.shard_index, self.shard_count)?;
         let file = config::load(self.config.as_deref())?;
         let profile = if self.stealth {
             self.profile.unwrap_or(Profile::Stealth)
@@ -423,6 +561,40 @@ impl ScanArgs {
             ));
         }
 
+        let ping_count = self.ping_count.unwrap_or(2);
+        if !(1..=10).contains(&ping_count) {
+            return Err(AppError::usage("--ping-count must be between 1 and 10"));
+        }
+        let ping_timeout_ms = self.ping_timeout_ms.unwrap_or(500);
+        if !(50..=10_000).contains(&ping_timeout_ms) {
+            return Err(AppError::usage(
+                "--ping-timeout-ms must be between 50 and 10000",
+            ));
+        }
+
+        let jitter_ms = self
+            .jitter_ms
+            .or(file.jitter_ms)
+            .unwrap_or_else(|| if profile == Profile::Stealth { 50 } else { 0 });
+        if jitter_ms > 5_000 {
+            return Err(AppError::usage("--jitter-ms must be at most 5000"));
+        }
+        let tls_mode = if self.no_tls {
+            TlsMode::Disabled
+        } else if self.tls {
+            TlsMode::Force
+        } else {
+            TlsMode::Auto
+        };
+        let decoys = parse_decoy_addresses(self.decoys.as_deref())?;
+        if let Some(size) = self.fragment_size
+            && (!(8..=1480).contains(&size) || !size.is_multiple_of(8))
+        {
+            return Err(AppError::usage(
+                "--fragment-size must be a multiple of 8 between 8 and 1480",
+            ));
+        }
+
         Ok(ResolvedConfig {
             timeout: Duration::from_secs_f64(timeout_seconds),
             probe_timeout: Duration::from_millis(probe_timeout_ms),
@@ -449,7 +621,18 @@ impl ScanArgs {
             min_confidence: self.min_confidence,
             explain: self.explain,
             defense: self.defense,
+            advisories: self.advisories,
+            no_db_update: self.no_db_update,
             diff_file: self.diff.clone(),
+            plugins: self.plugins.clone().or_else(|| file.plugins.clone()),
+            ping_sweep: self.ping_sweep,
+            ping_count,
+            ping_timeout: Duration::from_millis(ping_timeout_ms),
+            jitter: Duration::from_millis(jitter_ms),
+            decoys,
+            fragment_size: self.fragment_size,
+            tls_mode,
+            shard,
         })
     }
 
@@ -485,6 +668,27 @@ impl ScanArgs {
             Ok((ports, default_spec.to_string()))
         }
     }
+}
+
+fn parse_decoy_addresses(spec: Option<&str>) -> Result<Vec<Ipv4Addr>, AppError> {
+    let Some(spec) = spec else {
+        return Ok(Vec::new());
+    };
+    let mut addresses = Vec::new();
+    for part in spec.split([',', ' ', '\t']).filter(|part| !part.is_empty()) {
+        let address: Ipv4Addr = part.parse().map_err(|_| {
+            AppError::usage(format!(
+                "--decoys accepts IPv4 addresses only; '{part}' is invalid"
+            ))
+        })?;
+        if !addresses.contains(&address) {
+            addresses.push(address);
+        }
+    }
+    if addresses.len() > 8 {
+        return Err(AppError::usage("--decoys accepts at most 8 addresses"));
+    }
+    Ok(addresses)
 }
 
 #[cfg(test)]
@@ -536,7 +740,20 @@ mod tests {
             min_confidence: None,
             explain: None,
             defense: false,
+            advisories: false,
+            no_db_update: false,
             diff: None,
+            plugins: None,
+            ping_sweep: false,
+            ping_count: None,
+            ping_timeout_ms: None,
+            jitter_ms: None,
+            decoys: None,
+            fragment_size: None,
+            tls: false,
+            no_tls: false,
+            shard_index: None,
+            shard_count: None,
         }
     }
 
@@ -653,5 +870,93 @@ mod tests {
         let mut no_live = args();
         no_live.no_live = true;
         assert!(!no_live.resolve().unwrap().live_table);
+    }
+
+    #[test]
+    fn db_subcommands_parse() {
+        let cli = Cli::try_parse_from(["rayscan", "db", "status", "--json"]).unwrap();
+        match cli.command {
+            Command::Db(DbArgs {
+                action: DbAction::Status(options),
+            }) => assert!(options.json),
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "rayscan",
+            "--db-dir",
+            "/tmp/rayscan-db",
+            "db",
+            "update",
+            "--years",
+            "2024-2026",
+            "--force",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.db_dir.as_deref(),
+            Some(std::path::Path::new("/tmp/rayscan-db"))
+        );
+        match cli.command {
+            Command::Db(DbArgs {
+                action: DbAction::Update(options),
+            }) => {
+                assert!(options.force);
+                assert_eq!(options.years.as_deref(), Some("2024-2026"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scan_accepts_advisory_flags() {
+        let mut parsed = args();
+        parsed.advisories = true;
+        parsed.no_db_update = true;
+        let resolved = parsed.resolve().unwrap();
+        assert!(resolved.advisories);
+        assert!(resolved.no_db_update);
+    }
+
+    #[test]
+    fn shard_selection_requires_a_valid_pair() {
+        let mut parsed = args();
+        parsed.shard_index = Some(0);
+        parsed.shard_count = Some(4);
+        assert_eq!(parsed.resolve().unwrap().shard, Some((0, 4)));
+
+        let mut incomplete = args();
+        incomplete.shard_index = Some(1);
+        assert_eq!(incomplete.resolve().unwrap_err().exit_code(), 2);
+
+        let mut invalid = args();
+        invalid.shard_index = Some(4);
+        invalid.shard_count = Some(4);
+        assert_eq!(invalid.resolve().unwrap_err().exit_code(), 2);
+    }
+
+    #[test]
+    fn merge_subcommand_parses() {
+        let cli = Cli::try_parse_from([
+            "rayscan",
+            "merge",
+            "shard-a.json",
+            "shard-b.jsonl",
+            "--output",
+            "merged.json",
+            "--jsonl",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Merge(options) => {
+                assert_eq!(options.inputs.len(), 2);
+                assert!(options.jsonl);
+                assert_eq!(
+                    options.output.as_deref(),
+                    Some(std::path::Path::new("merged.json"))
+                );
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
     }
 }

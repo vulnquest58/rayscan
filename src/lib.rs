@@ -1,26 +1,33 @@
 pub mod accuracy;
+pub mod advisory;
 pub mod anomaly;
 pub mod classify;
 pub mod cli;
 pub mod config;
+pub mod db;
 pub mod defense;
 pub mod diff;
+pub mod discovery;
 pub mod doctor;
 pub mod error;
 pub mod fingerprint;
 pub mod interactive;
 pub mod limits;
+pub mod merge;
 pub mod model;
 pub mod output;
+pub mod plugin;
 pub mod ports;
 pub mod rate;
 pub mod resume;
 pub mod rtt;
 pub mod scanner;
 pub mod service;
+pub mod shard;
 pub mod syn;
 pub mod targets;
 pub mod theme;
+pub mod tls;
 pub mod udp;
 pub mod verify;
 
@@ -39,18 +46,44 @@ use crate::scanner::{ProgressCallback, ProgressEvent, ScanOptions};
 use crate::theme::{Theme, color_enabled};
 
 pub async fn run(cli: Cli) -> Result<(), AppError> {
-    let Cli { theme, command } = cli;
+    let Cli {
+        theme,
+        db_dir,
+        command,
+    } = cli;
     match command {
-        Command::Scan(args) => run_scan(args, theme).await,
+        Command::Scan(args) => run_scan(args, theme, db_dir.as_deref()).await,
         Command::Diff(args) => diff::run_cli(args, theme),
+        Command::Merge(args) => merge::run_cli(args),
         Command::Doctor(args) => doctor::run(args, theme),
+        Command::Db(args) => db::run_cli(args, db_dir.as_deref(), theme),
         Command::Interactive => interactive::run(theme).await,
     }
 }
 
-pub(crate) async fn run_scan(args: ScanArgs, theme: Option<Theme>) -> Result<(), AppError> {
+pub(crate) async fn run_scan(
+    args: ScanArgs,
+    theme: Option<Theme>,
+    db_dir: Option<&std::path::Path>,
+) -> Result<(), AppError> {
     let mut resolved = args.resolve()?;
     resolved.theme = theme.unwrap_or(resolved.theme);
+    let plugins = match resolved.plugins.as_deref() {
+        Some(path) => plugin::Registry::load(path)?,
+        None => plugin::Registry::default(),
+    };
+
+    let db_paths = db::DbPaths::resolve(db_dir);
+    if !resolved.no_db_update
+        && let Some(paths) = &db_paths
+    {
+        db::auto_update(paths, args.quiet, resolved.advisories);
+    }
+    let local_index = if resolved.advisories {
+        db_paths.as_ref().and_then(db::LocalIndex::load)
+    } else {
+        None
+    };
     let resume_state = resolved
         .resume_file
         .as_ref()
@@ -63,13 +96,44 @@ pub(crate) async fn run_scan(args: ScanArgs, theme: Option<Theme>) -> Result<(),
         }
         _ => args.resolve_ports()?,
     };
-    let targets = targets::resolve_targets(
+    let mut targets = targets::resolve_targets(
         &args.target,
         &args.target_file,
         &args.exclude,
         resolved.family,
     )
     .await?;
+    if let Some((index, count)) = resolved.shard {
+        let before = targets.len();
+        targets = shard::select(targets, index, count);
+        if !args.quiet {
+            eprintln!(
+                "shard {index}/{count}: assigned {} of {before} resolved target(s)",
+                targets.len()
+            );
+        }
+    }
+    if resolved.ping_sweep && !targets.is_empty() {
+        let before = targets.len();
+        if !args.quiet {
+            eprintln!(
+                "[discover] probing {before} host(s) with {} ping probe(s), {} ms timeout …",
+                resolved.ping_count,
+                resolved.ping_timeout.as_millis()
+            );
+        }
+        targets = discovery::sweep(
+            &targets,
+            discovery::DiscoveryOptions {
+                count: resolved.ping_count,
+                timeout: resolved.ping_timeout,
+            },
+        )
+        .await;
+        if !args.quiet {
+            eprintln!("[discover] {} of {before} host(s) responded", targets.len());
+        }
+    }
     if (resolved.resume_file.is_some() || resolved.save_state_file.is_some()) && targets.len() > 1 {
         return Err(AppError::usage(
             "resumable scans currently support a single target",
@@ -123,7 +187,20 @@ pub(crate) async fn run_scan(args: ScanArgs, theme: Option<Theme>) -> Result<(),
             partial: false,
             defense_observations: Vec::new(),
         };
+        tls::apply(
+            &mut report,
+            resolved.tls_mode,
+            resolved.timeout.min(std::time::Duration::from_secs(5)),
+            args.quiet,
+        )
+        .await;
+        plugins
+            .apply(&mut report.results, resolved.probe_timeout, args.quiet)
+            .await;
         accuracy::score_report(&mut report);
+        if resolved.advisories {
+            advisory::apply_advisories_with(&mut report, local_index.as_ref());
+        }
         let diff_report = if let Some(ref diff_path) = resolved.diff_file {
             match diff::load_baseline(diff_path) {
                 Ok(baseline) => {
@@ -156,6 +233,7 @@ pub(crate) async fn run_scan(args: ScanArgs, theme: Option<Theme>) -> Result<(),
                 min_confidence: resolved.min_confidence,
                 explain: resolved.explain,
                 defense: resolved.defense,
+                advisories: resolved.advisories,
                 diff: diff_report.as_ref(),
             },
         );
@@ -288,6 +366,7 @@ pub(crate) async fn run_scan(args: ScanArgs, theme: Option<Theme>) -> Result<(),
         connect_only: resolved.connect_only,
         service_detection: resolved.service_detection,
         retain,
+        jitter: resolved.jitter,
         shutdown: Arc::clone(&shutdown),
     };
 
@@ -304,6 +383,9 @@ pub(crate) async fn run_scan(args: ScanArgs, theme: Option<Theme>) -> Result<(),
             retain,
             aimd: resolved.aimd,
             aimd_min_pps: resolved.aimd_min_pps,
+            jitter_ms: resolved.jitter.as_millis().min(u128::from(u64::MAX)) as u64,
+            decoys: resolved.decoys.clone(),
+            fragment_size: resolved.fragment_size,
         };
         let mut report =
             match tokio::task::spawn_blocking(move || syn::syn_scan(syn_opts, callback))
@@ -501,6 +583,14 @@ pub(crate) async fn run_scan(args: ScanArgs, theme: Option<Theme>) -> Result<(),
         report.ports = all_ports.len();
     }
 
+    tls::apply(
+        &mut report,
+        resolved.tls_mode,
+        resolved.timeout.min(std::time::Duration::from_secs(5)),
+        args.quiet,
+    )
+    .await;
+
     // ── Phase 6: Save state if requested ────────────────────────────────────
     if let Some(ref save_path) = resolved.save_state_file {
         let mut probed: HashSet<u16> = prior_scanned.iter().copied().collect();
@@ -529,7 +619,13 @@ pub(crate) async fn run_scan(args: ScanArgs, theme: Option<Theme>) -> Result<(),
         eprintln!("[rayscan] partial results — scan was interrupted before completion");
     }
 
+    plugins
+        .apply(&mut report.results, resolved.probe_timeout, args.quiet)
+        .await;
     accuracy::score_report(&mut report);
+    if resolved.advisories {
+        advisory::apply_advisories_with(&mut report, local_index.as_ref());
+    }
 
     let diff_report = if let Some(ref diff_path) = resolved.diff_file {
         match diff::load_baseline(diff_path) {
@@ -564,6 +660,7 @@ pub(crate) async fn run_scan(args: ScanArgs, theme: Option<Theme>) -> Result<(),
             min_confidence: resolved.min_confidence,
             explain: resolved.explain,
             defense: resolved.defense,
+            advisories: resolved.advisories,
             diff: diff_report.as_ref(),
         },
     )

@@ -154,6 +154,10 @@ pub struct PortResult {
     pub confidence: Option<f32>,
     /// Evidence string detailing why this result and confidence were reached.
     pub evidence: Option<String>,
+    /// Offline CVE advisories correlated with the detected service.
+    pub advisories: Vec<crate::advisory::AdvisoryMatch>,
+    /// TLS metadata captured during an optional post-scan handshake.
+    pub tls: Option<crate::tls::TlsInfo>,
 }
 
 impl PortResult {
@@ -168,6 +172,8 @@ impl PortResult {
             banner: None,
             confidence: None,
             evidence: None,
+            advisories: Vec::new(),
+            tls: None,
         }
     }
 

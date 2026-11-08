@@ -135,7 +135,20 @@ pub async fn run(theme: Option<Theme>) -> Result<(), AppError> {
         min_confidence: None,
         explain: None,
         defense: false,
+        advisories: false,
+        no_db_update: false,
         diff: None,
+        plugins: None,
+        ping_sweep: false,
+        ping_count: None,
+        ping_timeout_ms: None,
+        jitter_ms: None,
+        decoys: None,
+        fragment_size: None,
+        tls: false,
+        no_tls: false,
+        shard_index: None,
+        shard_count: None,
     };
 
     let start = Confirm::new("Start scan?")
@@ -147,7 +160,7 @@ pub async fn run(theme: Option<Theme>) -> Result<(), AppError> {
         return Ok(());
     }
 
-    crate::run_scan(args, theme).await
+    crate::run_scan(args, theme, None).await
 }
 
 fn prompt_error(error: InquireError) -> AppError {

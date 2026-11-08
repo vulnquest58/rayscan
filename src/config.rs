@@ -134,6 +134,8 @@ pub struct FileConfig {
     pub format: Option<OutputFormat>,
     pub show: Option<Vec<StateFilter>>,
     pub theme: Option<Theme>,
+    pub plugins: Option<PathBuf>,
+    pub jitter_ms: Option<u64>,
 }
 
 pub fn load(path: Option<&Path>) -> Result<FileConfig, AppError> {

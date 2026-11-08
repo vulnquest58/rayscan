@@ -300,7 +300,12 @@ pub async fn probe_udp(
     port: u16,
     probe_timeout: std::time::Duration,
 ) -> (Vec<u8>, UdpDetection) {
-    let socket = match tokio::net::UdpSocket::bind("0.0.0.0:0").await {
+    let bind = if host.is_ipv6() {
+        "[::]:0"
+    } else {
+        "0.0.0.0:0"
+    };
+    let socket = match tokio::net::UdpSocket::bind(bind).await {
         Ok(s) => s,
         Err(_) => return (Vec::new(), UdpDetection::default()),
     };
@@ -336,6 +341,35 @@ pub async fn probe_udp(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn ipv6_udp_probe_binds_and_classifies_dns() {
+        let server = tokio::net::UdpSocket::bind("[::1]:0").await.unwrap();
+        let port = server.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let mut query = [0u8; 512];
+            let (_, peer) = server.recv_from(&mut query).await.unwrap();
+            let response = [
+                0x12, 0x34, 0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+            ];
+            server.send_to(&response, peer).await.unwrap();
+        });
+
+        let (raw, detection) = probe_udp(
+            "::1".parse().unwrap(),
+            port,
+            std::time::Duration::from_secs(1),
+        )
+        .await;
+        assert_eq!(raw.len(), 12);
+        assert_eq!(
+            detection
+                .service
+                .as_ref()
+                .map(|service| service.name.as_str()),
+            Some("dns")
+        );
+    }
 
     #[test]
     fn inspect_dns_response() {

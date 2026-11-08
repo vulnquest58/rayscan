@@ -166,6 +166,7 @@ mod tests {
             connect_only: false,
             service_detection: true,
             retain,
+            jitter: Duration::ZERO,
             shutdown: Arc::new(AtomicBool::new(false)),
         }
     }

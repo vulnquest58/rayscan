@@ -17,6 +17,8 @@ pub mod packet;
 pub mod permute;
 #[cfg(target_os = "linux")]
 pub mod route;
+#[cfg(target_os = "linux")]
+pub(crate) mod v6;
 
 #[cfg(target_os = "linux")]
 pub use aimd::{AimdConfig, AimdController};
@@ -27,7 +29,9 @@ pub use engine::{SynScanOptions, check_raw_privilege, syn_scan};
 #[cfg(target_os = "linux")]
 pub use filter::{attach_filter, build_filter};
 #[cfg(target_os = "linux")]
-pub use packet::{ParsedFrame, build_syn_frame, ip_checksum, parse_frame, tcp_checksum};
+pub use packet::{
+    ParsedFrame, build_syn_frame, fragment_syn_frame, ip_checksum, parse_frame, tcp_checksum,
+};
 #[cfg(target_os = "linux")]
 pub use permute::BlackRock;
 #[cfg(target_os = "linux")]
@@ -56,6 +60,9 @@ pub struct SynScanOptions {
     pub retain: crate::model::StateSet,
     pub aimd: bool,
     pub aimd_min_pps: u64,
+    pub jitter_ms: u64,
+    pub decoys: Vec<std::net::Ipv4Addr>,
+    pub fragment_size: Option<usize>,
 }
 
 #[cfg(not(target_os = "linux"))]

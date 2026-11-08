@@ -1,6 +1,6 @@
 [package]
 name = "rayscan"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.99"
 authors = ["vulnquest58 <https://github.com/vulnquest58>"]
@@ -27,15 +27,21 @@ clap_mangen = "0.2"
 comfy-table = "7"
 core_affinity = "0.8"
 crossbeam-channel = "0.5"
+flate2 = "1.1.11"
 indicatif = "0.18"
 inquire = "0.7"
 libc = "0.2"
 rand = "0.8"
+regex = "1"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.11.1"
 siphasher = "0.3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util", "signal"] }
 toml = "0.8"
+ureq = "2"
+x509-parser = "0.16"
 
 [profile.release]
 lto = "thin"

@@ -780,6 +780,35 @@ pub fn fingerprint_from_frame(data: &[u8]) -> Option<TcpFingerprint> {
     Some(fp)
 }
 
+/// Extract a `TcpFingerprint` from an IPv6 TCP SYN-ACK segment.
+///
+/// `hop_limit` comes from the IPv6 header when available; `hops` is the
+/// estimated distance to the target (0 for directly connected/LAN hosts).
+pub fn fingerprint_from_ipv6_tcp(tcp: &[u8], hop_limit: u8, hops: u8) -> Option<TcpFingerprint> {
+    if tcp.len() < 20 {
+        return None;
+    }
+    let flags = tcp[13];
+    if (flags & 0x12) != 0x12 {
+        return None;
+    }
+    let window = u16::from_be_bytes([tcp[14], tcp[15]]) as u32;
+    let data_offset = ((tcp[12] >> 4) as usize) * 4;
+    if data_offset < 20 || tcp.len() < data_offset {
+        return None;
+    }
+
+    let mut fp = TcpFingerprint {
+        ttl: hop_limit,
+        hops,
+        window,
+        df: true,
+        ..Default::default()
+    };
+    parse_tcp_options(&tcp[20..data_offset], &mut fp);
+    Some(fp)
+}
+
 // ── Active probe ──────────────────────────────────────────────────────────────
 
 /// Probe a live host and return an `OsGuess`.
@@ -811,13 +840,15 @@ pub fn probe_fingerprint(host: IpAddr, port: u16, timeout: Duration) -> Option<O
 
 #[cfg(target_os = "linux")]
 fn probe_fingerprint_linux(host: IpAddr, port: u16, timeout: Duration) -> Option<OsGuess> {
-    use crate::syn::route;
+    match host {
+        IpAddr::V4(v4) => probe_fingerprint_v4(v4, port, timeout),
+        IpAddr::V6(v6) => probe_fingerprint_v6(v6, port, timeout),
+    }
+}
 
-    // Only IPv4 supported for now.
-    let target_v4 = match host {
-        IpAddr::V4(v4) => v4,
-        IpAddr::V6(_) => return None,
-    };
+#[cfg(target_os = "linux")]
+fn probe_fingerprint_v4(target_v4: Ipv4Addr, port: u16, timeout: Duration) -> Option<OsGuess> {
+    use crate::syn::route;
 
     // Resolve route: source IP, interface, gateway MAC.
     let route_info = route::route_for(target_v4).ok()?;
@@ -946,6 +977,152 @@ fn probe_fingerprint_linux(host: IpAddr, port: u16, timeout: Duration) -> Option
     // SAFETY: Closing open fd.
     unsafe { libc::close(fd) };
 
+    result
+}
+
+#[cfg(target_os = "linux")]
+fn probe_fingerprint_v6(
+    target: std::net::Ipv6Addr,
+    port: u16,
+    timeout: Duration,
+) -> Option<OsGuess> {
+    use crate::syn::v6::source_for;
+
+    let source = source_for(target, port).ok()?;
+    let src_port: u16 = 62001;
+    let seq: u32 = 0x_DEAD_BEEF;
+    let tcp_options: [u8; 20] = [
+        0x02, 0x04, 0x05, 0xb4, 0x01, 0x03, 0x03, 0x06, 0x01, 0x01, 0x04, 0x02, 0x08, 0x0a, 0x00,
+        0x00, 0x00, 0x01, 0x00, 0x00,
+    ];
+    let packet = crate::syn::packet::build_ipv6_tcp_packet(
+        &source,
+        &target,
+        src_port,
+        port,
+        seq,
+        &tcp_options,
+    );
+
+    // SAFETY: create IPv6 raw TCP receive socket.
+    let rx_fd = unsafe { libc::socket(libc::AF_INET6, libc::SOCK_RAW, libc::IPPROTO_TCP) };
+    if rx_fd < 0 {
+        return None;
+    }
+
+    let mut bind_addr: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
+    bind_addr.sin6_family = libc::AF_INET6 as u16;
+    // SAFETY: rx_fd is valid and bind_addr is initialized.
+    if unsafe {
+        libc::bind(
+            rx_fd,
+            &bind_addr as *const _ as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+        )
+    } < 0
+    {
+        // SAFETY: close owned descriptor.
+        unsafe { libc::close(rx_fd) };
+        return None;
+    }
+
+    let timeout_ms = timeout.as_millis().clamp(100, 10_000) as u64;
+    let tv = libc::timeval {
+        tv_sec: (timeout_ms / 1000) as i64,
+        tv_usec: ((timeout_ms % 1000) * 1000) as i64,
+    };
+    // SAFETY: rx_fd is valid and tv points to a valid timeval.
+    unsafe {
+        libc::setsockopt(
+            rx_fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVTIMEO,
+            &tv as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+        );
+    }
+
+    // SAFETY: create raw IPv6 transmit socket (header included).
+    let tx_fd = unsafe { libc::socket(libc::AF_INET6, libc::SOCK_RAW, libc::IPPROTO_RAW) };
+    if tx_fd < 0 {
+        // SAFETY: close owned descriptor.
+        unsafe { libc::close(rx_fd) };
+        return None;
+    }
+
+    let mut destination: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
+    destination.sin6_family = libc::AF_INET6 as u16;
+    destination.sin6_port = 0;
+    destination.sin6_addr.s6_addr = target.octets();
+
+    // SAFETY: both descriptors are valid and all pointers reference live buffers.
+    let sent = unsafe {
+        libc::sendto(
+            tx_fd,
+            packet.as_ptr() as *const libc::c_void,
+            packet.len(),
+            0,
+            &destination as *const _ as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+        )
+    };
+    // SAFETY: close owned transmit descriptor after sending.
+    unsafe { libc::close(tx_fd) };
+    if sent < 0 {
+        // SAFETY: close owned descriptor.
+        unsafe { libc::close(rx_fd) };
+        return None;
+    }
+
+    let mut buf = [0u8; 1500];
+    let mut result = None;
+    for _ in 0..32 {
+        let mut from: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
+        let mut from_len = std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t;
+        // SAFETY: rx_fd is valid, buf/from are writable.
+        let n = unsafe {
+            libc::recvfrom(
+                rx_fd,
+                buf.as_mut_ptr() as *mut libc::c_void,
+                buf.len(),
+                0,
+                &mut from as *mut _ as *mut libc::sockaddr,
+                &mut from_len,
+            )
+        };
+        if n <= 0 {
+            break;
+        }
+
+        let peer = std::net::Ipv6Addr::from(from.sin6_addr.s6_addr);
+        let data = &buf[..n as usize];
+        let (src, hop_limit, tcp) = if data.len() >= 40 && (data[0] >> 4) == 6 {
+            if data[6] != 6 {
+                continue;
+            }
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(&data[8..24]);
+            (std::net::Ipv6Addr::from(octets), data[7], &data[40..])
+        } else {
+            (peer, 64, data)
+        };
+        if src != target || tcp.len() < 4 {
+            continue;
+        }
+        if u16::from_be_bytes([tcp[0], tcp[1]]) != port
+            || u16::from_be_bytes([tcp[2], tcp[3]]) != src_port
+        {
+            continue;
+        }
+        if let Some(mut fp) = fingerprint_from_ipv6_tcp(tcp, hop_limit, 0) {
+            fp.hops = estimate_hops(fp.ttl);
+            result = Some(classify(&fp));
+            break;
+        }
+    }
+
+    // SAFETY: rx_fd is still owned and open.
+    unsafe { libc::close(rx_fd) };
     result
 }
 
@@ -1296,6 +1473,36 @@ mod tests {
     fn fingerprint_from_frame_rejects_short_input() {
         assert!(fingerprint_from_frame(&[0u8; 10]).is_none());
         assert!(fingerprint_from_frame(&[]).is_none());
+    }
+
+    #[test]
+    fn ipv6_tcp_fingerprint_parses_syn_ack_options() {
+        let mut tcp = [0u8; 44];
+        tcp[0..2].copy_from_slice(&443u16.to_be_bytes());
+        tcp[2..4].copy_from_slice(&62001u16.to_be_bytes());
+        tcp[12] = 0xb0;
+        tcp[13] = 0x12;
+        tcp[14..16].copy_from_slice(&65535u16.to_be_bytes());
+        tcp[20..24].copy_from_slice(&[0x02, 0x04, 0x05, 0xb4]);
+        tcp[24] = 0x01;
+        tcp[25..28].copy_from_slice(&[0x03, 0x03, 0x07]);
+        tcp[28] = 0x01;
+        tcp[29] = 0x01;
+        tcp[30..32].copy_from_slice(&[0x04, 0x02]);
+        tcp[32..34].copy_from_slice(&[0x08, 0x0a]);
+        tcp[34..38].copy_from_slice(&1u32.to_be_bytes());
+        tcp[38..42].copy_from_slice(&0u32.to_be_bytes());
+        tcp[42..44].copy_from_slice(&[0x00, 0x00]);
+
+        let fp = fingerprint_from_ipv6_tcp(&tcp, 64, 0).unwrap();
+        assert_eq!(fp.ttl, 64);
+        assert_eq!(fp.window, 65535);
+        assert!(fp.df);
+        assert_eq!(fp.mss, Some(1460));
+        assert_eq!(fp.wscale, Some(7));
+        assert!(fp.sack_ok);
+        assert!(fp.timestamps);
+        assert!(fingerprint_from_ipv6_tcp(&[0u8; 4], 64, 0).is_none());
     }
 
     #[test]
