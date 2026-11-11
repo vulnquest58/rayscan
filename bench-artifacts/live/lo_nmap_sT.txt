@@ -1,0 +1,10 @@
+# rc=TIMEOUT(300) wall=300.195
+--- STDOUT ---
+Starting Nmap 7.80 ( https://nmap.org ) at 2026-11-09 23:13 CET
+Nmap scan report for 127.0.0.53
+Host is up (0.00079s latency).
+Not shown: 65534 closed ports
+PORT   STATE SERVICE
+53/tcp open  domain
+
+

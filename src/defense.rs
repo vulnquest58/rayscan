@@ -274,12 +274,14 @@ mod tests {
             name: "http".to_string(),
             product: Some("nginx".to_string()),
             version: None,
+            confidence: Some(0.85),
         });
         let mut r2 = PortResult::new(host, 22, PortState::Open, Duration::from_millis(1));
         r2.service = Some(ServiceInfo {
             name: "ssh".to_string(),
             product: Some("OpenSSH".to_string()),
             version: None,
+            confidence: Some(0.85),
         });
 
         let report = ScanReport {
@@ -295,6 +297,7 @@ mod tests {
             results: vec![r1, r2],
             os_fingerprints: HashMap::new(),
             probed_ports: vec![80, 22],
+            host_progress: Default::default(),
             partial: false,
             defense_observations: Vec::new(),
         };
@@ -325,6 +328,7 @@ mod tests {
             results: vec![s1, s2, s3],
             os_fingerprints: HashMap::new(),
             probed_ports: vec![9000, 9001, 9002],
+            host_progress: Default::default(),
             partial: false,
             defense_observations: Vec::new(),
         };
@@ -354,6 +358,7 @@ mod tests {
                 name: "service".to_string(),
                 product: Some("product".to_string()),
                 version: None,
+                confidence: Some(0.85),
             });
             open.confidence = Some(1.0);
             results.push(open);
@@ -373,6 +378,7 @@ mod tests {
             results,
             os_fingerprints: HashMap::new(),
             probed_ports: Vec::new(),
+            host_progress: Default::default(),
             partial: false,
             defense_observations: Vec::new(),
         };
@@ -406,6 +412,7 @@ mod tests {
                 name: "service".to_string(),
                 product: Some("product".to_string()),
                 version: None,
+                confidence: Some(0.85),
             });
             open.confidence = Some(1.0);
             results.push(open);
@@ -425,6 +432,7 @@ mod tests {
             results,
             os_fingerprints: HashMap::new(),
             probed_ports: Vec::new(),
+            host_progress: Default::default(),
             partial: false,
             defense_observations: Vec::new(),
         };
@@ -459,6 +467,7 @@ mod tests {
             results: vec![closed, anomaly],
             os_fingerprints: HashMap::new(),
             probed_ports: Vec::new(),
+            host_progress: Default::default(),
             partial: false,
             defense_observations: Vec::new(),
         };
@@ -487,6 +496,7 @@ mod tests {
             results: vec![r],
             os_fingerprints: HashMap::new(),
             probed_ports: vec![9003],
+            host_progress: Default::default(),
             partial: false,
             defense_observations: Vec::new(),
         };

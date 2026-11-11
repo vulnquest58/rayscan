@@ -240,11 +240,14 @@ impl LocalIndex {
                     if entry.product != cpe_product || !entry_matches(entry, version) {
                         continue;
                     }
+                    let (cisa_kev, epss) = crate::advisory::lookup_threat_intel(&entry.id);
                     let advisory = AdvisoryMatch {
                         id: entry.id.clone(),
                         title: entry.title.clone(),
                         severity: Severity::from_cvss(entry.cvss),
                         cvss: entry.cvss,
+                        cisa_kev,
+                        epss,
                         source: "nvd",
                     };
                     match best.get_mut(&advisory.id) {

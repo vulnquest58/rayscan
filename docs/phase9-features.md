@@ -1,10 +1,24 @@
 # Phase 9 feature gate
 
-This checkpoint records the `0.3.0` feature set and the evidence gathered to
-validate it. It follows `docs/phase8-speed-gate.md` and
+This checkpoint records the `0.3.0` and `0.4.0` feature sets and the evidence
+gathered to validate them. It follows `docs/phase8-speed-gate.md` and
 `docs/next-phase-enhancements.md`.
 
-## Scope completed
+## v0.4.0 scope completed
+
+- Scope Guard enforcement with structured TOML or line-based allow/deny rules,
+  target-file expansion, wildcard domains, resolved-address semantics, and
+  `--force-out-of-scope` audit warnings (`src/scope.rs`, `src/lib.rs`)
+- Full CISA KEV and EPSS ingestion via `rayscan db intel`, atomic gzip cache,
+  24-hour freshness, bundled fallback, and automatic advisory overlay
+  (`src/intel.rs`, `src/advisory.rs`, `src/db/mod.rs`)
+- Real-time `--stream` JSONL findings with immediate flush and deduplication
+  (`src/lib.rs`, `src/output.rs`)
+- IPv6 NDP multicast discovery via `--ndp`: `ff02::1` probing, Linux neighbor
+  table + host-route merge, broad `/64` target expansion, and scoped link-local
+  socket addresses (`src/discovery.rs`, `src/targets.rs`)
+
+## 0.3.0 scope completed
 
 - IPv6 raw SYN discovery and IPv6 OS fingerprinting (`src/syn/v6.rs`,
   `src/fingerprint.rs`)
@@ -26,7 +40,7 @@ validate it. It follows `docs/phase8-speed-gate.md` and
 | Check | Command | Result |
 | :--- | :--- | :--- |
 | Formatting and lint | `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings` | clean |
-| Unit and CLI tests | `cargo test --all-targets --all-features` | 200 library + 11 CLI tests pass |
+| Unit and CLI tests | `cargo test --all-targets --all-features` | 219 library + 15 CLI tests pass |
 | Benchmark harness tests | `python3 -m unittest discover -s bench/tests` | 13 pass |
 | Exact localhost gate | `python3 bench/localhost_gate.py` | exact 65,535-port open set |
 | Lab ground truth | `make lab-check` | 11/11 states match |
@@ -86,6 +100,67 @@ A local IPv6 UDP DNS server answered a synthetic A query. `rayscan scan -6 -t
 }
 ```
 
+### Full CISA KEV and EPSS refresh on 2026-11-09
+
+A live `rayscan db intel --db-dir /tmp/rayscan-intel --force --json` refresh
+downloaded the complete feeds and wrote the gzip cache:
+
+```json
+{
+  "path": "/tmp/rayscan-intel/intel/threat_intel.json.gz",
+  "kev_count": 1775,
+  "epss_count": 402199,
+  "total": 402199,
+  "refreshed": true
+}
+```
+
+A second invocation without `--force` returned `"refreshed": false` from the
+fresh cache. A local vsftpd 2.3.4 banner scan with `--kev-only` correlated
+`CVE-2011-2523` with `cisa_kev: true` and `epss: 0.96184`; adding
+`--min-epss 0.99` removed that advisory as expected.
+
+### IPv6 NDP discovery in a Linux network namespace
+
+A veth pair connected the root namespace (`fe80::1/64`) to `ndpns`
+(`fe80::2/64`). An HTTP listener bound `[::]:8080` inside the namespace.
+`ff02::1%veth-ray` ping confirmed both kernels answer multicast echo. NDP then
+discovered both namespace link-local addresses, and the scanner successfully
+connected using the registered interface scope:
+
+```text
+rayscan scan -t fe80::/64 --ndp -6 -p 8080 --connect-only \
+  --no-service-detection --no-tls --no-live --no-db-update --format json
+```
+
+Result: `targets: 2`, `open: 2` (`fe80::2:8080` and the namespace's autoconfigured
+link-local address), `elapsed_ms: 4.133`.
+
+A second run after flushing the neighbor cache isolated the raw multicast probe.
+`tcpdump` observed `fe80::1 > ff02::1: ICMP6 echo request` and `fe80::2 >
+fe80::1: ICMP6 echo reply`; the scanner resolved only `fe80::2` from `fe80::/64`
+and correctly reported port 8080 closed when no listener was present:
+
+```json
+{
+  "targets": 1,
+  "open": [],
+  "summary": {"open": 0, "closed": 1}
+}
+```
+
+This validates multicast probing, neighbor-table merge, broad `/64` expansion,
+and link-local scope-ID handling.
+
+### Public IPv6 `nmap.org` — environment blocked
+
+`nmap.org` resolves to `2600:3c01:e000:3e6::6d4e:7061`. Both the WSL2 guest and
+the native Windows host lack working IPv6 upstream connectivity (`ping -6`
+returns `Network is unreachable` in WSL2; native IPv6 TCP to `nmap.org:443`
+times out). Public IPv6 scanning could not be validated from this network. NDP
+and IPv6 service scanning were instead validated against the local namespace
+above.
+
 ### Metasploitable 2 at `192.168.100.37`
 
 Live connect and raw-SYN scans, plus OS fingerprinting, were repeated against
@@ -105,8 +180,8 @@ the local Metasploitable 2 VM:
 
 `make dist` produces:
 
-- `dist/rayscan-0.3.0-linux-x86_64.tar.gz`
-- `dist/rayscan-0.3.0-windows-x86_64.zip`
+- `dist/rayscan-0.4.0-linux-x86_64.tar.gz`
+- `dist/rayscan-0.4.0-windows-x86_64.zip`
 - `dist/SHA256SUMS`
 
 Signing is optional and activated by `RAYSCAN_GPG_KEY` or

@@ -1,0 +1,7 @@
+# rc=0 wall=101.162
+--- STDOUT ---
+Starting Nmap 7.80 ( https://nmap.org ) at 2026-11-09 23:08 CET
+Nmap done: 1 IP address (1 host up) scanned in 101.14 seconds
+
+--- STDERR ---
+

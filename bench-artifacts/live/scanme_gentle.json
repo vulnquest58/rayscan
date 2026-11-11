@@ -1,0 +1,35 @@
+{
+  "rayscan_conn_top1000": {
+    "wall": 3.931,
+    "rc": 0,
+    "opens": [
+      "45.33.32.156:22",
+      "45.33.32.156:80"
+    ],
+    "summary": {
+      "open": 2,
+      "closed": 998,
+      "filtered": 0,
+      "silent": 0,
+      "unreachable": 0,
+      "error": 0
+    }
+  },
+  "rayscan_conn_top1000_svc": {
+    "wall": 1.72,
+    "rc": 0,
+    "opens": [
+      "45.33.32.156:22",
+      "45.33.32.156:80"
+    ],
+    "services": []
+  },
+  "nmap_sT_top1000": {
+    "wall": 24.453,
+    "rc": 0,
+    "opens": [
+      "45.33.32.156:22",
+      "45.33.32.156:80"
+    ]
+  }
+}

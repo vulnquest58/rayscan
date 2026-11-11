@@ -1,6 +1,6 @@
 .ie \n(.g .ds Aq \(aq
 .el .ds Aq '
-.TH rayscan 1  "rayscan 0.3.0" 
+.TH rayscan 1  "rayscan 0.4.0" 
 .SH NAME
 rayscan \- An accuracy\-first TCP port scanner
 .SH SYNOPSIS
@@ -63,5 +63,7 @@ Examples:
   rayscan scan \-\-target 127.0.0.1 \-\-ports 1\-1024
   rayscan scan \-t 10.0.0.0/24 \-p 22,80,443 \-\-json
   rayscan scan \-t 10.77.0.2 \-p 1\-10000 \-\-profile careful \-\-show all
+  rayscan db intel \-\-force
+  sudo rayscan scan \-6 \-t fe80::/64 \-\-ndp \-p 22,80,443
 .SH VERSION
-v0.3.0
+v0.4.0

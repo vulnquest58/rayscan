@@ -139,9 +139,16 @@ pub async fn run(theme: Option<Theme>) -> Result<(), AppError> {
         no_db_update: false,
         diff: None,
         plugins: None,
+        scope: None,
+        force_out_of_scope: false,
+        kev_only: false,
+        min_epss: None,
+        stream: false,
         ping_sweep: false,
         ping_count: None,
         ping_timeout_ms: None,
+        ndp: false,
+        ndp_timeout_ms: None,
         jitter_ms: None,
         decoys: None,
         fragment_size: None,
@@ -149,6 +156,10 @@ pub async fn run(theme: Option<Theme>) -> Result<(), AppError> {
         no_tls: false,
         shard_index: None,
         shard_count: None,
+        exclude_ports: None,
+        save_baseline: None,
+        alert_file: None,
+        fail_on_change: false,
     };
 
     let start = Confirm::new("Start scan?")

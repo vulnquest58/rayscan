@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::io::{self, IsTerminal, Write};
+use std::net::IpAddr;
 use std::path::Path;
 
 use clap::ValueEnum;
@@ -32,6 +33,9 @@ pub enum OutputFormat {
     Sarif,
     /// Human-readable Markdown report for tickets and pull requests.
     Markdown,
+    /// Plain `host:port` list — one open port per line for pipeline chaining.
+    #[value(name = "host-port", alias = "hostport", alias = "plain")]
+    HostPort,
 }
 
 impl OutputFormat {
@@ -45,6 +49,7 @@ impl OutputFormat {
             Self::Greppable => "greppable",
             Self::Sarif => "sarif",
             Self::Markdown => "markdown",
+            Self::HostPort => "host-port",
         }
     }
 }
@@ -62,6 +67,7 @@ pub struct EmitOptions<'a> {
     pub explain: Option<u16>,
     pub defense: bool,
     pub advisories: bool,
+    pub stream: bool,
     pub diff: Option<&'a crate::diff::ScanDiff>,
 }
 
@@ -113,10 +119,15 @@ pub fn emit(report: &ScanReport, target: &str, options: EmitOptions<'_>) -> Resu
         OutputFormat::Greppable => render_greppable(target, &selected),
         OutputFormat::Sarif => render_sarif(&selected)?,
         OutputFormat::Markdown => render_markdown(report, target, &selected, options.diff),
+        OutputFormat::HostPort => render_host_port(&selected),
     };
 
     if let Some(path) = options.destination {
         return write_destination(Some(path), &contents, options.quiet);
+    }
+
+    if options.stream {
+        return Ok(());
     }
 
     if options.streamed && options.format == OutputFormat::Table && stdout_is_tty {
@@ -588,10 +599,15 @@ fn advisory_summary(result: &PortResult) -> String {
     let Some(first) = result.advisories.first() else {
         return String::new();
     };
-    if result.advisories.len() == 1 {
-        first.id.clone()
+    let kev_badge = if result.advisories.iter().any(|a| a.cisa_kev) {
+        " [KEV]"
     } else {
-        format!("{} +{}", first.id, result.advisories.len() - 1)
+        ""
+    };
+    if result.advisories.len() == 1 {
+        format!("{}{kev_badge}", first.id)
+    } else {
+        format!("{} +{}{kev_badge}", first.id, result.advisories.len() - 1)
     }
 }
 
@@ -601,11 +617,17 @@ fn advisory_explain_lines(result: &PortResult) -> Vec<String> {
     }
     let mut lines = vec!["  Advisory Matches:".to_string()];
     for advisory in result.advisories.iter().take(MAX_ADVISORY_LINES) {
+        let kev = if advisory.cisa_kev { " [KEV]" } else { "" };
+        let epss = match advisory.epss {
+            Some(score) => format!("  EPSS {:>5.1}%", score * 100.0),
+            None => String::new(),
+        };
         lines.push(format!(
-            "    [{}] {}  CVSS {:.1}  {}",
+            "    [{}] {}{kev}  CVSS {:.1}{}  {}",
             advisory.severity.label(),
             advisory.id,
             advisory.cvss,
+            epss,
             advisory.title
         ));
     }
@@ -643,11 +665,17 @@ fn render_advisory_section(results: &[&PortResult]) -> String {
             result.host, result.port, suffix
         ));
         for advisory in result.advisories.iter().take(MAX_ADVISORY_LINES) {
+            let kev = if advisory.cisa_kev { " [KEV]" } else { "" };
+            let epss = match advisory.epss {
+                Some(score) => format!("  EPSS {:>5.1}%", score * 100.0),
+                None => String::new(),
+            };
             output.push_str(&format!(
-                "    [{}] {}  CVSS {:.1}  {}\n",
+                "    [{}] {}{kev}  CVSS {:.1}{}  {}\n",
                 advisory.severity.label(),
                 advisory.id,
                 advisory.cvss,
+                epss,
                 advisory.title
             ));
         }
@@ -716,29 +744,31 @@ struct JsonReport<'a> {
 }
 
 #[derive(Serialize)]
-struct JsonResult {
-    host: String,
-    port: u16,
-    state: PortState,
-    latency_ms: f64,
+pub(crate) struct JsonResult {
+    pub(crate) host: String,
+    pub(crate) port: u16,
+    pub(crate) state: PortState,
+    pub(crate) latency_ms: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
-    banner: Option<String>,
+    pub(crate) banner: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    service: Option<ServiceInfo>,
+    pub(crate) service: Option<ServiceInfo>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    detail: Option<String>,
+    pub(crate) detail: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    confidence: Option<f32>,
+    pub(crate) confidence: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    evidence: Option<String>,
+    pub(crate) evidence: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    advisories: Vec<crate::advisory::AdvisoryMatch>,
+    pub(crate) advisories: Vec<crate::advisory::AdvisoryMatch>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    tls: Option<crate::tls::TlsInfo>,
+    pub(crate) tls: Option<crate::tls::TlsInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) rdp: Option<crate::rdp::RdpInfo>,
 }
 
 impl JsonResult {
-    fn from_result(result: &PortResult) -> Self {
+    pub(crate) fn from_result(result: &PortResult) -> Self {
         Self {
             host: result.host.to_string(),
             port: result.port,
@@ -751,6 +781,7 @@ impl JsonResult {
             evidence: result.evidence.clone(),
             advisories: result.advisories.clone(),
             tls: result.tls.clone(),
+            rdp: result.rdp.clone(),
         }
     }
 }
@@ -1104,6 +1135,8 @@ fn render_sarif(results: &[&PortResult]) -> Result<String, AppError> {
                     "properties": {
                         "severity": advisory.severity.label(),
                         "cvss": advisory.cvss,
+                        "cisa_kev": advisory.cisa_kev,
+                        "epss": advisory.epss,
                         "source": advisory.source,
                     }
                 })
@@ -1262,15 +1295,22 @@ fn render_markdown(
     if vulnerable.is_empty() {
         out.push_str("_No advisory matches._\n\n");
     } else {
-        out.push_str("| Host | Port | Advisory | Severity | CVSS | Title |\n");
-        out.push_str("|---|---:|---|---|---:|---|\n");
+        out.push_str("| Host | Port | Advisory | KEV | EPSS | Severity | CVSS | Title |\n");
+        out.push_str("|---|---:|---|:---:|---:|---|---:|---|\n");
         for result in vulnerable {
             for advisory in &result.advisories {
+                let kev = if advisory.cisa_kev { "Yes" } else { "-" };
+                let epss = advisory
+                    .epss
+                    .map(|e| format!("{:.1}%", e * 100.0))
+                    .unwrap_or_else(|| "-".to_string());
                 out.push_str(&format!(
-                    "| {} | {} | {} | {} | {:.1} | {} |\n",
+                    "| {} | {} | {} | {} | {} | {} | {:.1} | {} |\n",
                     result.host,
                     result.port,
                     md_cell(&advisory.id),
+                    kev,
+                    epss,
                     advisory.severity.label(),
                     advisory.cvss,
                     md_cell(&advisory.title)
@@ -1384,6 +1424,39 @@ fn render_markdown(
     out
 }
 
+/// Render a plain `host:port` list of open results for pipeline chaining.
+fn render_host_port(results: &[&PortResult]) -> String {
+    let mut output = String::new();
+    for result in results {
+        if result.state != PortState::Open {
+            continue;
+        }
+        match result.host {
+            IpAddr::V4(host) => {
+                output.push_str(&format!("{host}:{}\n", result.port));
+            }
+            IpAddr::V6(host) => {
+                output.push_str(&format!("[{host}]:{}\n", result.port));
+            }
+        }
+    }
+    output
+}
+
+/// Write a standalone JSON report to `path`, regardless of the display format.
+pub fn write_json_report(
+    report: &ScanReport,
+    target: &str,
+    show: StateSet,
+    min_confidence: Option<u8>,
+    diff: Option<&crate::diff::ScanDiff>,
+    path: &Path,
+    quiet: bool,
+) -> Result<(), AppError> {
+    let contents = render_json(report, target, show, min_confidence, diff)?;
+    write_destination(Some(path), &contents, quiet)
+}
+
 fn write_destination(
     destination: Option<&Path>,
     contents: &str,
@@ -1438,6 +1511,7 @@ mod tests {
                     name: "http".to_string(),
                     product: Some("rayscan-lab".to_string()),
                     version: None,
+                    confidence: Some(0.85),
                 }),
                 banner: Some("HTTP/1.1 200 OK".to_string()),
             });
@@ -1460,6 +1534,7 @@ mod tests {
             ],
             os_fingerprints: std::collections::HashMap::new(),
             probed_ports: vec![80, 81, 82],
+            host_progress: Default::default(),
             partial: false,
             defense_observations: Vec::new(),
         }
@@ -1559,6 +1634,7 @@ mod tests {
             name: "ftp".to_string(),
             product: Some("vsFTPd".to_string()),
             version: Some("2.3.4".to_string()),
+            confidence: Some(0.98),
         });
         report.results[0].banner = Some("220 (vsFTPd 2.3.4)".to_string());
         crate::accuracy::score_report(&mut report);
@@ -1589,6 +1665,8 @@ mod tests {
                 title: "synthetic advisory".to_string(),
                 severity: crate::advisory::Severity::High,
                 cvss: 7.5,
+                cisa_kev: false,
+                epss: None,
                 source: "nvd",
             })
             .collect();
@@ -1613,6 +1691,7 @@ mod tests {
             name: "ftp".to_string(),
             product: Some("vsFTPd".to_string()),
             version: Some("2.3.4".to_string()),
+            confidence: Some(0.98),
         });
         report.results[0].banner = Some("220 (vsFTPd 2.3.4)".to_string());
         crate::accuracy::score_report(&mut report);
@@ -1631,6 +1710,7 @@ mod tests {
             name: "ftp".to_string(),
             product: Some("vsFTPd".to_string()),
             version: Some("2.3.4".to_string()),
+            confidence: Some(0.98),
         });
         report.results[0].banner = Some("220 (vsFTPd 2.3.4)".to_string());
         crate::advisory::apply_advisories(&mut report);
@@ -1662,6 +1742,7 @@ mod tests {
             name: "ftp".to_string(),
             product: Some("vsFTPd".to_string()),
             version: Some("2.3.4".to_string()),
+            confidence: Some(0.98),
         });
         report.results[0].banner = Some("220 (vsFTPd 2.3.4)".to_string());
         report.results[0].tls = Some(crate::tls::TlsInfo {
@@ -1804,5 +1885,28 @@ mod tests {
         assert!(output.contains("Host: 192.0.2.1"), "must contain host line");
         assert!(output.contains("80/open/tcp"), "must contain port entry");
         assert!(output.contains("http"), "must include service name");
+    }
+
+    #[test]
+    fn host_port_format_lists_only_open_targets() {
+        let report = sample_report();
+        let results: Vec<&PortResult> = report.results.iter().collect();
+        let output = render_host_port(&results);
+        assert_eq!(output, "192.0.2.1:80\n");
+
+        let v6 = PortResult::new(
+            "2001:db8::5".parse().unwrap(),
+            443,
+            PortState::Open,
+            Duration::from_millis(1),
+        );
+        let closed = PortResult::new(
+            "192.0.2.1".parse().unwrap(),
+            81,
+            PortState::Closed,
+            Duration::from_millis(1),
+        );
+        let mixed = render_host_port(&[&v6, &closed]);
+        assert_eq!(mixed, "[2001:db8::5]:443\n");
     }
 }

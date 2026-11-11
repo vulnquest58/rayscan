@@ -1,0 +1,58 @@
+# rc=0 wall=2.603
+--- STDOUT ---
+{
+  "target": "172.22.64.1",
+  "targets": 1,
+  "ports": 65535,
+  "jobs": 65535,
+  "workers": 2,
+  "open": [
+    {
+      "host": "172.22.64.1",
+      "port": 80,
+      "state": "open",
+      "latency_ms": 2.134,
+      "banner": "HTTP/1.1 404 Not Found",
+      "service": {
+        "name": "http",
+        "product": "Microsoft-IIS",
+        "version": "10.0"
+      },
+      "confidence": 0.95,
+      "evidence": "handshake:ok(20%) banner:http/Microsoft-IIS(40%) stack:standard(15%) latency:2.1ms(20%)"
+    },
+    {
+      "host": "172.22.64.1",
+      "port": 139,
+      "state": "open",
+      "latency_ms": 1.928,
+      "confidence": 0.85,
+      "evidence": "handshake:ok(20%) banner:binary-protocol(30%) stack:standard(15%) latency:1.9ms(20%)"
+    }
+  ],
+  "defense": {
+    "172.22.64.1": {
+      "host": "172.22.64.1",
+      "defense_type": "syn_proxy",
+      "confidence": 0.92,
+      "summary": "Target is shielded by a SYN Proxy middlebox (e.g. iptables SYNPROXY, F5 BIG-IP, or DDoS protection).",
+      "indicators": [
+        "1 client-first listener(s) (e.g. RPC, PostgreSQL, X11, AJP) held mute as expected; silence on known binary ports is not treated as tarpit evidence",
+        "1 port(s) returned SYN-ACK during discovery but were rejected or dropped upon connection verification"
+      ],
+      "recommended_action": "Raw SYN discovery produces phantom candidates; verified scan mode (`rayscan scan`) confirms true backend listeners."
+    }
+  },
+  "summary": {
+    "open": 2,
+    "closed": 2,
+    "filtered": 65529,
+    "silent": 2,
+    "unreachable": 0,
+    "error": 0
+  },
+  "elapsed_ms": 2452.398
+}
+
+--- STDERR ---
+

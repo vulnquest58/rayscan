@@ -169,6 +169,51 @@ impl BaselineSnapshot {
 }
 
 impl ScanDiff {
+    /// True when any port or posture difference was detected.
+    pub fn changes_detected(&self) -> bool {
+        self.summary.new_ports > 0
+            || self.summary.gone_ports > 0
+            || self.summary.modified_ports > 0
+            || self.summary.posture_changes > 0
+    }
+
+    /// Compact plain-text alert suitable for log ingestion or webhook payloads.
+    pub fn render_alert(&self) -> String {
+        let mut out = String::new();
+        out.push_str("rayscan change alert\n");
+        out.push_str(&format!("baseline: {}\n", self.baseline_source));
+        out.push_str(&format!("target: {}\n", self.current_target));
+        out.push_str(&format!(
+            "new: {}  gone: {}  modified: {}  posture: {}  critical_advisories: {}\n",
+            self.summary.new_ports,
+            self.summary.gone_ports,
+            self.summary.modified_ports,
+            self.summary.posture_changes,
+            self.summary.critical_advisories
+        ));
+        if !self.changes_detected() {
+            out.push_str("status: no changes\n");
+            return out;
+        }
+        out.push_str("status: changes detected\n");
+        for change in &self.port_changes {
+            out.push_str(&format!(
+                "{} {}:{} {}\n",
+                change.kind.tag(),
+                change.host,
+                change.port,
+                change.summary
+            ));
+        }
+        for posture in &self.posture_changes {
+            out.push_str(&format!(
+                "[~] POSTURE {} {} -> {}\n",
+                posture.host, posture.old_posture, posture.new_posture
+            ));
+        }
+        out
+    }
+
     /// Compute differences between two baseline snapshots.
     pub fn compute_snapshots(
         baseline_source: &str,
@@ -623,8 +668,8 @@ pub fn load_baseline(path: &Path) -> Result<BaselineSnapshot, AppError> {
             .get("results")
             .and_then(|v| v.as_array())
             .or_else(|| value.get("open").and_then(|v| v.as_array()));
-
-        if let Some(arr) = results_array {
+        let looks_like_report = results_array.is_some();
+        if looks_like_report && let Some(arr) = results_array {
             for item in arr {
                 let host = item
                     .get("host")
@@ -758,7 +803,7 @@ pub fn load_baseline(path: &Path) -> Result<BaselineSnapshot, AppError> {
             }
         }
 
-        if !snapshot.ports.is_empty() {
+        if !snapshot.ports.is_empty() || looks_like_report {
             return Ok(snapshot);
         }
     }
@@ -795,6 +840,22 @@ pub fn load_baseline(path: &Path) -> Result<BaselineSnapshot, AppError> {
     )))
 }
 
+/// Write a concise diff alert to `path`, creating parent directories as needed.
+pub fn write_alert(path: &Path, diff: &ScanDiff) -> Result<(), AppError> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            AppError::runtime(format!(
+                "cannot create alert directory {}: {error}",
+                parent.display()
+            ))
+        })?;
+    }
+    std::fs::write(path, diff.render_alert())
+        .map_err(|error| AppError::runtime(format!("cannot write {}: {error}", path.display())))
+}
+
 /// CLI entry point for the standalone `rayscan diff <BASELINE> <CURRENT>` command.
 pub fn run_cli(
     args: crate::cli::DiffArgs,
@@ -818,6 +879,13 @@ pub fn run_cli(
         let use_color = crate::theme::color_enabled(theme.unwrap_or_default(), stdout_is_tty);
         print!("{}", diff.render_terminal(use_color));
     }
+
+    if let Some(path) = &args.alert_file {
+        write_alert(path, &diff)?;
+    }
+    if args.fail_on_change && diff.changes_detected() {
+        return Err(AppError::silent(1));
+    }
     Ok(())
 }
 
@@ -828,6 +896,51 @@ mod tests {
     use crate::model::StateCounts;
     use crate::service::ServiceInfo;
     use std::time::Duration;
+
+    #[test]
+    fn alert_text_is_compact_and_marks_no_changes() {
+        let empty = ScanDiff {
+            baseline_source: "base.json".to_string(),
+            current_target: "192.0.2.10".to_string(),
+            port_changes: Vec::new(),
+            posture_changes: Vec::new(),
+            summary: DiffSummary::default(),
+        };
+        assert!(!empty.changes_detected());
+        let alert = empty.render_alert();
+        assert!(alert.contains("status: no changes"));
+        assert!(!alert.contains("[+] NEW"));
+
+        let host: IpAddr = "192.0.2.10".parse().unwrap();
+        let changed = ScanDiff {
+            baseline_source: "base.json".to_string(),
+            current_target: "192.0.2.10".to_string(),
+            port_changes: vec![PortChange {
+                host,
+                port: 8080,
+                kind: ChangeKind::New,
+                old_state: None,
+                new_state: Some(PortState::Open),
+                old_service: None,
+                new_service: Some("http nginx/1.24".to_string()),
+                old_confidence: None,
+                new_confidence: Some(1.0),
+                new_advisories: Vec::new(),
+                resolved_advisories: Vec::new(),
+                summary: "http nginx/1.24 (Confidence: 100%)".to_string(),
+            }],
+            posture_changes: Vec::new(),
+            summary: DiffSummary {
+                new_ports: 1,
+                ..Default::default()
+            },
+        };
+        assert!(changed.changes_detected());
+        let alert = changed.render_alert();
+        assert!(alert.contains("status: changes detected"));
+        assert!(alert.contains("[+] NEW 192.0.2.10:8080"));
+        assert!(alert.contains("new: 1"));
+    }
 
     #[test]
     fn detects_new_and_gone_and_modified_ports() {
@@ -860,6 +973,7 @@ mod tests {
             name: "ssh".to_string(),
             product: Some("OpenSSH".to_string()),
             version: Some("8.9".to_string()),
+            confidence: Some(0.98),
         });
         r22.confidence = Some(1.0);
 
@@ -868,6 +982,7 @@ mod tests {
             name: "http".to_string(),
             product: Some("Apache".to_string()),
             version: Some("2.4.52".to_string()),
+            confidence: Some(0.98),
         });
         r80.confidence = Some(0.95);
 
@@ -887,6 +1002,7 @@ mod tests {
             results: vec![r21, r22, r80],
             os_fingerprints: HashMap::new(),
             probed_ports: vec![21, 22, 80],
+            host_progress: Default::default(),
             partial: false,
             defense_observations: Vec::new(),
         };
@@ -929,6 +1045,7 @@ mod tests {
             name: "https".to_string(),
             product: Some("nginx".to_string()),
             version: Some("1.18.0".to_string()),
+            confidence: Some(0.98),
         });
         result.confidence = Some(1.0);
         result.advisories = vec![
@@ -937,6 +1054,8 @@ mod tests {
                 title: "rescored".to_string(),
                 severity: crate::advisory::Severity::High,
                 cvss: 8.1,
+                cisa_kev: false,
+                epss: None,
                 source: "nvd",
             },
             AdvisoryMatch {
@@ -944,6 +1063,8 @@ mod tests {
                 title: "new critical issue".to_string(),
                 severity: crate::advisory::Severity::Critical,
                 cvss: 9.8,
+                cisa_kev: true,
+                epss: Some(0.95),
                 source: "nvd",
             },
         ];
@@ -961,6 +1082,7 @@ mod tests {
             results: vec![result],
             os_fingerprints: HashMap::new(),
             probed_ports: vec![443],
+            host_progress: Default::default(),
             partial: false,
             defense_observations: Vec::new(),
         };
@@ -975,5 +1097,21 @@ mod tests {
         let rendered = diff.render_terminal(false);
         assert!(rendered.contains("advisories +2 -1"));
         assert!(rendered.contains("New critical advisories: 1"));
+    }
+
+    #[test]
+    fn empty_json_report_is_a_valid_baseline() {
+        let path = std::env::temp_dir().join(format!(
+            "rayscan-empty-baseline-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            r#"{"target":"192.0.2.1","targets":1,"ports":2,"jobs":2,"workers":2,"open":[],"summary":{"open":0,"closed":2,"filtered":0,"silent":0,"unreachable":0,"error":0},"elapsed_ms":1.0}"#,
+        )
+        .expect("write empty baseline");
+        let snapshot = load_baseline(&path).expect("empty report must load");
+        assert!(snapshot.ports.is_empty());
+        let _ = std::fs::remove_file(&path);
     }
 }

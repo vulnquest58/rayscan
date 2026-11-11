@@ -2,6 +2,168 @@
 
 All notable changes to rayscan are documented here.
 
+## [0.4.0] - 2026-11-11
+
+### Added
+
+- **Pipeline-ready output and exit codes**: `--format host-port` (alias
+  `hostport`/`plain`) emits one `host:port` per open port for direct chaining
+  into httpx/nuclei-style tools (IPv6 bracketed). `--exclude-ports` accepts the
+  same list/range syntax as `--ports` and applies to resumed scans too.
+  `--fail-on-change` on `scan --diff` and on the standalone `diff` subcommand
+  exits `1` when new/gone/modified ports or posture shifts are detected, while
+  a clean run exits `0` (no diagnostic printed on the status path). Exit codes
+  remain `0`/`1`/`2` for success/runtime failure/usage otherwise.
+- **Baseline and alert workflow**: `--save-baseline FILE` writes the current
+  run as a JSON baseline in the exact format `--diff` consumes.
+  `--alert-file FILE` (scan and `diff`) writes a compact, timestamp-free alert
+  on every run — `status: no changes` or `status: changes detected` with one
+  line per change — suitable for log shipping or a future webhook bridge.
+- **Expanded service and version detection**:
+  - HTTP now sends `GET` instead of `HEAD`, identifies products from
+    `Server`, `X-Powered-By`, `X-Jenkins`, `kbn-name`/`kbn-version`,
+    `X-Elastic-Product`, and `Docker-Distribution-Api-Version`, and fingerprints
+    common Bug Bounty web surfaces from login/dashboard pages (Jenkins, Kibana,
+    Elasticsearch/OpenSearch, Grafana, Apache Tomcat, phpMyAdmin, Adminer,
+    Webmin, Zabbix, Prometheus, Portainer, SonarQube, Kubernetes Dashboard,
+    Argo CD, RabbitMQ Management, Nexus, GitLab, MinIO, Rancher, Proxmox VE,
+    pfSense, OpenWrt LuCI, WebLogic, WebSphere, Jira, Confluence).
+  - Native probes now run before the HTTP probe on their ports: SMB2 NEGOTIATE
+    with SMB1 fallback (dialect reported, e.g. `SMB 3.0.2`), MongoDB legacy
+    `buildInfo` (server version), Redis `INFO server` (`redis_version`), and
+    memcached `stats` (version). The previous MongoDB probe used an invalid
+    opcode and is replaced by a correctly framed OP_QUERY.
+  - SSH parsing recognizes OpenSSH, Dropbear, libssh, Win32-OpenSSH, Cisco,
+    Paramiko, AsyncSSH, PuTTY, and SunSSH.
+  - RDP identity: X.224 connection negotiation followed by a TLS CredSSP NTLM
+    probe recovers the negotiated security protocol (`HYBRID_EX`, `HYBRID`,
+    `SSL`, …), NLA computer/domain names, and the Windows build, mapped to a
+    product such as `Windows 10 / Server 2019`. Silent RDP ports are retained
+    and promoted to `open`, and JSON results gain an `rdp` object.
+  - `service` objects now include an identification `confidence` (`0.98` with
+    version, `0.85` with product, `0.70` with protocol name only) for JSON/JSONL
+    pipelines and `jq` filtering.
+- **TLS auto-inspection on non-standard ports**: in the default `Auto` mode,
+  an open port whose banner already looks like TLS — or whose service could not
+  be identified at all — is now inspected for certificate/version/cipher
+  metadata instead of being limited to the well-known TLS port list. HTTP and
+  other identified services are skipped as before.
+- **HTTPS application fingerprints**: after a direct TLS handshake, a bounded
+  decrypted `GET` reuses the HTTP fingerprint database, so Jenkins, Kibana,
+  Grafana, Elasticsearch, and other products are reported as
+  `service.name = "https"` with product/version on arbitrary ports. Ports that
+  complete a TCP handshake but reset the plaintext probe are retained for TLS
+  inspection and promoted from `closed` to `open` when the handshake succeeds.
+
+- **Multi-target resume**: `--resume`/`--save-state` no longer require a single
+  target. Per-host progress is tracked in the state file (`hosts` entries with
+  each target's probed ports and state counts), so an interrupted multi-target
+  scan resumes by scanning only each host's remaining ports. Merged reports add
+  prior results/counts without duplication, and resuming a complete state
+  finishes instantly with no probes. Single-target states saved by earlier
+  versions resume unchanged; resuming them against a different host set keeps
+  prior results only for hosts outside the new scan. Raw SYN mode
+  (`--syn`) remains single-target for resumable scans.
+
+- **Scope Guard Engine** (`--scope FILE`, `--force-out-of-scope`, `src/scope.rs`):
+  Enforces legal and operational engagement boundaries for bug bounty hunters
+  (e.g., HackerOne, Bugcrowd) and offensive security teams. Supports structured
+  `scope.toml` or line-based target lists with CIDRs, IPv4 ranges, and wildcard
+  domains (`*.example.com`). Explicit deny rules override allowlists, and
+  unauthorized targets are rejected before packets are sent unless overridden
+  with `--force-out-of-scope`. Target-file contents are expanded before
+  validation, domain allow rules authorize the addresses they resolve to, and
+  explicit IP/CIDR targets are checked against IP allowlists independently.
+- **CISA KEV & EPSS Threat Prioritization** (`--kev-only`, `--min-epss SCORE`,
+  `rayscan db intel`, `src/advisory.rs`, `src/intel.rs`, `data/cisa_kev.json`):
+  Correlates open services against the CISA Known Exploited Vulnerabilities
+  catalog and FIRST.org Exploit Prediction Scoring System (EPSS). Services with
+  active weaponized exploitation in the wild are highlighted with bold `[KEV]`
+  badges and probability metrics in table, markdown, JSON, and SARIF outputs.
+  Hunters can filter directly for exploitable targets via `--kev-only` and `--min-epss`.
+  `rayscan db intel [--force] [--json]` downloads the complete CISA KEV catalog
+  and current EPSS CSV, merges them with the bundled fallback set, and atomically
+  caches a gzip index under `<db>/intel/threat_intel.json.gz` with a 24-hour
+  freshness window. Cached indicators are overlaid automatically for advisory
+  scans.
+- **Real-Time Streaming Output** (`--stream`, `src/lib.rs`, `src/output.rs`):
+  Streams verified port findings line-by-line as unbuffered JSONL directly to
+  `stdout`. Allows downstream pipeline tools (H1Hunter, ParamOracle, Shadow Octopus)
+  to consume findings asynchronously without waiting for the full scan to finish.
+  Post-scan TLS, plugin, and advisory enrichment is not backfilled into streamed
+  records; use the final report when those fields are required.
+- **IPv6 Neighbor Discovery Protocol (NDP) & ICMPv6 Sweep** (`--ndp`,
+  `--ndp-timeout-ms`, `src/discovery.rs`, `src/targets.rs`):
+  Expands broad IPv6 CIDRs such as `/64` through link-local all-nodes multicast
+  probing (`ff02::1`), the Linux neighbor table (`ip -6 neigh` /
+  `/proc/net/ndisc_cache`), and verified host routes instead of enumerating
+  every address. Replies are merged and deduplicated, and link-local results are
+  automatically attached to the correct interface scope ID for connect, TLS,
+  UDP, plugin, and verification probes. Discovery is Linux-only, requires raw
+  ICMPv6 privileges, and honors `--ndp-timeout-ms` (default 750 ms). Native raw
+  ICMPv6 Echo (Type 128/129) remains available to `--ping-sweep`.
+
+### Changed
+
+- Version bumped to `0.4.0` across `Cargo.toml`, README, and man pages.
+- `--advisories` is automatically activated when passing `--kev-only` or `--min-epss`.
+- Table and markdown advisory summaries now prominently display `[KEV]` and EPSS percentages.
+- JSON results now include `cisa_kev: bool` and `epss: Option<f32>` fields for every advisory.
+- **Raw SYN engine throughput rework** (`src/syn/engine.rs`, `src/syn/v6.rs`,
+  `src/syn/packet.rs`): IPv4 SYN frames are now written directly into
+  preallocated batch slots reused across every probe and retransmission pass,
+  eliminating the per-frame heap allocation and `to_vec()` copy on the hot
+  transmit path. IPv6 probes switched from one `sendto(2)` syscall per packet to
+  batched `sendmmsg(2)` over the same reused-buffer pool. The default batch size
+  rose from 64 to 4096 frames per syscall, response draining/progress/AIMD
+  updates now run once per batch flush instead of once per probe, and pacing is
+  enforced exactly once per flush.
+- **Parallel SYN transmit sharding** (`src/syn/engine.rs`): target list is split
+  into contiguous shards, one dedicated AF_PACKET TX thread per shard (up to
+  half the CPU cores, capped at 8), each with its own rate budget, AIMD
+  controller, pacer, tx-time map, and retransmission pass. The single RX thread
+  fan-outs decoded responses to the owning shard via a target map, and shard
+  reports are merged into the final `ScanReport` (`workers` reports TX shards
+  plus the RX thread). Retransmission passes remain per-shard and skip probes
+  already answered within their own shard.
+- **Batched SYN receive** (`src/syn/engine.rs`, `src/syn/v6.rs`): both RX loops
+  replaced per-packet `recvfrom(2)` with `recvmmsg(2)` over prebuilt iovec/
+  `mmsghdr` arrays of 64 reusable 2 KiB slots, cutting one syscall per response
+  frame on the hot receive path.
+- **AIMD rate control hardened for silent paths** (`src/syn/aimd.rs`,
+  `src/syn/engine.rs`, `src/syn/v6.rs`): discovered through live benchmarking
+  against a NAT'd reachability-real target. Three defects fixed:
+  (1) the AIMD update ran once per batch flush with cumulative counters read
+  before the just-flushed batch's responses could arrive, so every update read
+  the ratio low and multiplicative decrease collapsed the rate toward `min_pps`
+  (a 65535-port capped scan would run roughly 50x slower than the requested
+  rate); updates now happen on a fixed 1-second window with per-window
+  counters; (2) sub-1-percent response ratios carry no congestion signal when
+  the path or target silently drops RST responses (common behind firewalls and
+  NATs), so the controller now freezes the configured rate instead of
+  collapsing it; partial response ratios still feed the regular AIMD logic;
+  (3) the additive-increase step doubled from `rate/20` to `rate/4` so the
+  controller can recover the configured rate within a few seconds after a
+  real decrease. Additionally, when the first pass observes responses on under
+  1 percent of probes, retransmission passes are skipped: a path that answers
+  nothing does not begin answering after a resend, and the retry passes would
+  only re-pay the full wall clock. Rate caps are now honored exactly
+  (65535 ports at 10000/2000/500 pps complete in 8.2/33.6/132 s respectively
+  in the benchmark environment).
+- **Live permitted-range benchmark documentation** (`README.md`,
+  `docs/bench-results.md`, `bench-artifacts/`): same-day live measurements on
+  explicitly permitted ranges - the loopback sweep, the WSL2 NAT gateway
+  (`172.22.64.1`, full cross-tool matrix against masscan/rustscan/nmap), and
+  scanme.nmap.org (held to ≤3,000 pps, one full-range pass per tool, traffic
+  stopped when the target rate-limited the test IP). Raw per-run logs, runner
+  scripts, and parsed JSON results are archived verbatim under
+  `bench-artifacts/` (including `bench-artifacts/live/`).
+
+### Fixed
+
+- An empty JSON baseline (target with no open ports) is now accepted by
+  `--diff`/`rayscan diff` instead of being rejected as an invalid file.
+
 ## [0.3.0] - 2026-11-08
 
 ### Added

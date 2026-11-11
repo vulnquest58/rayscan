@@ -12,7 +12,8 @@
 //! advisories before acting.
 
 use std::cmp::Ordering;
-use std::sync::OnceLock;
+use std::collections::HashMap;
+use std::sync::{OnceLock, RwLock};
 
 use serde::{Deserialize, Serialize};
 
@@ -20,9 +21,84 @@ use crate::db::LocalIndex;
 use crate::model::{PortResult, PortState, ScanReport};
 
 const DATABASE_JSON: &str = include_str!("../data/advisories.json");
+const CISA_KEV_JSON: &str = include_str!("../data/cisa_kev.json");
+
+/// One bundled or downloaded threat-intelligence record.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct ThreatIntelEntry {
+    pub id: String,
+    #[serde(default)]
+    pub cisa_kev: bool,
+    #[serde(default)]
+    pub epss: Option<f32>,
+}
+
+/// A threat-intelligence indicator for one CVE.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ThreatIndicator {
+    pub cisa_kev: bool,
+    pub epss: Option<f32>,
+}
+
+type ThreatIntelTable = HashMap<String, ThreatIndicator>;
+
+fn threat_intel() -> &'static RwLock<ThreatIntelTable> {
+    static THREAT_INTEL: OnceLock<RwLock<ThreatIntelTable>> = OnceLock::new();
+    THREAT_INTEL.get_or_init(|| RwLock::new(bundled_threat_intel()))
+}
+
+fn bundled_threat_intel() -> ThreatIntelTable {
+    let entries: Vec<ThreatIntelEntry> = serde_json::from_str(CISA_KEV_JSON).unwrap_or_default();
+    entries
+        .into_iter()
+        .map(|entry| {
+            (
+                entry.id,
+                ThreatIndicator {
+                    cisa_kev: entry.cisa_kev,
+                    epss: entry.epss,
+                },
+            )
+        })
+        .collect()
+}
+
+/// Return the small curated threat-intelligence set compiled into the binary.
+pub fn bundled_threat_intel_entries() -> Vec<ThreatIntelEntry> {
+    serde_json::from_str(CISA_KEV_JSON).unwrap_or_default()
+}
+
+/// Merge downloaded threat intelligence into the process-wide lookup table.
+///
+/// Bundled entries remain available for CVEs absent from the downloaded feed.
+/// Reinstalling an overlay simply replaces indicator values for matching CVEs.
+pub fn install_threat_intel(entries: impl IntoIterator<Item = ThreatIntelEntry>) {
+    let mut table = threat_intel()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for entry in entries {
+        table.insert(
+            entry.id,
+            ThreatIndicator {
+                cisa_kev: entry.cisa_kev,
+                epss: entry.epss,
+            },
+        );
+    }
+}
+
+/// Lookup threat intelligence indicators (CISA KEV membership and FIRST.org EPSS score).
+pub fn lookup_threat_intel(cve_id: &str) -> (bool, Option<f32>) {
+    threat_intel()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(cve_id)
+        .map(|indicator| (indicator.cisa_kev, indicator.epss))
+        .unwrap_or((false, None))
+}
 
 /// Qualitative severity derived from the advisory's CVSS score.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Severity {
     Low,
@@ -55,12 +131,16 @@ impl Severity {
 }
 
 /// One advisory matched to a port result.
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AdvisoryMatch {
     pub id: String,
     pub title: String,
     pub severity: Severity,
     pub cvss: f32,
+    #[serde(default)]
+    pub cisa_kev: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub epss: Option<f32>,
     /// Where the match came from: `curated` or `nvd`.
     pub source: &'static str,
 }
@@ -193,12 +273,17 @@ pub fn correlate_with(result: &PortResult, index: Option<&LocalIndex>) -> Vec<Ad
     let mut matches: Vec<AdvisoryMatch> = database()
         .iter()
         .filter(|advisory| advisory.matches(&identities, version.as_deref(), banner.as_deref()))
-        .map(|advisory| AdvisoryMatch {
-            id: advisory.id.clone(),
-            title: advisory.title.clone(),
-            severity: Severity::from_cvss(advisory.cvss),
-            cvss: advisory.cvss,
-            source: "curated",
+        .map(|advisory| {
+            let (cisa_kev, epss) = lookup_threat_intel(&advisory.id);
+            AdvisoryMatch {
+                id: advisory.id.clone(),
+                title: advisory.title.clone(),
+                severity: Severity::from_cvss(advisory.cvss),
+                cvss: advisory.cvss,
+                cisa_kev,
+                epss,
+                source: "curated",
+            }
         })
         .collect();
 
@@ -233,6 +318,26 @@ pub fn apply_advisories(report: &mut ScanReport) {
 pub fn apply_advisories_with(report: &mut ScanReport, index: Option<&LocalIndex>) {
     for result in &mut report.results {
         result.advisories = correlate_with(result, index);
+    }
+}
+
+/// Filter advisory findings according to CISA KEV presence and minimum EPSS threshold.
+pub fn filter_advisories(report: &mut ScanReport, kev_only: bool, min_epss: Option<f32>) {
+    if !kev_only && min_epss.is_none() {
+        return;
+    }
+    for result in &mut report.results {
+        result.advisories.retain(|adv| {
+            if kev_only && !adv.cisa_kev {
+                return false;
+            }
+            if let Some(threshold) = min_epss
+                && !adv.epss.is_some_and(|score| score >= threshold)
+            {
+                return false;
+            }
+            true
+        });
     }
 }
 
@@ -283,6 +388,7 @@ mod tests {
             name: name.to_string(),
             product: product.map(str::to_string),
             version: version.map(str::to_string),
+            confidence: None,
         });
         result.banner = banner.map(str::to_string);
         result
@@ -374,6 +480,8 @@ mod tests {
                 title: "nvd critical".to_string(),
                 severity: Severity::Critical,
                 cvss: 9.8,
+                cisa_kev: false,
+                epss: None,
                 source: "nvd",
             },
             AdvisoryMatch {
@@ -381,6 +489,8 @@ mod tests {
                 title: "curated medium".to_string(),
                 severity: Severity::Medium,
                 cvss: 5.0,
+                cisa_kev: false,
+                epss: None,
                 source: "curated",
             },
         ];
@@ -408,6 +518,7 @@ mod tests {
             name: "ssh".to_string(),
             product: Some("OpenSSH".to_string()),
             version: Some("4.7p1".to_string()),
+            confidence: Some(0.98),
         });
 
         let mut report = ScanReport {
@@ -424,6 +535,7 @@ mod tests {
             results: vec![ftp, closed],
             os_fingerprints: std::collections::HashMap::new(),
             probed_ports: vec![21, 22],
+            host_progress: Default::default(),
             partial: false,
             defense_observations: Vec::new(),
         };
@@ -431,5 +543,48 @@ mod tests {
         apply_advisories(&mut report);
         assert_eq!(report.results[0].advisories.len(), 1);
         assert!(report.results[1].advisories.is_empty());
+    }
+
+    #[test]
+    fn cisa_kev_and_epss_enrichment_and_filtering() {
+        let mut ftp = sample("ftp", Some("vsFTPd"), Some("2.3.4"), None);
+        ftp.port = 21;
+        let matches = correlate(&ftp);
+        assert!(!matches.is_empty());
+        let first = &matches[0];
+        assert_eq!(first.id, "CVE-2011-2523");
+        assert!(
+            first.cisa_kev,
+            "vsftpd backdoor must be flagged as CISA KEV"
+        );
+        assert!(
+            first.epss.is_some_and(|e| e > 0.9),
+            "vsftpd backdoor must have high EPSS"
+        );
+
+        let mut report = ScanReport {
+            targets: 1,
+            ports: 1,
+            jobs: 1,
+            workers: 1,
+            elapsed: Duration::from_millis(5),
+            counts: crate::model::StateCounts {
+                open: 1,
+                ..Default::default()
+            },
+            results: vec![ftp],
+            os_fingerprints: std::collections::HashMap::new(),
+            probed_ports: vec![21],
+            host_progress: Default::default(),
+            partial: false,
+            defense_observations: Vec::new(),
+        };
+
+        apply_advisories(&mut report);
+        assert_eq!(report.results[0].advisories.len(), 1);
+
+        // Filter with high EPSS threshold (e.g. 0.99 which exceeds 0.941)
+        filter_advisories(&mut report, false, Some(0.99));
+        assert!(report.results[0].advisories.is_empty());
     }
 }

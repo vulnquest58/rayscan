@@ -2,6 +2,8 @@ use std::net::IpAddr;
 
 use serde::Serialize;
 
+use crate::discovery::socket_addr;
+
 /// DNS query for "example.com" (A record).
 const DNS_QUERY: &[u8] = &[
     0x00, 0x01, // txid
@@ -310,7 +312,7 @@ pub async fn probe_udp(
         Err(_) => return (Vec::new(), UdpDetection::default()),
     };
 
-    if socket.connect((host, port)).await.is_err() {
+    if socket.connect(socket_addr(host, port)).await.is_err() {
         return (Vec::new(), UdpDetection::default());
     }
 

@@ -42,16 +42,48 @@ pub async fn resolve_targets(
     excludes: &[String],
     family: AddressFamily,
 ) -> Result<Vec<IpAddr>, AppError> {
+    resolve_targets_with_ndp(specs, files, excludes, family, None).await
+}
+
+/// Resolve targets, optionally using NDP multicast discovery to expand broad
+/// IPv6 CIDRs instead of failing on the address cap.
+pub async fn resolve_targets_with_ndp(
+    specs: &[String],
+    files: &[PathBuf],
+    excludes: &[String],
+    family: AddressFamily,
+    ndp_timeout: Option<Duration>,
+) -> Result<Vec<IpAddr>, AppError> {
     let specs = expand_files(specs, files)?;
     if specs.is_empty() {
         return Err(AppError::usage("at least one target is required"));
     }
 
-    let mut targets = resolve_specs(&specs, family).await?;
+    let ndp_neighbors = match ndp_timeout {
+        Some(timeout) if needs_ndp_discovery(&specs) => {
+            if !crate::discovery::ndp_supported() {
+                return Err(AppError::usage(
+                    "--ndp is only supported on Linux with raw ICMPv6 privileges",
+                ));
+            }
+            Some(
+                tokio::task::spawn_blocking(move || {
+                    crate::discovery::discover_ipv6_multicast(timeout)
+                })
+                .await
+                .map_err(|error| {
+                    AppError::runtime(format!("NDP discovery task failed: {error}"))
+                })?,
+            )
+        }
+        _ => None,
+    };
+
+    let mut targets = resolve_specs(&specs, family, ndp_neighbors.as_deref()).await?;
 
     let excludes = expand_files(excludes, &[])?;
     if !excludes.is_empty() {
-        let excluded: HashSet<IpAddr> = resolve_specs(&excludes, family)
+        let excluded: HashSet<IpAddr> = resolve_specs(&excludes, family, None)
             .await?
             .into_iter()
             .collect();
@@ -63,6 +95,26 @@ pub async fn resolve_targets(
     }
 
     Ok(targets)
+}
+
+fn needs_ndp_discovery(specs: &[String]) -> bool {
+    specs.iter().any(|spec| {
+        let Some((address, prefix)) = spec.split_once('/') else {
+            return false;
+        };
+        if !matches!(address.trim().parse::<IpAddr>(), Ok(IpAddr::V6(_))) {
+            return false;
+        }
+        prefix
+            .trim()
+            .parse::<u8>()
+            .is_ok_and(|prefix| u32::from(prefix) < 128 - 16)
+    })
+}
+
+/// Expand `@file` entries and target-file paths into individual target specs.
+pub fn expand_target_specs(specs: &[String], files: &[PathBuf]) -> Result<Vec<String>, AppError> {
+    expand_files(specs, files)
 }
 
 fn expand_files(specs: &[String], files: &[PathBuf]) -> Result<Vec<String>, AppError> {
@@ -105,7 +157,11 @@ fn read_target_file(path: &Path, output: &mut Vec<String>) -> Result<(), AppErro
     Ok(())
 }
 
-async fn resolve_specs(specs: &[String], family: AddressFamily) -> Result<Vec<IpAddr>, AppError> {
+async fn resolve_specs(
+    specs: &[String],
+    family: AddressFamily,
+    ndp_neighbors: Option<&[IpAddr]>,
+) -> Result<Vec<IpAddr>, AppError> {
     enum Entry {
         Literal(Vec<IpAddr>),
         Name(String),
@@ -113,7 +169,7 @@ async fn resolve_specs(specs: &[String], family: AddressFamily) -> Result<Vec<Ip
 
     let mut entries = Vec::with_capacity(specs.len());
     for spec in specs {
-        match parse_literal(spec, family)? {
+        match parse_literal(spec, family, ndp_neighbors)? {
             Some(addresses) => entries.push(Entry::Literal(addresses)),
             None => entries.push(Entry::Name(spec.clone())),
         }
@@ -181,7 +237,11 @@ impl Accumulator {
     }
 }
 
-fn parse_literal(spec: &str, family: AddressFamily) -> Result<Option<Vec<IpAddr>>, AppError> {
+fn parse_literal(
+    spec: &str,
+    family: AddressFamily,
+    ndp_neighbors: Option<&[IpAddr]>,
+) -> Result<Option<Vec<IpAddr>>, AppError> {
     let spec = spec.trim();
     if spec.is_empty() {
         return Err(AppError::usage("empty target"));
@@ -198,7 +258,7 @@ fn parse_literal(spec: &str, family: AddressFamily) -> Result<Option<Vec<IpAddr>
     }
 
     if spec.contains('/') {
-        return parse_cidr(spec, family).map(Some);
+        return parse_cidr(spec, family, ndp_neighbors).map(Some);
     }
 
     if let Some(range) = parse_range(spec, family)? {
@@ -220,7 +280,11 @@ fn ensure_family(address: IpAddr, family: AddressFamily, context: &str) -> Resul
     }
 }
 
-fn parse_cidr(spec: &str, family: AddressFamily) -> Result<Vec<IpAddr>, AppError> {
+fn parse_cidr(
+    spec: &str,
+    family: AddressFamily,
+    ndp_neighbors: Option<&[IpAddr]>,
+) -> Result<Vec<IpAddr>, AppError> {
     let (address_text, prefix_text) = spec.split_once('/').ok_or_else(|| {
         AppError::usage(format!("invalid CIDR {spec:?}; expected address/prefix"))
     })?;
@@ -267,19 +331,33 @@ fn parse_cidr(spec: &str, family: AddressFamily) -> Result<Vec<IpAddr>, AppError
                 )));
             }
             let host_bits = 128 - u32::from(prefix);
-            if host_bits >= 128 {
-                return Err(too_many(spec));
-            }
-            let count = 1u128 << host_bits;
-            if count > MAX_TARGETS as u128 {
-                return Err(too_many(spec));
-            }
             let mask = if prefix == 0 {
                 0
             } else {
                 u128::MAX << host_bits
             };
             let base = u128::from(address) & mask;
+
+            if host_bits >= 128 || (1u128 << host_bits.min(127)) > MAX_TARGETS as u128 {
+                if let Some(neighbors) = ndp_neighbors {
+                    let addresses: Vec<IpAddr> = neighbors
+                        .iter()
+                        .copied()
+                        .filter(|address| {
+                            matches!(address, IpAddr::V6(value) if u128::from(*value) & mask == base)
+                        })
+                        .collect();
+                    if addresses.is_empty() {
+                        return Err(AppError::usage(format!(
+                            "NDP discovery found no active IPv6 neighbors inside {spec}"
+                        )));
+                    }
+                    return Ok(addresses);
+                }
+                return Err(too_many(spec));
+            }
+
+            let count = 1u128 << host_bits;
             let mut addresses = Vec::with_capacity(count as usize);
             for offset in 0..count {
                 addresses.push(IpAddr::V6(Ipv6Addr::from(base + offset)));
@@ -465,6 +543,37 @@ mod tests {
         assert_eq!(addresses[3], "2001:db8::3".parse::<IpAddr>().unwrap());
         assert_eq!(addresses[4], "2001:db8:1::1".parse::<IpAddr>().unwrap());
         assert_eq!(addresses[6], "2001:db8:1::3".parse::<IpAddr>().unwrap());
+    }
+
+    #[tokio::test]
+    async fn ndp_neighbors_expand_broad_ipv6_cidr() {
+        let neighbors = vec![
+            "fe80::1".parse::<IpAddr>().unwrap(),
+            "fe80::2".parse::<IpAddr>().unwrap(),
+            "2001:db8::1".parse::<IpAddr>().unwrap(),
+        ];
+        let addresses = resolve_specs(
+            &["fe80::/64".to_string()],
+            AddressFamily::V6,
+            Some(&neighbors),
+        )
+        .await
+        .unwrap();
+        assert_eq!(addresses.len(), 2);
+        assert!(addresses.iter().all(|address| address.is_ipv6()));
+    }
+
+    #[tokio::test]
+    async fn ndp_without_matching_neighbors_reports_a_clear_error() {
+        let neighbors = vec!["2001:db8::1".parse::<IpAddr>().unwrap()];
+        let error = resolve_specs(
+            &["fe80::/64".to_string()],
+            AddressFamily::V6,
+            Some(&neighbors),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("NDP discovery found no active"));
     }
 
     #[tokio::test]

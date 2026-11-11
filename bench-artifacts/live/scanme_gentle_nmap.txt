@@ -1,0 +1,14 @@
+# rc=0 wall=24.453
+--- STDOUT ---
+Starting Nmap 7.80 ( https://nmap.org ) at 2026-11-10 17:48 WAT
+Nmap scan report for 45.33.32.156
+Host is up (0.24s latency).
+Not shown: 998 closed ports
+PORT   STATE SERVICE
+22/tcp open  ssh
+80/tcp open  http
+
+Nmap done: 1 IP address (1 host up) scanned in 24.44 seconds
+
+--- STDERR ---
+

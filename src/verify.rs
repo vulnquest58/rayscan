@@ -5,8 +5,11 @@ use std::time::Instant;
 use tokio::net::TcpStream;
 
 use crate::classify::{FailureKind, classify_kind};
+use crate::discovery::socket_addr;
 use crate::error::AppError;
-use crate::model::{PortResult, PortState, ScanReport, StateSet};
+#[cfg(test)]
+use crate::model::StateSet;
+use crate::model::{PortResult, PortState, ScanReport};
 use crate::rate::RateLimiter;
 use crate::scanner::{self, ProgressCallback, ScanOptions};
 
@@ -38,11 +41,11 @@ pub async fn verify_syn_open_candidates(
     }
 
     let verified = scanner::verify_candidates(candidates, options, progress).await?;
-    merge_verification(report, verified, options.retain);
+    merge_verification(report, verified, options);
     Ok(())
 }
 
-fn merge_verification(report: &mut ScanReport, verified: Vec<PortResult>, retain: StateSet) {
+fn merge_verification(report: &mut ScanReport, verified: Vec<PortResult>, options: &ScanOptions) {
     for result in verified {
         let Some(index) = report.results.iter().position(|existing| {
             existing.host == result.host
@@ -59,7 +62,8 @@ fn merge_verification(report: &mut ScanReport, verified: Vec<PortResult>, retain
             report.defense_observations.push(result.clone());
         }
 
-        if retain.contains(result.state) {
+        let retain = options.retains(&result);
+        if retain {
             report.results[index] = result;
         } else {
             report.results.remove(index);
@@ -95,7 +99,7 @@ pub async fn recheck_local_opens(report: &mut ScanReport, options: &ScanOptions)
     let mut rejected = Vec::new();
     for (host, port) in candidates {
         limiter.acquire().await;
-        let address = SocketAddr::new(host, port);
+        let address = socket_addr(host, port);
         let started = Instant::now();
         let outcome = tokio::time::timeout(options.timeout, TcpStream::connect(address)).await;
         let elapsed = started.elapsed();
@@ -114,7 +118,7 @@ pub async fn recheck_local_opens(report: &mut ScanReport, options: &ScanOptions)
     }
 
     if !rejected.is_empty() {
-        merge_verification(report, rejected, options.retain);
+        merge_verification(report, rejected, options);
     }
 }
 
@@ -166,6 +170,8 @@ mod tests {
             connect_only: false,
             service_detection: true,
             retain,
+            retain_silent_ports: Vec::new(),
+            retain_reset_closed: false,
             jitter: Duration::ZERO,
             shutdown: Arc::new(AtomicBool::new(false)),
         }
@@ -190,6 +196,7 @@ mod tests {
             )],
             os_fingerprints: std::collections::HashMap::new(),
             probed_ports: vec![port],
+            host_progress: Default::default(),
             partial: false,
             defense_observations: Vec::new(),
         }
@@ -219,6 +226,7 @@ mod tests {
             ],
             os_fingerprints: std::collections::HashMap::new(),
             probed_ports: vec![80, 9000, 9003],
+            host_progress: Default::default(),
             partial: false,
             defense_observations: Vec::new(),
         }
@@ -233,7 +241,7 @@ mod tests {
             PortResult::new(host(), 9003, PortState::Closed, Duration::from_millis(1)),
         ];
 
-        merge_verification(&mut report, verified, StateSet::all());
+        merge_verification(&mut report, verified, &options(StateSet::all()));
 
         assert_eq!(report.counts.open, 1);
         assert_eq!(report.counts.silent, 1);
@@ -257,7 +265,7 @@ mod tests {
             Duration::from_millis(300),
         )];
 
-        merge_verification(&mut report, verified, StateSet::open());
+        merge_verification(&mut report, verified, &options(StateSet::open()));
 
         assert_eq!(report.counts.open, 2);
         assert_eq!(report.counts.silent, 1);
@@ -321,6 +329,7 @@ mod tests {
             )],
             os_fingerprints: std::collections::HashMap::new(),
             probed_ports: vec![80],
+            host_progress: Default::default(),
             partial: false,
             defense_observations: Vec::new(),
         };

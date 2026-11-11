@@ -28,7 +28,7 @@ use crate::tls::TlsMode;
                   detection on ports that accept UDP traffic.",
     arg_required_else_help = true,
     subcommand_required = true,
-    after_help = "Examples:\n  rayscan scan --target 127.0.0.1 --ports 1-1024\n  rayscan scan -t 10.0.0.0/24 -p 22,80,443 --json\n  rayscan scan -t 10.77.0.2 -p 1-10000 --profile careful --show all"
+    after_help = "Examples:\n  rayscan scan --target 127.0.0.1 --ports 1-1024\n  rayscan scan -t 10.0.0.0/24 -p 22,80,443 --json\n  rayscan scan -t 10.77.0.2 -p 1-10000 --profile careful --show all\n  rayscan db intel --force\n  sudo rayscan scan -6 -t fe80::/64 --ndp -p 22,80,443"
 )]
 pub struct Cli {
     /// Color theme for tables, progress, and diagnostics.
@@ -72,6 +72,8 @@ pub enum DbAction {
     Update(DbUpdateArgs),
     /// Show local advisory database status and coverage.
     Status(DbStatusArgs),
+    /// Download and index the full CISA KEV catalog and current EPSS scores.
+    Intel(DbIntelArgs),
 }
 
 #[derive(Debug, Args)]
@@ -97,6 +99,21 @@ pub struct DbStatusArgs {
 }
 
 #[derive(Debug, Args)]
+pub struct DbIntelArgs {
+    /// Re-download feeds even when the cached copy is fresh.
+    #[arg(long)]
+    pub force: bool,
+
+    /// Emit the refresh summary as JSON.
+    #[arg(long)]
+    pub json: bool,
+
+    /// Suppress progress output.
+    #[arg(long)]
+    pub quiet: bool,
+}
+
+#[derive(Debug, Args)]
 pub struct DiffArgs {
     /// Baseline JSON report or state file.
     #[arg(value_name = "BASELINE_FILE")]
@@ -109,6 +126,14 @@ pub struct DiffArgs {
     /// Output differences in JSON format.
     #[arg(long)]
     pub json: bool,
+
+    /// Exit with status 1 when any change is detected.
+    #[arg(long)]
+    pub fail_on_change: bool,
+
+    /// Write a concise change alert to FILE (written on every run).
+    #[arg(long, value_name = "FILE")]
+    pub alert_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -160,6 +185,10 @@ pub struct ScanArgs {
     /// Scan the top N most common ports (e.g. 10, 100, 1000).
     #[arg(long, value_name = "N", conflicts_with = "ports")]
     pub top_ports: Option<usize>,
+
+    /// Exclude ports from the scan, for example 22,135,445 or 8000-8100.
+    #[arg(long, value_name = "PORTS")]
+    pub exclude_ports: Option<String>,
 
     /// Emit the benchmark-compatible JSON report.
     #[arg(long, conflicts_with = "format")]
@@ -353,6 +382,18 @@ pub struct ScanArgs {
     #[arg(long, visible_alias = "compare-to", value_name = "FILE")]
     pub diff: Option<PathBuf>,
 
+    /// Save the final report as a JSON baseline for future --diff comparisons.
+    #[arg(long, value_name = "FILE")]
+    pub save_baseline: Option<PathBuf>,
+
+    /// Write a concise change alert to FILE (requires --diff; written on every run).
+    #[arg(long, value_name = "FILE", requires = "diff")]
+    pub alert_file: Option<PathBuf>,
+
+    /// Exit with status 1 when --diff detects any new, gone, or modified port.
+    #[arg(long, requires = "diff")]
+    pub fail_on_change: bool,
+
     /// Discover responsive hosts with ICMP echo/TCP ping before scanning.
     #[arg(long)]
     pub ping_sweep: bool,
@@ -365,9 +406,38 @@ pub struct ScanArgs {
     #[arg(long, value_name = "MS", requires = "ping_sweep")]
     pub ping_timeout_ms: Option<u64>,
 
+    /// Discover local IPv6 neighbors with an NDP all-nodes multicast probe.
+    /// Expands broad IPv6 CIDRs such as /64 instead of enumerating every address.
+    #[arg(long, requires = "ipv6")]
+    pub ndp: bool,
+
+    /// NDP discovery timeout in milliseconds (50-5000). Requires --ndp.
+    #[arg(long, value_name = "MS", requires = "ndp")]
+    pub ndp_timeout_ms: Option<u64>,
+
     /// Directory or TOML file with declarative probe packs.
     #[arg(long, value_name = "PATH")]
     pub plugins: Option<PathBuf>,
+
+    /// Scope definition file (TOML or plaintext) specifying authorized target boundaries.
+    #[arg(long = "scope", visible_alias = "scope-file", value_name = "FILE")]
+    pub scope: Option<PathBuf>,
+
+    /// Force scan execution even if targets violate the Scope Guard definition.
+    #[arg(long = "force-out-of-scope")]
+    pub force_out_of_scope: bool,
+
+    /// Filter advisory findings to only display services with CISA Known Exploited Vulnerabilities.
+    #[arg(long = "kev-only")]
+    pub kev_only: bool,
+
+    /// Filter advisory findings to those with EPSS exploitation probability >= SCORE (0.0-1.0).
+    #[arg(long = "min-epss", value_name = "SCORE")]
+    pub min_epss: Option<f32>,
+
+    /// Stream JSONL port findings immediately to stdout as each candidate is verified.
+    #[arg(long = "stream")]
+    pub stream: bool,
 
     /// Scan only this shard of the target list (0-based). Requires --shard-count.
     #[arg(long, value_name = "N")]
@@ -432,6 +502,10 @@ pub struct ResolvedConfig {
     pub ping_count: u8,
     /// Per-ping timeout.
     pub ping_timeout: Duration,
+    /// Discover local IPv6 neighbors through NDP multicast before scanning.
+    pub ndp: bool,
+    /// NDP discovery timeout.
+    pub ndp_timeout: Duration,
     /// Maximum random delay before each probe.
     pub jitter: Duration,
     /// Spoofed decoy source addresses for raw SYN scans.
@@ -442,6 +516,24 @@ pub struct ResolvedConfig {
     pub tls_mode: TlsMode,
     /// Optional `(index, count)` target shard selection.
     pub shard: Option<(usize, usize)>,
+    /// Authorized target boundary definition.
+    pub scope: Option<PathBuf>,
+    /// Bypass Scope Guard enforcement with warnings.
+    pub force_out_of_scope: bool,
+    /// Filter to CISA KEV findings only.
+    pub kev_only: bool,
+    /// Minimum EPSS probability threshold.
+    pub min_epss: Option<f32>,
+    /// Real-time JSONL streaming output.
+    pub stream: bool,
+    /// Ports excluded from the scan.
+    pub exclude_ports: Vec<u16>,
+    /// Path to write the JSON baseline after the scan.
+    pub save_baseline: Option<PathBuf>,
+    /// Path to write the change alert when a diff is computed.
+    pub alert_file: Option<PathBuf>,
+    /// Exit with status 1 when the diff detects changes.
+    pub fail_on_change: bool,
 }
 
 impl ScanArgs {
@@ -571,6 +663,12 @@ impl ScanArgs {
                 "--ping-timeout-ms must be between 50 and 10000",
             ));
         }
+        let ndp_timeout_ms = self.ndp_timeout_ms.unwrap_or(750);
+        if !(50..=5_000).contains(&ndp_timeout_ms) {
+            return Err(AppError::usage(
+                "--ndp-timeout-ms must be between 50 and 5000",
+            ));
+        }
 
         let jitter_ms = self
             .jitter_ms
@@ -594,6 +692,17 @@ impl ScanArgs {
                 "--fragment-size must be a multiple of 8 between 8 and 1480",
             ));
         }
+
+        if let Some(epss) = self.min_epss
+            && !(0.0..=1.0).contains(&epss)
+        {
+            return Err(AppError::usage("--min-epss must be between 0.0 and 1.0"));
+        }
+
+        let exclude_ports = match self.exclude_ports.as_deref() {
+            Some(spec) => crate::ports::parse_ports(spec)?,
+            None => Vec::new(),
+        };
 
         Ok(ResolvedConfig {
             timeout: Duration::from_secs_f64(timeout_seconds),
@@ -621,18 +730,29 @@ impl ScanArgs {
             min_confidence: self.min_confidence,
             explain: self.explain,
             defense: self.defense,
-            advisories: self.advisories,
+            advisories: self.advisories || self.kev_only || self.min_epss.is_some(),
             no_db_update: self.no_db_update,
             diff_file: self.diff.clone(),
             plugins: self.plugins.clone().or_else(|| file.plugins.clone()),
             ping_sweep: self.ping_sweep,
             ping_count,
             ping_timeout: Duration::from_millis(ping_timeout_ms),
+            ndp: self.ndp,
+            ndp_timeout: Duration::from_millis(ndp_timeout_ms),
             jitter: Duration::from_millis(jitter_ms),
             decoys,
             fragment_size: self.fragment_size,
             tls_mode,
             shard,
+            scope: self.scope.clone(),
+            force_out_of_scope: self.force_out_of_scope,
+            kev_only: self.kev_only,
+            min_epss: self.min_epss,
+            stream: self.stream,
+            exclude_ports,
+            save_baseline: self.save_baseline.clone(),
+            alert_file: self.alert_file.clone(),
+            fail_on_change: self.fail_on_change,
         })
     }
 
@@ -747,6 +867,8 @@ mod tests {
             ping_sweep: false,
             ping_count: None,
             ping_timeout_ms: None,
+            ndp: false,
+            ndp_timeout_ms: None,
             jitter_ms: None,
             decoys: None,
             fragment_size: None,
@@ -754,6 +876,15 @@ mod tests {
             no_tls: false,
             shard_index: None,
             shard_count: None,
+            scope: None,
+            force_out_of_scope: false,
+            kev_only: false,
+            min_epss: None,
+            stream: false,
+            exclude_ports: None,
+            save_baseline: None,
+            alert_file: None,
+            fail_on_change: false,
         }
     }
 
@@ -882,6 +1013,17 @@ mod tests {
             other => panic!("unexpected command: {other:?}"),
         }
 
+        let cli = Cli::try_parse_from(["rayscan", "db", "intel", "--force", "--json"]).unwrap();
+        match cli.command {
+            Command::Db(DbArgs {
+                action: DbAction::Intel(options),
+            }) => {
+                assert!(options.force);
+                assert!(options.json);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
         let cli = Cli::try_parse_from([
             "rayscan",
             "--db-dir",
@@ -919,6 +1061,48 @@ mod tests {
     }
 
     #[test]
+    fn ndp_timeout_is_bounded_and_resolved() {
+        let mut enabled = args();
+        enabled.ipv6 = true;
+        enabled.ndp = true;
+        enabled.ndp_timeout_ms = Some(250);
+        let resolved = enabled.resolve().unwrap();
+        assert!(resolved.ndp);
+        assert_eq!(resolved.ndp_timeout, Duration::from_millis(250));
+
+        let mut invalid = args();
+        invalid.ndp = true;
+        invalid.ndp_timeout_ms = Some(10);
+        assert_eq!(invalid.resolve().unwrap_err().exit_code(), 2);
+    }
+
+    #[test]
+    fn ndp_requires_ipv6_and_parses_timeout() {
+        let cli = Cli::try_parse_from([
+            "rayscan",
+            "scan",
+            "-t",
+            "fe80::/64",
+            "-6",
+            "--ndp",
+            "--ndp-timeout-ms",
+            "250",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Scan(scan) => {
+                assert!(scan.ndp);
+                assert_eq!(scan.ndp_timeout_ms, Some(250));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let error = Cli::try_parse_from(["rayscan", "scan", "-t", "fe80::/64", "--ndp"])
+            .expect_err("--ndp without --ipv6 must fail");
+        assert!(error.to_string().contains("--ipv6"));
+    }
+
+    #[test]
     fn shard_selection_requires_a_valid_pair() {
         let mut parsed = args();
         parsed.shard_index = Some(0);
@@ -933,6 +1117,71 @@ mod tests {
         invalid.shard_index = Some(4);
         invalid.shard_count = Some(4);
         assert_eq!(invalid.resolve().unwrap_err().exit_code(), 2);
+    }
+
+    #[test]
+    fn exclude_ports_and_change_monitoring_flags_resolve() {
+        let mut excluded = args();
+        excluded.exclude_ports = Some("80,443".to_string());
+        assert_eq!(excluded.resolve().unwrap().exclude_ports, vec![80, 443]);
+
+        let mut invalid = args();
+        invalid.exclude_ports = Some("70000".to_string());
+        assert_eq!(invalid.resolve().unwrap_err().exit_code(), 2);
+
+        let cli = Cli::try_parse_from([
+            "rayscan",
+            "scan",
+            "-t",
+            "192.0.2.1",
+            "--diff",
+            "baseline.json",
+            "--fail-on-change",
+            "--alert-file",
+            "alert.txt",
+            "--save-baseline",
+            "next.json",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Scan(scan) => {
+                assert!(scan.fail_on_change);
+                assert_eq!(
+                    scan.alert_file.as_deref(),
+                    Some(std::path::Path::new("alert.txt"))
+                );
+                assert_eq!(
+                    scan.save_baseline.as_deref(),
+                    Some(std::path::Path::new("next.json"))
+                );
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let error = Cli::try_parse_from(["rayscan", "scan", "-t", "192.0.2.1", "--fail-on-change"])
+            .expect_err("--fail-on-change requires --diff");
+        assert!(error.to_string().contains("--diff"));
+
+        let cli = Cli::try_parse_from([
+            "rayscan",
+            "diff",
+            "a.json",
+            "b.json",
+            "--fail-on-change",
+            "--alert-file",
+            "alert.txt",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Diff(options) => {
+                assert!(options.fail_on_change);
+                assert_eq!(
+                    options.alert_file.as_deref(),
+                    Some(std::path::Path::new("alert.txt"))
+                );
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
     }
 
     #[test]

@@ -1,0 +1,50 @@
+# rc=0 wall=3.931
+--- STDOUT ---
+{
+  "target": "45.33.32.156",
+  "targets": 1,
+  "ports": 1000,
+  "jobs": 1000,
+  "workers": 2,
+  "open": [
+    {
+      "host": "45.33.32.156",
+      "port": 22,
+      "state": "open",
+      "latency_ms": 324.383,
+      "confidence": 0.83,
+      "evidence": "handshake:ok(20%) banner:listener-verified(28%) stack:standard(15%) latency:324.4ms(20%)"
+    },
+    {
+      "host": "45.33.32.156",
+      "port": 80,
+      "state": "open",
+      "latency_ms": 364.184,
+      "confidence": 0.83,
+      "evidence": "handshake:ok(20%) banner:listener-verified(28%) stack:standard(15%) latency:364.2ms(20%)"
+    }
+  ],
+  "defense": {
+    "45.33.32.156": {
+      "host": "45.33.32.156",
+      "defense_type": "direct_host",
+      "confidence": 1.0,
+      "summary": "Target behaves as a clean, direct endpoint with no detectable middlebox or tarpit interference.",
+      "indicators": [
+        "All 2 open port(s) (with 0 identified services) responded with standard TCP semantics"
+      ]
+    }
+  },
+  "summary": {
+    "open": 2,
+    "closed": 998,
+    "filtered": 0,
+    "silent": 0,
+    "unreachable": 0,
+    "error": 0
+  },
+  "elapsed_ms": 3619.658
+}
+
+--- STDERR ---
+

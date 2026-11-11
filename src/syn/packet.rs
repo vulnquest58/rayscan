@@ -171,6 +171,38 @@ pub fn build_ipv6_syn_packet(
     build_ipv6_tcp_packet(src_ip, dst_ip, src_port, dst_port, seq, &[])
 }
 
+/// Writes a 60-byte IPv6 SYN packet (no TCP options) into a caller-provided
+/// buffer, avoiding a heap allocation for every outgoing probe.
+pub fn write_ipv6_syn_packet_into(
+    packet: &mut [u8; 60],
+    src_ip: &Ipv6Addr,
+    dst_ip: &Ipv6Addr,
+    src_port: u16,
+    dst_port: u16,
+    seq: u32,
+) {
+    packet[0..4].fill(0);
+    packet[0] = 0x60;
+    packet[4..6].copy_from_slice(&20u16.to_be_bytes());
+    packet[6] = 6;
+    packet[7] = 64;
+    packet[8..24].copy_from_slice(&src_ip.octets());
+    packet[24..40].copy_from_slice(&dst_ip.octets());
+
+    let segment = &mut packet[40..];
+    segment[0..2].copy_from_slice(&src_port.to_be_bytes());
+    segment[2..4].copy_from_slice(&dst_port.to_be_bytes());
+    segment[4..8].copy_from_slice(&seq.to_be_bytes());
+    segment[8..12].fill(0);
+    segment[12] = 0x50; // Data offset 5 (20 bytes)
+    segment[13] = 0x02; // SYN
+    segment[14..16].copy_from_slice(&1024u16.to_be_bytes());
+    segment[16..18].fill(0);
+
+    let checksum = tcp6_checksum(src_ip, dst_ip, segment);
+    segment[16..18].copy_from_slice(&checksum.to_be_bytes());
+}
+
 /// Parsed IPv6/TCP response relevant to the raw SYN scanner.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParsedV6Frame {
@@ -246,7 +278,27 @@ pub fn build_syn_frame(
     seq: u32,
 ) -> [u8; 54] {
     let mut frame = [0u8; 54];
+    write_syn_frame(
+        &mut frame, src_mac, dst_mac, src_ip, dst_ip, src_port, dst_port, seq,
+    );
+    frame
+}
 
+/// Writes a 54-byte raw Ethernet/IPv4/TCP SYN frame into a caller-provided
+/// buffer, avoiding a heap allocation for every outgoing probe.
+///
+/// Header layout is identical to [`build_syn_frame`].
+#[expect(clippy::too_many_arguments)]
+pub fn write_syn_frame(
+    frame: &mut [u8; 54],
+    src_mac: &[u8; 6],
+    dst_mac: &[u8; 6],
+    src_ip: u32,
+    dst_ip: u32,
+    src_port: u16,
+    dst_port: u16,
+    seq: u32,
+) {
     // 1. Ethernet Header (bytes 0..14)
     frame[0..6].copy_from_slice(dst_mac);
     frame[6..12].copy_from_slice(src_mac);
@@ -280,8 +332,6 @@ pub fn build_syn_frame(
 
     let tcp_ck = tcp_checksum(src_ip, dst_ip, &frame[34..54]);
     frame[50..52].copy_from_slice(&tcp_ck.to_be_bytes());
-
-    frame
 }
 
 /// Split a raw Ethernet/IPv4/TCP SYN frame into IPv4 fragments.
@@ -434,6 +484,43 @@ pub fn parse_frame(data: &[u8]) -> ParsedFrame {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn write_syn_frame_matches_builder() {
+        let src_mac = [1u8, 2, 3, 4, 5, 6];
+        let dst_mac = [7u8, 8, 9, 10, 11, 12];
+        let built = build_syn_frame(
+            &src_mac,
+            &dst_mac,
+            0x0a000001,
+            0x0a000002,
+            61234,
+            80,
+            0x1234_5678,
+        );
+        let mut written = [0u8; 54];
+        write_syn_frame(
+            &mut written,
+            &src_mac,
+            &dst_mac,
+            0x0a000001,
+            0x0a000002,
+            61234,
+            80,
+            0x1234_5678,
+        );
+        assert_eq!(written, built);
+    }
+
+    #[test]
+    fn ipv6_write_variant_matches_builder() {
+        let src: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let dst: Ipv6Addr = "2001:db8::2".parse().unwrap();
+        let built = build_ipv6_syn_packet(&src, &dst, 61000, 443, 0x1234_5678);
+        let mut written = [0u8; 60];
+        write_ipv6_syn_packet_into(&mut written, &src, &dst, 61000, 443, 0x1234_5678);
+        assert_eq!(written.as_slice(), built.as_slice());
+    }
 
     #[test]
     fn test_build_and_parse_syn_ack() {

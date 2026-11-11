@@ -1,0 +1,82 @@
+# rc=0 wall=7.191
+--- STDOUT ---
+{
+  "target": "172.22.64.1",
+  "targets": 1,
+  "ports": 65535,
+  "jobs": 65535,
+  "workers": 2,
+  "open": [
+    {
+      "host": "172.22.64.1",
+      "port": 80,
+      "state": "open",
+      "latency_ms": 119.084,
+      "confidence": 0.83,
+      "evidence": "handshake:ok(20%) banner:listener-verified(28%) stack:standard(15%) latency:119.1ms(20%)"
+    },
+    {
+      "host": "172.22.64.1",
+      "port": 135,
+      "state": "open",
+      "latency_ms": 117.713,
+      "confidence": 0.85,
+      "evidence": "handshake:ok(20%) banner:binary-protocol(30%) stack:standard(15%) latency:117.7ms(20%)"
+    },
+    {
+      "host": "172.22.64.1",
+      "port": 139,
+      "state": "open",
+      "latency_ms": 131.321,
+      "confidence": 0.85,
+      "evidence": "handshake:ok(20%) banner:binary-protocol(30%) stack:standard(15%) latency:131.3ms(20%)"
+    },
+    {
+      "host": "172.22.64.1",
+      "port": 445,
+      "state": "open",
+      "latency_ms": 121.639,
+      "confidence": 0.85,
+      "evidence": "handshake:ok(20%) banner:binary-protocol(30%) stack:standard(15%) latency:121.6ms(20%)"
+    },
+    {
+      "host": "172.22.64.1",
+      "port": 2179,
+      "state": "open",
+      "latency_ms": 123.548,
+      "confidence": 0.83,
+      "evidence": "handshake:ok(20%) banner:listener-verified(28%) stack:standard(15%) latency:123.5ms(20%)"
+    },
+    {
+      "host": "172.22.64.1",
+      "port": 49668,
+      "state": "open",
+      "latency_ms": 121.405,
+      "confidence": 0.83,
+      "evidence": "handshake:ok(20%) banner:listener-verified(28%) stack:standard(15%) latency:121.4ms(20%)"
+    }
+  ],
+  "defense": {
+    "172.22.64.1": {
+      "host": "172.22.64.1",
+      "defense_type": "direct_host",
+      "confidence": 1.0,
+      "summary": "Target behaves as a clean, direct endpoint with no detectable middlebox or tarpit interference.",
+      "indicators": [
+        "All 6 open port(s) (with 0 identified services) responded with standard TCP semantics"
+      ]
+    }
+  },
+  "summary": {
+    "open": 6,
+    "closed": 0,
+    "filtered": 65529,
+    "silent": 0,
+    "unreachable": 0,
+    "error": 0
+  },
+  "elapsed_ms": 7042.683
+}
+
+--- STDERR ---
+

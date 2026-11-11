@@ -282,3 +282,322 @@ fn stealth_flag_runs_scan() {
     assert_eq!(payload["summary"]["open"], 1);
     server.stop();
 }
+
+#[test]
+fn scope_guard_blocks_unauthorized_target() {
+    let temp_dir = std::env::temp_dir();
+    let scope_path = temp_dir.join("test_scope_block.toml");
+    std::fs::write(
+        &scope_path,
+        r#"
+[scope]
+program = "Engagement Alpha"
+allow = ["10.0.0.0/8"]
+"#,
+    )
+    .expect("write scope");
+
+    let output = rayscan()
+        .args([
+            "scan",
+            "--target",
+            "127.0.0.1",
+            "--ports",
+            "80",
+            "--scope",
+            scope_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run rayscan scan");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("SCOPE VIOLATION"));
+    assert!(stderr.contains("Engagement Alpha"));
+
+    // Overriding with --force-out-of-scope succeeds
+    let override_output = rayscan()
+        .args([
+            "scan",
+            "--target",
+            "127.0.0.1",
+            "--ports",
+            "80",
+            "--scope",
+            scope_path.to_str().unwrap(),
+            "--force-out-of-scope",
+            "--json",
+            "--quiet",
+        ])
+        .output()
+        .expect("run rayscan scan");
+
+    assert!(override_output.status.success());
+    let _ = std::fs::remove_file(scope_path);
+}
+
+#[test]
+fn scope_guard_allows_authorized_target() {
+    let server = banner_server();
+    let port = server.port();
+    let temp_dir = std::env::temp_dir();
+    let scope_path = temp_dir.join("test_scope_allow.toml");
+    std::fs::write(
+        &scope_path,
+        r#"
+[scope]
+program = "Localhost Lab"
+allow = ["127.0.0.0/8"]
+"#,
+    )
+    .expect("write scope");
+
+    let output = rayscan()
+        .args([
+            "scan",
+            "--target",
+            "127.0.0.1",
+            "--ports",
+            &port.to_string(),
+            "--scope",
+            scope_path.to_str().unwrap(),
+            "--json",
+            "--quiet",
+        ])
+        .output()
+        .expect("run rayscan scan");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let payload: Value = serde_json::from_slice(&output.stdout).expect("valid JSON output");
+    assert_eq!(payload["open"][0]["port"], port);
+    let _ = std::fs::remove_file(scope_path);
+    server.stop();
+}
+
+#[test]
+fn scope_guard_checks_domains_from_target_files() {
+    let temp_dir = std::env::temp_dir();
+    let scope_path = temp_dir.join("test_scope_file.toml");
+    let targets_path = temp_dir.join("test_scope_targets.txt");
+    std::fs::write(
+        &scope_path,
+        r#"
+[scope]
+program = "File Scope"
+allow = ["127.0.0.0/8"]
+deny = ["localhost"]
+"#,
+    )
+    .expect("write scope");
+    std::fs::write(&targets_path, "localhost\n").expect("write targets");
+
+    let output = rayscan()
+        .args([
+            "scan",
+            "--target-file",
+            targets_path.to_str().unwrap(),
+            "--ports",
+            "80",
+            "--scope",
+            scope_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run rayscan scan");
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("SCOPE VIOLATION"));
+    let _ = std::fs::remove_file(scope_path);
+    let _ = std::fs::remove_file(targets_path);
+}
+
+#[test]
+fn stream_flag_emits_jsonl_records() {
+    let server = banner_server();
+    let port = server.port();
+    let output = rayscan()
+        .args([
+            "scan",
+            "--target",
+            "127.0.0.1",
+            "--ports",
+            &port.to_string(),
+            "--stream",
+        ])
+        .output()
+        .expect("run rayscan scan");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut found_port = false;
+    for line in stdout.lines() {
+        if let Ok(parsed) = serde_json::from_str::<Value>(line)
+            && parsed["port"] == port
+            && parsed["state"] == "open"
+        {
+            found_port = true;
+            break;
+        }
+    }
+    assert!(
+        found_port,
+        "Stream output must contain line-by-line JSON with port {port}: {stdout}"
+    );
+    server.stop();
+}
+
+#[test]
+fn host_port_format_lists_open_ports_for_pipelines() {
+    let server = banner_server();
+    let port = server.port();
+    let output = rayscan()
+        .args([
+            "scan",
+            "--target",
+            "127.0.0.1",
+            "--ports",
+            &port.to_string(),
+            "--format",
+            "host-port",
+            "--timeout",
+            "1",
+            "--quiet",
+        ])
+        .output()
+        .expect("run rayscan scan");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        format!("127.0.0.1:{port}")
+    );
+    server.stop();
+}
+
+#[test]
+fn exclude_ports_rejects_removing_the_entire_scan() {
+    let server = banner_server();
+    let port = server.port();
+    let output = rayscan()
+        .args([
+            "scan",
+            "--target",
+            "127.0.0.1",
+            "--ports",
+            &port.to_string(),
+            "--exclude-ports",
+            &port.to_string(),
+            "--quiet",
+        ])
+        .output()
+        .expect("run rayscan scan");
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--exclude-ports removed every port"));
+    server.stop();
+}
+
+#[test]
+fn baseline_alerts_and_fail_on_change_drive_monitoring() {
+    let server = banner_server();
+    let port = server.port();
+    let dir = std::env::temp_dir().join(format!("rayscan-monitor-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create test directory");
+    let baseline = dir.join("baseline.json");
+    let alert = dir.join("alert.txt");
+
+    let first = rayscan()
+        .args([
+            "scan",
+            "--target",
+            "127.0.0.1",
+            "--ports",
+            &port.to_string(),
+            "--save-baseline",
+            baseline.to_str().expect("baseline path"),
+            "--json",
+            "--timeout",
+            "1",
+            "--quiet",
+        ])
+        .output()
+        .expect("run baseline scan");
+    assert!(
+        first.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert!(baseline.exists(), "baseline file must be written");
+
+    let second = rayscan()
+        .args([
+            "scan",
+            "--target",
+            "127.0.0.1",
+            "--ports",
+            &port.to_string(),
+            "--diff",
+            baseline.to_str().expect("baseline path"),
+            "--fail-on-change",
+            "--alert-file",
+            alert.to_str().expect("alert path"),
+            "--quiet",
+        ])
+        .output()
+        .expect("run unchanged scan");
+    assert!(
+        second.status.success(),
+        "no changes must exit 0; stderr: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let unchanged = std::fs::read_to_string(&alert).expect("alert file");
+    assert!(unchanged.contains("status: no changes"));
+
+    let mut payload: Value =
+        serde_json::from_str(&std::fs::read_to_string(&baseline).expect("read baseline"))
+            .expect("baseline JSON");
+    payload["open"] = serde_json::json!([]);
+    if payload.get("results").is_some() {
+        payload["results"] = serde_json::json!([]);
+    }
+    std::fs::write(
+        &baseline,
+        serde_json::to_string_pretty(&payload).expect("encode baseline"),
+    )
+    .expect("rewrite baseline");
+
+    let third = rayscan()
+        .args([
+            "scan",
+            "--target",
+            "127.0.0.1",
+            "--ports",
+            &port.to_string(),
+            "--diff",
+            baseline.to_str().expect("baseline path"),
+            "--fail-on-change",
+            "--alert-file",
+            alert.to_str().expect("alert path"),
+            "--quiet",
+        ])
+        .output()
+        .expect("run changed scan");
+    assert_eq!(third.status.code(), Some(1));
+    let changed = std::fs::read_to_string(&alert).expect("alert file");
+    assert!(changed.contains("status: changes detected"));
+    assert!(changed.contains(&format!("[+] NEW 127.0.0.1:{port}")));
+
+    let _ = std::fs::remove_dir_all(&dir);
+    server.stop();
+}

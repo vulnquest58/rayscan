@@ -1,0 +1,22 @@
+{
+  "rayscan_conn_full": {
+    "wall": 341.994,
+    "rc": 0,
+    "opens": []
+  },
+  "nmap_sT_full": {
+    "wall": 900.057,
+    "rc": "TIMEOUT(900)",
+    "opens": []
+  },
+  "rayscan_conn_light": {
+    "wall": 6.155,
+    "rc": 0,
+    "opens": []
+  },
+  "nmap_sT_light": {
+    "wall": 101.162,
+    "rc": 0,
+    "opens": []
+  }
+}

@@ -7,7 +7,7 @@
 //! supported for FTP, SMTP, POP3, and IMAP.
 
 use std::io::{Read, Write};
-use std::net::{IpAddr, SocketAddr, TcpStream};
+use std::net::{IpAddr, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -20,6 +20,7 @@ use rustls::{ClientConfig, ClientConnection, DigitallySignedStruct, SignatureSch
 use x509_parser::extensions::GeneralName;
 use x509_parser::prelude::*;
 
+use crate::discovery::socket_addr;
 use crate::model::{PortResult, PortState, ScanReport};
 use crate::service::ServiceInfo;
 
@@ -69,6 +70,30 @@ pub fn probe_for(port: u16, mode: TlsMode) -> Option<TlsProbe> {
     (mode == TlsMode::Force).then_some(TlsProbe::Direct)
 }
 
+/// Decide whether an observed result should be inspected and how.
+///
+/// In `Auto` mode a non-standard port whose banner already looks like TLS, or
+/// whose service could not be identified at all, is inspected too: HTTPS and
+/// other TLS services on arbitrary ports are common outside the well-known
+/// list, and an unidentified open port is a cheap candidate.
+pub fn probe_for_result(port: u16, service_name: Option<&str>, mode: TlsMode) -> Option<TlsProbe> {
+    if mode == TlsMode::Disabled {
+        return None;
+    }
+    if let Some(probe) = probe_for(port, mode) {
+        return Some(probe);
+    }
+    match mode {
+        TlsMode::Force => Some(TlsProbe::Direct),
+        TlsMode::Auto if port == crate::rdp::RDP_PORT => None,
+        TlsMode::Auto => match service_name {
+            Some("tls") | None => Some(TlsProbe::Direct),
+            _ => None,
+        },
+        TlsMode::Disabled => None,
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct TlsInfo {
     pub version: String,
@@ -111,7 +136,7 @@ pub async fn apply(
         .results
         .iter()
         .enumerate()
-        .filter(|(_, result)| result.state == PortState::Open)
+        .filter(|(_, result)| result.state == PortState::Open || result.reset_during_verification())
         .filter(|(_, result)| {
             !result
                 .service
@@ -119,7 +144,12 @@ pub async fn apply(
                 .is_some_and(|service| service.name.starts_with("udp:"))
         })
         .filter_map(|(index, result)| {
-            probe_for(result.port, mode).map(|probe| (index, result.host, result.port, probe))
+            probe_for_result(
+                result.port,
+                result.service.as_ref().map(|service| service.name.as_str()),
+                mode,
+            )
+            .map(|probe| (index, result.host, result.port, probe))
         })
         .collect();
     if candidates.is_empty() {
@@ -127,7 +157,7 @@ pub async fn apply(
     }
 
     if !quiet {
-        eprintln!("[tls] inspecting {} open port(s) …", candidates.len());
+        eprintln!("[tls] inspecting {} candidate port(s) …", candidates.len());
     }
 
     let mut inspected = Vec::new();
@@ -138,7 +168,7 @@ pub async fn apply(
         }
         while let Some(joined) = tasks.join_next().await {
             match joined {
-                Ok((index, Some(info))) => inspected.push((index, info)),
+                Ok((index, Some(outcome))) => inspected.push((index, outcome)),
                 Ok((_, None)) => {}
                 Err(error) => {
                     if !quiet {
@@ -150,9 +180,18 @@ pub async fn apply(
     }
 
     let matched = inspected.len();
-    for (index, info) in inspected {
+    for (index, outcome) in inspected {
         if let Some(result) = report.results.get_mut(index) {
-            annotate(result, info);
+            let was_reset = result.state == PortState::Closed;
+            if was_reset {
+                result.detail = None;
+            }
+            annotate(result, outcome);
+            if was_reset {
+                result.state = PortState::Open;
+                report.counts.remove(PortState::Closed);
+                report.counts.add(PortState::Open);
+            }
         }
     }
 
@@ -162,17 +201,27 @@ pub async fn apply(
     matched
 }
 
-fn annotate(result: &mut PortResult, info: TlsInfo) {
+fn annotate(result: &mut PortResult, outcome: TlsOutcome) {
+    let TlsOutcome { info, https } = outcome;
+    let has_https = https.is_some();
     let default_name = service_name(result.port, info.starttls.as_deref());
-    let should_replace = result
-        .service
-        .as_ref()
-        .is_none_or(|service| service.name == "tls" || service.name.is_empty());
+    let should_replace = result.service.as_ref().is_none_or(|service| {
+        service.name == "tls" || service.name.is_empty() || (has_https && service.name == "http")
+    });
     if should_replace {
-        result.service = Some(ServiceInfo {
-            name: default_name.to_string(),
-            product: None,
-            version: None,
+        result.service = Some(match https.and_then(|detection| detection.service) {
+            Some(service) => ServiceInfo {
+                name: "https".to_string(),
+                product: service.product,
+                version: service.version,
+                confidence: service.confidence,
+            },
+            None => ServiceInfo {
+                name: default_name.to_string(),
+                product: None,
+                version: None,
+                confidence: None,
+            },
         });
     }
     if result.banner.is_none() {
@@ -219,12 +268,17 @@ fn service_name(port: u16, starttls: Option<&str>) -> &'static str {
     }
 }
 
+pub struct TlsOutcome {
+    info: TlsInfo,
+    https: Option<crate::service::Detection>,
+}
+
 pub async fn inspect(
     host: IpAddr,
     port: u16,
     timeout: Duration,
     probe: TlsProbe,
-) -> Option<TlsInfo> {
+) -> Option<TlsOutcome> {
     tokio::task::spawn_blocking(move || inspect_blocking(host, port, timeout, probe))
         .await
         .ok()
@@ -236,19 +290,76 @@ fn inspect_blocking(
     port: u16,
     timeout: Duration,
     probe: TlsProbe,
-) -> Option<TlsInfo> {
+) -> Option<TlsOutcome> {
     let stream = connect(host, port, timeout)?;
     match probe {
-        TlsProbe::Direct => handshake(stream, host, timeout, None),
+        TlsProbe::Direct => {
+            let (info, mut connection, mut stream) = handshake(stream, host, timeout, None)?;
+            let https = https_identity(&mut connection, &mut stream, host, port, timeout);
+            Some(TlsOutcome { info, https })
+        }
         TlsProbe::StartTls(protocol) => {
             let stream = negotiate_starttls(stream, protocol, timeout)?;
             handshake(stream, host, timeout, Some(protocol))
+                .map(|(info, _, _)| TlsOutcome { info, https: None })
         }
     }
 }
 
+/// Fetch an HTTP response over the completed TLS session so HTTPS virtual
+/// hosts can be identified with the same fingerprints as plain HTTP.
+fn https_identity(
+    connection: &mut ClientConnection,
+    stream: &mut TcpStream,
+    host: IpAddr,
+    port: u16,
+    timeout: Duration,
+) -> Option<crate::service::Detection> {
+    connection
+        .writer()
+        .write_all(&crate::service::http_probe(host))
+        .ok()?;
+    let deadline = std::time::Instant::now() + timeout.min(Duration::from_millis(700));
+    let mut data = Vec::new();
+    let mut buffer = [0u8; 1024];
+
+    loop {
+        loop {
+            match connection.reader().read(&mut buffer) {
+                Ok(0) => break,
+                Ok(read) => {
+                    data.extend_from_slice(&buffer[..read]);
+                    if data.len() >= 1024 {
+                        break;
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(_) => break,
+            }
+        }
+        if data.len() >= 1024 || std::time::Instant::now() >= deadline {
+            break;
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let _ = stream.set_read_timeout(Some(remaining));
+        if connection.complete_io(stream).is_err() {
+            break;
+        }
+    }
+
+    if data.is_empty() {
+        return None;
+    }
+    let detection = crate::service::inspect(port, &data);
+    detection
+        .service
+        .as_ref()
+        .is_some_and(|service| service.name == "http")
+        .then_some(detection)
+}
+
 fn connect(host: IpAddr, port: u16, timeout: Duration) -> Option<TcpStream> {
-    let address = SocketAddr::new(host, port);
+    let address = socket_addr(host, port);
     let stream = TcpStream::connect_timeout(&address, timeout).ok()?;
     let _ = stream.set_nodelay(true);
     let _ = stream.set_read_timeout(Some(timeout));
@@ -425,7 +536,7 @@ fn handshake(
     host: IpAddr,
     timeout: Duration,
     starttls: Option<&str>,
-) -> Option<TlsInfo> {
+) -> Option<(TlsInfo, ClientConnection, TcpStream)> {
     let _ = stream.set_read_timeout(Some(timeout));
     let _ = stream.set_write_timeout(Some(timeout));
 
@@ -460,7 +571,11 @@ fn handshake(
         .map(|suite| format!("{:?}", suite.suite()))
         .unwrap_or_else(|| "unknown".to_string());
     let chain = capture.chain.lock().unwrap().clone();
-    Some(parse_info(host, &version, &cipher, &chain, starttls))
+    Some((
+        parse_info(host, &version, &cipher, &chain, starttls),
+        connection,
+        stream,
+    ))
 }
 
 fn format_version(version: rustls::ProtocolVersion) -> String {
@@ -589,6 +704,59 @@ pub fn dns_name_matches(pattern: &str, host: &str) -> bool {
 mod tests {
     use super::*;
 
+    fn tls_info() -> TlsInfo {
+        TlsInfo {
+            version: "TLSv1.3".to_string(),
+            cipher: "TLS13_AES_256_GCM_SHA384".to_string(),
+            subject: None,
+            issuer: None,
+            san: Vec::new(),
+            serial: None,
+            not_before: None,
+            not_after: None,
+            days_remaining: None,
+            expired: false,
+            not_yet_valid: false,
+            self_signed: true,
+            hostname_matches: false,
+            chain_len: 1,
+            starttls: None,
+        }
+    }
+
+    #[test]
+    fn https_identity_replaces_generic_http_on_tls_ports() {
+        let mut result = PortResult::new(
+            "127.0.0.1".parse().unwrap(),
+            4443,
+            PortState::Open,
+            Duration::ZERO,
+        );
+        let detection = crate::service::Detection {
+            service: Some(ServiceInfo {
+                name: "http".to_string(),
+                product: Some("Jenkins".to_string()),
+                version: Some("2.426.1".to_string()),
+                confidence: Some(0.98),
+            }),
+            banner: None,
+        };
+
+        annotate(
+            &mut result,
+            TlsOutcome {
+                info: tls_info(),
+                https: Some(detection),
+            },
+        );
+
+        let service = result.service.unwrap();
+        assert_eq!(service.name, "https");
+        assert_eq!(service.product.as_deref(), Some("Jenkins"));
+        assert_eq!(service.version.as_deref(), Some("2.426.1"));
+        assert_eq!(service.confidence, Some(0.98));
+    }
+
     #[test]
     fn probe_plan_selects_known_ports_and_force_mode() {
         assert_eq!(probe_for(443, TlsMode::Auto), Some(TlsProbe::Direct));
@@ -599,6 +767,25 @@ mod tests {
         assert_eq!(probe_for(8080, TlsMode::Auto), None);
         assert_eq!(probe_for(8080, TlsMode::Force), Some(TlsProbe::Direct));
         assert_eq!(probe_for(443, TlsMode::Disabled), None);
+    }
+
+    #[test]
+    fn auto_mode_inspects_tls_banners_on_non_standard_ports() {
+        assert_eq!(
+            probe_for_result(8080, Some("tls"), TlsMode::Auto),
+            Some(TlsProbe::Direct)
+        );
+        assert_eq!(probe_for_result(8080, Some("http"), TlsMode::Auto), None);
+        assert_eq!(probe_for_result(8080, Some("tls"), TlsMode::Disabled), None);
+        assert_eq!(
+            probe_for_result(443, Some("http"), TlsMode::Auto),
+            Some(TlsProbe::Direct)
+        );
+        assert_eq!(
+            probe_for_result(4443, None, TlsMode::Auto),
+            Some(TlsProbe::Direct)
+        );
+        assert_eq!(probe_for_result(8080, None, TlsMode::Disabled), None);
     }
 
     #[test]

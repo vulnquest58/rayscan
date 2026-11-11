@@ -1,0 +1,6 @@
+# rc=28 wall=8.012
+--- STDOUT ---
+000
+--- STDERR ---
+curl: (28) Connection timed out after 8001 milliseconds
+

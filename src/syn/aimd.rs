@@ -97,6 +97,16 @@ impl AimdController {
             return self.rate_pps();
         }
 
+        // A silent path answers nothing regardless of the transmit rate: sub
+        // 1-percent response samples carry no congestion signal and a decrease
+        // would just stall the scan (firewalls and NATs commonly drop RST
+        // replies).  Freeze the rate instead; partial responses still feed the
+        // regular AIMD logic.
+        let ratio = (received as f64) / (sent as f64);
+        if ratio < 0.01 {
+            return self.rate_pps();
+        }
+
         let ratio = (received as f64) / (sent as f64);
         self.ema_ratio = self.cfg.ema_alpha * ratio + (1.0 - self.cfg.ema_alpha) * self.ema_ratio;
 
@@ -158,11 +168,20 @@ mod tests {
     }
 
     #[test]
+    fn zero_received_freezes_rate() {
+        let mut ctrl = controller(1000);
+        // A silent path is not congestion evidence; keep the configured rate.
+        ctrl.update(1000, 0);
+        ctrl.update(4096, 1);
+        assert_eq!(ctrl.rate_pps(), 1000);
+    }
+
+    #[test]
     fn rate_clamps_to_min() {
         let mut ctrl = controller(200);
-        // Force several decreases
+        // Force several decreases with heavy partial loss
         for _ in 0..10 {
-            ctrl.update(100, 0);
+            ctrl.update(100, 1);
         }
         assert_eq!(ctrl.rate_pps(), 100, "must not go below min_pps");
     }

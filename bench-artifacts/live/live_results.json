@@ -1,0 +1,36 @@
+{
+  "meta": {
+    "scanme_ip": "45.33.32.156",
+    "hackertarget_ip": "",
+    "rate_cap_pps": 3000,
+    "started": "2026-11-09T22:19:32+0100",
+    "finished": "2026-11-09T22:45:45+0100"
+  },
+  "results": {
+    "rayscan_raw_full": {
+      "wall": 226.769,
+      "rc": 0,
+      "opens": []
+    },
+    "nmap_sS_full": {
+      "wall": 900.137,
+      "rc": "TIMEOUT(900)",
+      "opens": []
+    },
+    "masscan_full": {
+      "wall": 300.053,
+      "rc": "TIMEOUT(300)",
+      "opens": []
+    },
+    "rayscan_verified_full": {
+      "wall": 27.828,
+      "rc": 0,
+      "opens": []
+    },
+    "rustscan_full": {
+      "wall": 58.026,
+      "rc": 0,
+      "opens": []
+    }
+  }
+}

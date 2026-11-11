@@ -1,0 +1,2 @@
+Starting Nmap 7.80 ( https://nmap.org ) at 2026-11-09 19:34 CET
+Nmap done: 1 IP address (1 host up) scanned in 95.98 seconds

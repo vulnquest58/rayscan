@@ -6,14 +6,53 @@
 //! connection refusal still proves the host is alive, so firewalled hosts
 //! with reachable closed ports are discovered without raw privileges.
 
-use std::collections::HashSet;
-use std::net::{IpAddr, SocketAddr};
+use std::collections::{HashMap, HashSet};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr, SocketAddrV6};
+#[cfg(target_os = "linux")]
+use std::process::Command;
+use std::sync::{OnceLock, RwLock};
 use std::time::Duration;
+#[cfg(target_os = "linux")]
+use std::time::Instant;
 
 use tokio::net::TcpStream;
 use tokio::task::JoinSet;
 
 pub const TCP_PING_PORTS: [u16; 7] = [80, 443, 22, 445, 3389, 8080, 53];
+
+static IPV6_SCOPE_IDS: OnceLock<RwLock<HashMap<Ipv6Addr, u32>>> = OnceLock::new();
+
+fn scope_ids() -> &'static RwLock<HashMap<Ipv6Addr, u32>> {
+    IPV6_SCOPE_IDS.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn register_scope_id(address: Ipv6Addr, index: u32) {
+    if index == 0 || !is_link_local(address) {
+        return;
+    }
+    if let Ok(mut scopes) = scope_ids().write() {
+        scopes.insert(address, index);
+    }
+}
+
+/// Build a socket address, attaching an interface scope for link-local IPv6
+/// targets discovered through NDP.
+pub fn socket_addr(host: IpAddr, port: u16) -> SocketAddr {
+    if let IpAddr::V6(address) = host
+        && is_link_local(address)
+        && let Ok(scopes) = scope_ids().read()
+        && let Some(index) = scopes.get(&address)
+    {
+        return SocketAddr::V6(SocketAddrV6::new(address, port, 0, *index));
+    }
+    SocketAddr::new(host, port)
+}
+
+fn is_link_local(address: Ipv6Addr) -> bool {
+    let octets = address.octets();
+    octets[0] == 0xfe && octets[1] & 0xc0 == 0x80
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct DiscoveryOptions {
@@ -44,8 +83,12 @@ async fn sweep_ports(targets: &[IpAddr], options: DiscoveryOptions, ports: &[u16
 
     #[cfg(target_os = "linux")]
     let raw_icmp = raw_icmp_available();
+    #[cfg(target_os = "linux")]
+    let raw_icmp_v6 = raw_icmpv6_available();
     #[cfg(not(target_os = "linux"))]
     let raw_icmp = false;
+    #[cfg(not(target_os = "linux"))]
+    let raw_icmp_v6 = false;
 
     let ports = ports.to_vec();
     let mut alive = HashSet::new();
@@ -57,6 +100,13 @@ async fn sweep_ports(targets: &[IpAddr], options: DiscoveryOptions, ports: &[u16
                 let discovered = if raw_icmp && host.is_ipv4() {
                     let raw = tokio::task::spawn_blocking(move || {
                         host_responds_to_icmp(host, options.count, options.timeout)
+                    })
+                    .await
+                    .unwrap_or(false);
+                    raw || tcp_ping(host, options.count, options.timeout, &ports).await
+                } else if raw_icmp_v6 && host.is_ipv6() {
+                    let raw = tokio::task::spawn_blocking(move || {
+                        host_responds_to_icmpv6(host, options.count, options.timeout)
                     })
                     .await
                     .unwrap_or(false);
@@ -84,7 +134,7 @@ async fn sweep_ports(targets: &[IpAddr], options: DiscoveryOptions, ports: &[u16
 async fn tcp_ping(host: IpAddr, count: u8, timeout: Duration, ports: &[u16]) -> bool {
     for _ in 0..count.max(1) {
         for &port in ports {
-            let address = SocketAddr::new(host, port);
+            let address = socket_addr(host, port);
             match tokio::time::timeout(timeout, TcpStream::connect(address)).await {
                 Ok(Ok(stream)) => {
                     drop(stream);
@@ -115,6 +165,18 @@ fn raw_icmp_available() -> bool {
         return false;
     }
     // SAFETY: fd is a valid owned socket.
+    unsafe {
+        libc::close(fd);
+    }
+    true
+}
+
+#[cfg(target_os = "linux")]
+fn raw_icmpv6_available() -> bool {
+    let fd = unsafe { libc::socket(libc::AF_INET6, libc::SOCK_RAW, libc::IPPROTO_ICMPV6) };
+    if fd < 0 {
+        return false;
+    }
     unsafe {
         libc::close(fd);
     }
@@ -212,9 +274,437 @@ fn host_responds_to_icmp(host: IpAddr, count: u8, timeout: Duration) -> bool {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn host_responds_to_icmpv6(host: IpAddr, count: u8, timeout: Duration) -> bool {
+    let IpAddr::V6(address) = host else {
+        return false;
+    };
+
+    unsafe {
+        let fd = libc::socket(libc::AF_INET6, libc::SOCK_RAW, libc::IPPROTO_ICMPV6);
+        if fd < 0 {
+            return false;
+        }
+
+        let timeval = libc::timeval {
+            tv_sec: timeout.as_secs() as _,
+            tv_usec: timeout.subsec_micros() as _,
+        };
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVTIMEO,
+            &timeval as *const libc::timeval as *const libc::c_void,
+            std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+        );
+
+        let mut destination: libc::sockaddr_in6 = std::mem::zeroed();
+        destination.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+        destination.sin6_port = 0;
+        destination.sin6_addr.s6_addr = address.octets();
+
+        let id = std::process::id() as u16;
+        let mut answered = false;
+
+        'probe: for sequence in 0..u32::from(count.max(1)) {
+            let mut packet = [0_u8; 8];
+            packet[0] = 128; // ICMPv6 echo request
+            packet[4..6].copy_from_slice(&id.to_be_bytes());
+            packet[6..8].copy_from_slice(&(sequence as u16).to_be_bytes());
+
+            let sent = libc::sendto(
+                fd,
+                packet.as_ptr() as *const libc::c_void,
+                packet.len(),
+                0,
+                &destination as *const libc::sockaddr_in6 as *const libc::sockaddr,
+                std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+            );
+            if sent < 0 {
+                break;
+            }
+
+            let mut buffer = [0_u8; 1500];
+            loop {
+                let mut source: libc::sockaddr_in6 = std::mem::zeroed();
+                let mut source_len = std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t;
+                let read = libc::recvfrom(
+                    fd,
+                    buffer.as_mut_ptr() as *mut libc::c_void,
+                    buffer.len(),
+                    0,
+                    &mut source as *mut libc::sockaddr_in6 as *mut libc::sockaddr,
+                    &mut source_len,
+                );
+                if read <= 0 {
+                    break;
+                }
+                if read < 8 || buffer[0] != 129 {
+                    continue;
+                }
+                let reply_id = u16::from_be_bytes([buffer[4], buffer[5]]);
+                let reply_seq = u16::from_be_bytes([buffer[6], buffer[7]]);
+                if reply_id == id && reply_seq == sequence as u16 {
+                    answered = true;
+                    break 'probe;
+                }
+            }
+        }
+
+        libc::close(fd);
+        answered
+    }
+}
+
 #[cfg(not(target_os = "linux"))]
 fn host_responds_to_icmp(_host: IpAddr, _count: u8, _timeout: Duration) -> bool {
     false
+}
+
+#[cfg(not(target_os = "linux"))]
+fn host_responds_to_icmpv6(_host: IpAddr, _count: u8, _timeout: Duration) -> bool {
+    false
+}
+
+/// Parse Linux `/proc/net/ipv6_route` content to extract verified 128-bit IPv6 host routes.
+pub fn parse_ipv6_route_content(content: &str) -> Vec<Ipv6Addr> {
+    let mut addrs = Vec::new();
+    for line in content.lines() {
+        let mut parts = line.split_whitespace();
+        let Some(dst_hex) = parts.next() else {
+            continue;
+        };
+        let Some(prefix_hex) = parts.next() else {
+            continue;
+        };
+        if prefix_hex != "80" || dst_hex.len() != 32 {
+            continue;
+        }
+        let mut bytes = [0u8; 16];
+        let mut valid = true;
+        for i in 0..16 {
+            if let Ok(byte) = u8::from_str_radix(&dst_hex[i * 2..i * 2 + 2], 16) {
+                bytes[i] = byte;
+            } else {
+                valid = false;
+                break;
+            }
+        }
+        if !valid {
+            continue;
+        }
+        let addr = Ipv6Addr::from(bytes);
+        if !addr.is_loopback() && !addr.is_unspecified() && !addr.is_multicast() {
+            addrs.push(addr);
+        }
+    }
+    addrs
+}
+
+/// One IPv6 address configured on a local interface.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Ipv6Interface {
+    pub name: String,
+    pub index: u32,
+    pub address: Ipv6Addr,
+    pub scope: u8,
+}
+
+/// Parse Linux `/proc/net/if_inet6` into usable local IPv6 interfaces.
+///
+/// Each line contains the address, interface index, prefix length, scope,
+/// flags, and interface name. Loopback and host-local entries are skipped.
+pub fn parse_proc_ipv6_interfaces(content: &str) -> Vec<Ipv6Interface> {
+    let mut interfaces = Vec::new();
+    for line in content.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 6 {
+            continue;
+        }
+        let Some(address) = parse_ipv6_hex(fields[0]) else {
+            continue;
+        };
+        let Ok(index) = u32::from_str_radix(fields[1], 16) else {
+            continue;
+        };
+        let Ok(scope) = u8::from_str_radix(fields[3], 16) else {
+            continue;
+        };
+        let name = fields[5].to_string();
+        if name == "lo"
+            || scope == 0x10
+            || address.is_multicast()
+            || address.is_unspecified()
+            || address.is_loopback()
+        {
+            continue;
+        }
+        interfaces.push(Ipv6Interface {
+            name,
+            index,
+            address,
+            scope,
+        });
+    }
+    interfaces
+}
+
+/// Parse `ip -6 neigh show` (or `/proc/net/ndisc_cache`) output.
+pub fn parse_ipv6_neighbors(content: &str) -> Vec<Ipv6Addr> {
+    let mut neighbors = HashSet::new();
+    for (address, _) in parse_ipv6_neighbor_entries(content) {
+        neighbors.insert(address);
+    }
+    neighbors.into_iter().collect()
+}
+
+fn parse_ipv6_neighbor_entries(content: &str) -> Vec<(Ipv6Addr, Option<String>)> {
+    let mut neighbors = Vec::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let upper = line.to_ascii_uppercase();
+        if upper.contains("FAILED") || upper.contains("INCOMPLETE") {
+            continue;
+        }
+        let mut fields = line.split_whitespace();
+        let Some(first) = fields.next() else {
+            continue;
+        };
+        let first = first.trim_end_matches(',');
+        let Ok(address) = first.parse::<Ipv6Addr>() else {
+            continue;
+        };
+        if address.is_loopback() || address.is_unspecified() || address.is_multicast() {
+            continue;
+        }
+        let interface = fields
+            .clone()
+            .position(|field| field == "dev")
+            .and_then(|index| fields.nth(index + 1))
+            .map(str::to_string);
+        neighbors.push((address, interface));
+    }
+    neighbors
+}
+
+/// Whether NDP discovery is available on this platform.
+pub const fn ndp_supported() -> bool {
+    cfg!(target_os = "linux")
+}
+
+/// Discover active local IPv6 neighbors via an ICMPv6 all-nodes multicast
+/// probe (`ff02::1`) plus the kernel neighbor and host-route tables.
+#[cfg(target_os = "linux")]
+pub fn discover_ipv6_multicast(timeout: Duration) -> Vec<IpAddr> {
+    let mut discovered = HashSet::new();
+    let mut local = HashSet::new();
+
+    let interfaces = std::fs::read_to_string("/proc/net/if_inet6")
+        .map(|content| parse_proc_ipv6_interfaces(&content))
+        .unwrap_or_default();
+    for interface in &interfaces {
+        local.insert(interface.address);
+    }
+    for address in probe_ipv6_all_nodes(&interfaces, timeout) {
+        discovered.insert(address);
+    }
+
+    for address in read_ipv6_neighbor_table(&interfaces) {
+        discovered.insert(address);
+    }
+
+    let mut addresses: Vec<IpAddr> = discovered
+        .into_iter()
+        .map(IpAddr::V6)
+        .filter(|address| match address {
+            IpAddr::V6(address) => {
+                !local.contains(address)
+                    && !address.is_loopback()
+                    && !address.is_unspecified()
+                    && !address.is_multicast()
+            }
+            IpAddr::V4(_) => false,
+        })
+        .collect();
+    addresses.sort();
+    addresses
+}
+
+#[cfg(target_os = "linux")]
+fn probe_ipv6_all_nodes(interfaces: &[Ipv6Interface], timeout: Duration) -> Vec<Ipv6Addr> {
+    let mut answered = HashSet::new();
+    if interfaces.is_empty() || timeout.is_zero() {
+        return Vec::new();
+    }
+
+    // SAFETY: creation and all following operations use an owned descriptor
+    // and fully initialized buffers.
+    unsafe {
+        let fd = libc::socket(libc::AF_INET6, libc::SOCK_RAW, libc::IPPROTO_ICMPV6);
+        if fd < 0 {
+            return Vec::new();
+        }
+
+        // The kernel computes the ICMPv6 checksum at offset 2 of the payload.
+        let checksum_offset: libc::c_int = 2;
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_IPV6,
+            libc::IPV6_CHECKSUM,
+            &checksum_offset as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+
+        let timeval = libc::timeval {
+            tv_sec: timeout.as_secs() as _,
+            tv_usec: timeout.subsec_micros() as _,
+        };
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVTIMEO,
+            &timeval as *const libc::timeval as *const libc::c_void,
+            std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+        );
+
+        let hops: libc::c_int = 1;
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_IPV6,
+            libc::IPV6_MULTICAST_HOPS,
+            &hops as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+
+        let mut destination: libc::sockaddr_in6 = std::mem::zeroed();
+        destination.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+        destination.sin6_addr.s6_addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1).octets();
+
+        let id = std::process::id() as u16;
+        let mut sequence = 0u16;
+        let mut sent_interfaces = HashSet::new();
+        for interface in interfaces {
+            if !sent_interfaces.insert(interface.index) {
+                continue;
+            }
+            let index = interface.index as libc::c_int;
+            if libc::setsockopt(
+                fd,
+                libc::IPPROTO_IPV6,
+                libc::IPV6_MULTICAST_IF,
+                &index as *const libc::c_int as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            ) != 0
+            {
+                continue;
+            }
+            destination.sin6_scope_id = interface.index;
+
+            sequence = sequence.wrapping_add(1);
+            let mut packet = [0_u8; 8];
+            packet[0] = 128; // ICMPv6 echo request
+            packet[4..6].copy_from_slice(&id.to_be_bytes());
+            packet[6..8].copy_from_slice(&sequence.to_be_bytes());
+            let _ = libc::sendto(
+                fd,
+                packet.as_ptr() as *const libc::c_void,
+                packet.len(),
+                0,
+                &destination as *const libc::sockaddr_in6 as *const libc::sockaddr,
+                std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+            );
+        }
+
+        let deadline = Instant::now() + timeout;
+        let mut buffer = [0_u8; 1500];
+        while Instant::now() < deadline {
+            let mut source: libc::sockaddr_in6 = std::mem::zeroed();
+            let mut source_len = std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t;
+            let read = libc::recvfrom(
+                fd,
+                buffer.as_mut_ptr() as *mut libc::c_void,
+                buffer.len(),
+                0,
+                &mut source as *mut libc::sockaddr_in6 as *mut libc::sockaddr,
+                &mut source_len,
+            );
+            if read <= 0 {
+                break;
+            }
+            if read >= 8 && buffer[0] == 129 {
+                let address = Ipv6Addr::from(source.sin6_addr.s6_addr);
+                if !address.is_loopback() && !address.is_unspecified() {
+                    if source.sin6_scope_id != 0 {
+                        register_scope_id(address, source.sin6_scope_id);
+                    }
+                    answered.insert(address);
+                }
+            }
+        }
+
+        libc::close(fd);
+    }
+
+    answered.into_iter().collect()
+}
+
+#[cfg(target_os = "linux")]
+fn read_ipv6_neighbor_table(interfaces: &[Ipv6Interface]) -> Vec<Ipv6Addr> {
+    let mut neighbors = HashSet::new();
+    let indices: HashMap<&str, u32> = interfaces
+        .iter()
+        .map(|interface| (interface.name.as_str(), interface.index))
+        .collect();
+    let fallback_index = (interfaces.len() == 1).then_some(interfaces[0].index);
+
+    if let Ok(output) = Command::new("ip").args(["-6", "neigh", "show"]).output()
+        && output.status.success()
+        && let Ok(content) = String::from_utf8(output.stdout)
+    {
+        for (address, interface) in parse_ipv6_neighbor_entries(&content) {
+            let index = interface
+                .as_deref()
+                .and_then(|name| indices.get(name).copied())
+                .or(fallback_index);
+            if let Some(index) = index {
+                register_scope_id(address, index);
+            }
+            neighbors.insert(address);
+        }
+    }
+
+    if let Ok(content) = std::fs::read_to_string("/proc/net/ndisc_cache") {
+        for (address, _) in parse_ipv6_neighbor_entries(&content) {
+            if let Some(index) = fallback_index {
+                register_scope_id(address, index);
+            }
+            neighbors.insert(address);
+        }
+    }
+    if let Ok(content) = std::fs::read_to_string("/proc/net/ipv6_route") {
+        neighbors.extend(parse_ipv6_route_content(&content));
+    }
+
+    neighbors.into_iter().collect()
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn discover_ipv6_multicast(_timeout: Duration) -> Vec<IpAddr> {
+    Vec::new()
+}
+
+fn parse_ipv6_hex(value: &str) -> Option<Ipv6Addr> {
+    if value.len() != 32 {
+        return None;
+    }
+    let mut bytes = [0u8; 16];
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).ok()?;
+    }
+    Some(Ipv6Addr::from(bytes))
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -237,6 +727,50 @@ fn checksum(data: &[u8]) -> u16 {
 mod tests {
     use super::*;
     use std::net::Ipv4Addr;
+
+    #[test]
+    fn parses_ipv6_interfaces_and_skips_loopback() {
+        let sample = "\
+            fe8000000000000002155dfffe6fc63d 02 40 20 80     eth0\n\
+            20010db8000000000000000000000042 02 40 00 80     eth0\n\
+            00000000000000000000000000000001 01 80 10 80       lo\n";
+        let interfaces = parse_proc_ipv6_interfaces(sample);
+        assert_eq!(interfaces.len(), 2);
+        assert_eq!(interfaces[0].name, "eth0");
+        assert_eq!(interfaces[0].index, 2);
+        assert_eq!(
+            interfaces[0].address,
+            "fe80::215:5dff:fe6f:c63d".parse::<Ipv6Addr>().unwrap()
+        );
+        assert_eq!(interfaces[1].scope, 0);
+    }
+
+    #[test]
+    fn scoped_socket_address_uses_registered_interface() {
+        let host: Ipv6Addr = "fe80::abcd".parse().unwrap();
+        register_scope_id(host, 42);
+        let address = socket_addr(IpAddr::V6(host), 443);
+        assert_eq!(address.port(), 443);
+        match address {
+            SocketAddr::V6(address) => assert_eq!(address.scope_id(), 42),
+            SocketAddr::V4(_) => panic!("expected an IPv6 socket address"),
+        }
+    }
+
+    #[test]
+    fn parses_neighbor_table_and_ignores_failed_entries() {
+        let sample = "\
+            fe80::1 dev eth0 lladdr 00:11:22:33:44:55 router REACHABLE\n\
+            fe80::2 dev eth0 lladdr 00:11:22:33:44:66 STALE\n\
+            fe80::3 dev eth0 FAILED\n\
+            2001:db8::5 dev eth0 lladdr 00:11:22:33:44:77 DELAY\n";
+        let mut neighbors = parse_ipv6_neighbors(sample);
+        neighbors.sort();
+        assert_eq!(neighbors.len(), 3);
+        assert_eq!(neighbors[0], "2001:db8::5".parse::<Ipv6Addr>().unwrap());
+        assert_eq!(neighbors[1], "fe80::1".parse::<Ipv6Addr>().unwrap());
+        assert_eq!(neighbors[2], "fe80::2".parse::<Ipv6Addr>().unwrap());
+    }
 
     #[test]
     fn checksum_matches_rfc1071_example() {
@@ -296,5 +830,19 @@ mod tests {
         )
         .await;
         assert_eq!(discovered, vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]);
+    }
+
+    #[test]
+    fn parses_ipv6_routes_from_proc_format() {
+        let sample = "fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000000000000000000000000000 00000100 00000001 00000000 00000001 eth0\n\
+00000000000000000000000000000001 80 00000000000000000000000000000000 00 00000000000000000000000000000000 ffffffff 00000001 00000000 00200200 lo\n\
+fe8000000000000002155dfffe6fcc55 80 00000000000000000000000000000000 00 00000000000000000000000000000000 00000000 00000002 00000000 80200001 eth0\n\
+ff000000000000000000000000000000 08 00000000000000000000000000000000 00 00000000000000000000000000000000 00000100 00000002 00000000 00000001 eth0\n";
+        let parsed = parse_ipv6_route_content(sample);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(
+            parsed[0],
+            "fe80::215:5dff:fe6f:cc55".parse::<Ipv6Addr>().unwrap()
+        );
     }
 }

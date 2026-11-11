@@ -29,6 +29,7 @@ use serde::Deserialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
+use crate::discovery::socket_addr;
 use crate::error::AppError;
 use crate::model::{PortResult, PortState};
 use crate::service::ServiceInfo;
@@ -260,6 +261,7 @@ impl Registry {
                     name: probe.service.clone(),
                     product: probe.product.clone(),
                     version: version.or_else(|| probe.version.clone()),
+                    confidence: None,
                 });
                 if !banner.is_empty() {
                     result.banner = Some(banner);
@@ -311,7 +313,7 @@ impl CompiledProbe {
             .timeout
             .unwrap_or(default_timeout)
             .clamp(Duration::from_millis(100), Duration::from_secs(10));
-        let connect = tokio::time::timeout(timeout, TcpStream::connect((host, port)))
+        let connect = tokio::time::timeout(timeout, TcpStream::connect(socket_addr(host, port)))
             .await
             .ok()?
             .ok()?;

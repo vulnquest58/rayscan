@@ -158,6 +158,8 @@ pub struct PortResult {
     pub advisories: Vec<crate::advisory::AdvisoryMatch>,
     /// TLS metadata captured during an optional post-scan handshake.
     pub tls: Option<crate::tls::TlsInfo>,
+    /// RDP NLA identity captured for Remote Desktop endpoints.
+    pub rdp: Option<crate::rdp::RdpInfo>,
 }
 
 impl PortResult {
@@ -174,12 +176,29 @@ impl PortResult {
             evidence: None,
             advisories: Vec::new(),
             tls: None,
+            rdp: None,
         }
     }
 
     pub fn with_evidence(mut self, evidence: impl Into<String>) -> Self {
         self.evidence = Some(evidence.into());
         self
+    }
+
+    /// True when verification completed a TCP handshake but the peer reset
+    /// after data was sent. Such ports are open but hostile to the plaintext
+    /// probe (common for TLS listeners on non-standard ports).
+    pub(crate) fn reset_during_verification(&self) -> bool {
+        if self.state != PortState::Closed {
+            return false;
+        }
+        self.detail.as_deref().is_some_and(|detail| {
+            let detail = detail.to_ascii_lowercase();
+            detail.contains("connection closed during verification")
+                && (detail.contains("reset")
+                    || detail.contains("broken pipe")
+                    || detail.contains("aborted"))
+        })
     }
 
     pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
@@ -200,6 +219,15 @@ impl PortResult {
     }
 }
 
+/// Per-host scan progress used to persist multi-target resume state.
+#[derive(Clone, Debug, Default)]
+pub struct HostProgress {
+    /// Ports probed against this host (every outcome).
+    pub ports_scanned: Vec<u16>,
+    /// State counts restricted to the probes above.
+    pub counts: StateCounts,
+}
+
 /// The complete scanner output, excluding presentation choices.
 #[derive(Clone, Debug)]
 pub struct ScanReport {
@@ -216,6 +244,9 @@ pub struct ScanReport {
     /// Ports actually probed by this scan.  Used to persist accurate resume
     /// state even when interrupted midway through a randomized scan.
     pub probed_ports: Vec<u16>,
+    /// Probe progress per host, keyed by host IP. Populated by the connect
+    /// scanner; enables per-target `--save-state`/`--resume` bookkeeping.
+    pub host_progress: HashMap<IpAddr, HostProgress>,
     /// True when the scan was interrupted (Ctrl-C) before all probes completed.
     /// Partial results are still valid but may be incomplete.
     pub partial: bool,

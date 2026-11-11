@@ -16,7 +16,9 @@ fn main() {
     };
 
     if let Err(error) = runtime.block_on(rayscan::run(cli)) {
-        eprintln!("rayscan: {error}");
+        if !error.is_silent() {
+            eprintln!("rayscan: {error}");
+        }
         std::process::exit(error.exit_code());
     }
 }

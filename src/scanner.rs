@@ -1,4 +1,5 @@
-use std::net::{IpAddr, SocketAddr};
+use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -11,9 +12,10 @@ use tokio::net::TcpStream;
 use tokio::task::JoinSet;
 
 use crate::classify::{Failure, FailureKind, classify_io_error, classify_kind};
+use crate::discovery::socket_addr;
 use crate::error::AppError;
 use crate::limits::worker_count;
-use crate::model::{PortResult, PortState, ScanReport, StateCounts, StateSet};
+use crate::model::{HostProgress, PortResult, PortState, ScanReport, StateCounts, StateSet};
 use crate::rate::RateLimiter;
 use crate::rtt::RttEstimator;
 use crate::service;
@@ -22,6 +24,10 @@ const MIN_CONNECT_TIMEOUT: Duration = Duration::from_millis(1_500);
 const SERVICE_BANNER_LIMIT: usize = 1024;
 const SERVICE_BANNER_IDLE: Duration = Duration::from_millis(50);
 const SERVICE_BANNER_GRACE: Duration = Duration::from_millis(100);
+/// How long to wait for a reply to the generic HTTP probe before trying the
+/// next protocol-native probe. Bounded so silent peers do not consume the
+/// whole probe timeout on the first probe.
+const SERVICE_BANNER_HTTP_WAIT: Duration = Duration::from_millis(300);
 /// Probes buffered per channel message.  Delivering every result as its own
 /// message costs a cross-thread wakeup per probe and capped scan throughput at
 /// roughly a third of the raw connect rate; batching trades a little buffering
@@ -79,11 +85,26 @@ pub struct ScanOptions {
     pub connect_only: bool,
     pub service_detection: bool,
     pub retain: StateSet,
+    /// Ports whose `Silent` results must be kept for post-scan identification
+    /// (for example RDP, which never sends an unsolicited banner).
+    pub retain_silent_ports: Vec<u16>,
+    /// Keep ports that completed a handshake but reset after the probe so TLS
+    /// inspection can decide whether they are an HTTPS listener.
+    pub retain_reset_closed: bool,
     /// Maximum random delay before each probe. Zero disables jitter.
     pub jitter: Duration,
     /// When set to `true` by an external signal handler, workers stop picking
     /// new jobs and the scan returns a partial report instead of an error.
     pub shutdown: Arc<AtomicBool>,
+}
+
+impl ScanOptions {
+    pub(crate) fn retains(&self, result: &PortResult) -> bool {
+        self.retain.contains(result.state)
+            || (result.state == PortState::Silent
+                && self.retain_silent_ports.contains(&result.port))
+            || (self.retain_reset_closed && result.reset_during_verification())
+    }
 }
 
 struct Shared {
@@ -150,12 +171,16 @@ pub async fn scan(
     let mut counts = StateCounts::default();
     let mut results = Vec::new();
     let mut probed_ports = Vec::new();
+    let mut host_progress: HashMap<IpAddr, HostProgress> = HashMap::new();
     while let Ok(batch) = receiver.recv().await {
         for result in batch {
             counts.add(result.state);
             probed_ports.push(result.port);
             let state = result.state;
-            let retained = options.retain.contains(result.state);
+            let host_entry = host_progress.entry(result.host).or_default();
+            host_entry.ports_scanned.push(result.port);
+            host_entry.counts.add(state);
+            let retained = options.retains(&result);
             let res_clone = if retained { Some(result.clone()) } else { None };
             if retained {
                 results.push(result);
@@ -193,6 +218,7 @@ pub async fn scan(
             results,
             os_fingerprints: std::collections::HashMap::new(),
             probed_ports,
+            host_progress,
             partial: true,
             defense_observations: Vec::new(),
         });
@@ -208,6 +234,7 @@ pub async fn scan(
         results,
         os_fingerprints: std::collections::HashMap::new(),
         probed_ports,
+        host_progress,
         partial: false,
         defense_observations: Vec::new(),
     })
@@ -276,7 +303,7 @@ async fn verify_candidate(
     host: IpAddr,
     port: u16,
 ) -> PortResult {
-    let address = SocketAddr::new(host, port);
+    let address = socket_addr(host, port);
     let mut attempt = 0u32;
 
     loop {
@@ -383,7 +410,7 @@ async fn apply_jitter(jitter: Duration) {
 }
 
 async fn probe(shared: &Shared, target_index: usize, host: IpAddr, port: u16) -> PortResult {
-    let address = SocketAddr::new(host, port);
+    let address = socket_addr(host, port);
     let mut attempt = 0u32;
 
     loop {
@@ -532,6 +559,12 @@ enum ReadOutcome {
     Error(std::io::Error),
 }
 
+enum ReadLoopOutcome {
+    Data,
+    Closed,
+    Error(std::io::Error),
+}
+
 async fn read_chunk(stream: &mut TcpStream, banner: &mut Vec<u8>, until: Instant) -> ReadOutcome {
     let remaining = until.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
@@ -554,6 +587,28 @@ async fn read_chunk(stream: &mut TcpStream, banner: &mut Vec<u8>, until: Instant
     }
 }
 
+async fn collect_banner(
+    stream: &mut TcpStream,
+    banner: &mut Vec<u8>,
+    empty_window: Duration,
+    deadline: Instant,
+) -> ReadLoopOutcome {
+    while Instant::now() < deadline && banner.len() < SERVICE_BANNER_LIMIT {
+        let until = if banner.is_empty() {
+            (Instant::now() + empty_window).min(deadline)
+        } else {
+            (Instant::now() + SERVICE_BANNER_IDLE).min(deadline)
+        };
+        match read_chunk(stream, banner, until).await {
+            ReadOutcome::Data => {}
+            ReadOutcome::Timeout => break,
+            ReadOutcome::Eof => return ReadLoopOutcome::Closed,
+            ReadOutcome::Error(error) => return ReadLoopOutcome::Error(error),
+        }
+    }
+    ReadLoopOutcome::Data
+}
+
 async fn verify_and_inspect(
     mut stream: TcpStream,
     host: IpAddr,
@@ -573,33 +628,51 @@ async fn verify_and_inspect(
         ReadOutcome::Error(error) => return verification_failure(host, port, latency, error),
     }
 
+    // Services such as SMB, MongoDB, Redis, and memcached wait for a
+    // protocol-native request. Probe those ports first so their replies (and
+    // version strings) are not masked by the generic HTTP probe. Port 445
+    // advertises multiple SMB dialects, so a probe sequence may be needed.
+    if banner.is_empty() && !closed && Instant::now() < deadline {
+        for probe in service::active_probes(port) {
+            if !banner.is_empty() || closed || Instant::now() >= deadline {
+                break;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let _ = tokio::time::timeout(remaining, stream.write_all(&probe)).await;
+            match collect_banner(&mut stream, &mut banner, SERVICE_BANNER_HTTP_WAIT, deadline).await
+            {
+                ReadLoopOutcome::Data => {}
+                ReadLoopOutcome::Closed => {
+                    closed = true;
+                    break;
+                }
+                ReadLoopOutcome::Error(error) => {
+                    return verification_failure(host, port, latency, error);
+                }
+            }
+        }
+    }
+
     let now = Instant::now();
-    if banner.is_empty() && !closed && now < deadline {
+    if banner.is_empty() && !closed && now < deadline && port != crate::rdp::RDP_PORT {
         let probe = service::http_probe(host);
         let remaining = deadline.saturating_duration_since(now);
         let _ = tokio::time::timeout(remaining, stream.write_all(&probe)).await;
+        match collect_banner(&mut stream, &mut banner, SERVICE_BANNER_HTTP_WAIT, deadline).await {
+            ReadLoopOutcome::Data => {}
+            ReadLoopOutcome::Closed => closed = true,
+            ReadLoopOutcome::Error(error) => {
+                return verification_failure(host, port, latency, error);
+            }
+        }
     }
 
-    while !closed && Instant::now() < deadline && banner.len() < SERVICE_BANNER_LIMIT {
-        let until = if banner.is_empty() {
-            deadline
-        } else {
-            (Instant::now() + SERVICE_BANNER_IDLE).min(deadline)
-        };
-        match read_chunk(&mut stream, &mut banner, until).await {
-            ReadOutcome::Data => {}
-            ReadOutcome::Timeout => break,
-            ReadOutcome::Eof => {
-                closed = true;
-                break;
-            }
-            ReadOutcome::Error(error) => {
-                if banner.is_empty() {
-                    return verification_failure(host, port, latency, error);
-                }
-                closed = true;
-                break;
-            }
+    // Drain remaining chunks: the peer may split its banner across reads.
+    if !closed && !banner.is_empty() && banner.len() < SERVICE_BANNER_LIMIT {
+        match collect_banner(&mut stream, &mut banner, SERVICE_BANNER_IDLE, deadline).await {
+            ReadLoopOutcome::Data => {}
+            ReadLoopOutcome::Closed => closed = true,
+            ReadLoopOutcome::Error(_) => closed = true,
         }
     }
 
@@ -653,9 +726,41 @@ mod tests {
             connect_only,
             service_detection: true,
             retain: StateSet::all(),
+            retain_silent_ports: Vec::new(),
+            retain_reset_closed: false,
             jitter: Duration::ZERO,
             shutdown: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    #[test]
+    fn retains_silent_rdp_and_reset_closed_candidates() {
+        let mut options = options(false);
+        options.retain = StateSet::open();
+        options.retain_silent_ports = vec![3389];
+        options.retain_reset_closed = true;
+
+        assert!(options.retains(&PortResult::new(
+            host(),
+            3389,
+            PortState::Silent,
+            Duration::ZERO
+        )));
+        assert!(!options.retains(&PortResult::new(
+            host(),
+            5900,
+            PortState::Silent,
+            Duration::ZERO
+        )));
+
+        let reset = PortResult::new(host(), 4443, PortState::Closed, Duration::ZERO).with_detail(
+            "connection closed during verification: Connection reset by peer (os error 104)",
+        );
+        assert!(options.retains(&reset));
+
+        let refused = PortResult::new(host(), 4444, PortState::Closed, Duration::ZERO)
+            .with_detail("connection closed during verification: Connection refused");
+        assert!(!options.retains(&refused));
     }
 
     fn host() -> IpAddr {
@@ -874,7 +979,7 @@ mod tests {
     async fn verification_retries_an_ambiguous_silent_candidate() {
         let (port, server) = flaky_http_server().await;
         let mut options = options(false);
-        options.probe_timeout = Duration::from_millis(200);
+        options.probe_timeout = Duration::from_millis(500);
         options.retries = 1;
 
         let results = verify_candidates(&[(host(), port)], &options, None)

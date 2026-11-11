@@ -207,6 +207,14 @@ impl DbPaths {
         self.root.join("downloads")
     }
 
+    pub fn intel_dir(&self) -> PathBuf {
+        self.root.join("intel")
+    }
+
+    pub fn intel_file(&self) -> PathBuf {
+        self.intel_dir().join("threat_intel.json.gz")
+    }
+
     pub fn lock_file(&self) -> PathBuf {
         self.root.join(".update.lock")
     }
@@ -760,6 +768,34 @@ pub fn run_cli(
                     }
                 );
                 eprintln!("[db] location: {}", paths.root.display());
+            }
+            Ok(())
+        }
+        DbAction::Intel(options) => {
+            let summary = crate::intel::update(
+                &paths,
+                crate::intel::IntelUpdateOptions {
+                    force: options.force,
+                    quiet: options.quiet,
+                },
+            )?;
+            if options.json {
+                let json = serde_json::to_string_pretty(&summary)
+                    .map_err(|error| AppError::runtime(format!("cannot encode intel: {error}")))?;
+                println!("{json}");
+            } else if !options.quiet {
+                eprintln!(
+                    "[intel] {} CISA KEV CVEs, {} EPSS-scored CVEs ({} total){}",
+                    summary.kev_count,
+                    summary.epss_count,
+                    summary.total,
+                    if summary.refreshed {
+                        ""
+                    } else {
+                        " — cached copy is fresh"
+                    }
+                );
+                eprintln!("[intel] location: {}", summary.path);
             }
             Ok(())
         }

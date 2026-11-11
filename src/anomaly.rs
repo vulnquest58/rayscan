@@ -134,6 +134,7 @@ mod tests {
             results,
             os_fingerprints: std::collections::HashMap::new(),
             probed_ports: ports.to_vec(),
+            host_progress: Default::default(),
             partial: false,
             defense_observations: Vec::new(),
         }

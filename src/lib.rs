@@ -11,6 +11,7 @@ pub mod discovery;
 pub mod doctor;
 pub mod error;
 pub mod fingerprint;
+pub mod intel;
 pub mod interactive;
 pub mod limits;
 pub mod merge;
@@ -19,9 +20,11 @@ pub mod output;
 pub mod plugin;
 pub mod ports;
 pub mod rate;
+pub mod rdp;
 pub mod resume;
 pub mod rtt;
 pub mod scanner;
+pub mod scope;
 pub mod service;
 pub mod shard;
 pub mod syn;
@@ -79,6 +82,13 @@ pub(crate) async fn run_scan(
     {
         db::auto_update(paths, args.quiet, resolved.advisories);
     }
+    if resolved.advisories
+        && let Some(paths) = &db_paths
+        && let Some(count) = intel::install_overlay(paths)
+        && !args.quiet
+    {
+        eprintln!("[intel] loaded {count} CISA KEV/EPSS indicator(s) from cache");
+    }
     let local_index = if resolved.advisories {
         db_paths.as_ref().and_then(db::LocalIndex::load)
     } else {
@@ -89,20 +99,56 @@ pub(crate) async fn run_scan(
         .as_ref()
         .map(|path| resume::load_state(path))
         .transpose()?;
-    let (all_ports, ports_spec) = match &resume_state {
+    let (mut all_ports, ports_spec) = match &resume_state {
         Some(state) if args.ports.is_none() && args.top_ports.is_none() => {
             let ports = crate::ports::parse_spec(&state.ports_spec)?;
             (ports, state.ports_spec.clone())
         }
         _ => args.resolve_ports()?,
     };
-    let mut targets = targets::resolve_targets(
+    let mut targets = targets::resolve_targets_with_ndp(
         &args.target,
         &args.target_file,
         &args.exclude,
         resolved.family,
+        resolved.ndp.then_some(resolved.ndp_timeout),
     )
     .await?;
+
+    if !resolved.exclude_ports.is_empty() {
+        let excluded: HashSet<u16> = resolved.exclude_ports.iter().copied().collect();
+        let kept: Vec<u16> = all_ports
+            .iter()
+            .copied()
+            .filter(|port| !excluded.contains(port))
+            .collect();
+        if kept.is_empty() {
+            return Err(AppError::usage(
+                "--exclude-ports removed every port from the scan",
+            ));
+        }
+        if !args.quiet {
+            eprintln!(
+                "[ports] excluding {} port(s); scanning {} port(s)",
+                excluded.len(),
+                kept.len()
+            );
+        }
+        all_ports = kept;
+    }
+
+    if let Some(ref scope_path) = resolved.scope {
+        let guard = scope::ScopeGuard::load_from_file(scope_path)?;
+        let scope_specs = targets::expand_target_specs(&args.target, &args.target_file)?;
+        guard.validate(&scope_specs, &targets, resolved.force_out_of_scope)?;
+        if !args.quiet {
+            eprintln!(
+                "[scope] validated {} target(s) against scope policy '{}'",
+                targets.len(),
+                guard.program
+            );
+        }
+    }
     if let Some((index, count)) = resolved.shard {
         let before = targets.len();
         targets = shard::select(targets, index, count);
@@ -134,14 +180,17 @@ pub(crate) async fn run_scan(
             eprintln!("[discover] {} of {before} host(s) responded", targets.len());
         }
     }
-    if (resolved.resume_file.is_some() || resolved.save_state_file.is_some()) && targets.len() > 1 {
+    if (resolved.resume_file.is_some() || resolved.save_state_file.is_some())
+        && targets.len() > 1
+        && resolved.syn_mode
+    {
         return Err(AppError::usage(
-            "resumable scans currently support a single target",
+            "resumable scans with multiple targets are not supported in raw SYN mode",
         ));
     }
 
     // ── Phase 6: Resume — load previous state and compute remaining ports ────
-    let (prior_results, prior_counts, prior_scanned, mut ports) =
+    let (prior_results, prior_counts, prior_scanned, mut ports, host_plan) =
         if let Some(state) = resume_state.as_ref() {
             if !args.quiet {
                 let audit = resume::ResumeGapAudit::build(state, &all_ports);
@@ -153,15 +202,54 @@ pub(crate) async fn run_scan(
                     ))
                 );
             }
-            let remaining = resume::remaining_ports(&all_ports, &state.ports_scanned);
             let (results, counts) = resume::restore_results(state);
-            (results, counts, state.ports_scanned.clone(), remaining)
+            if !state.hosts.is_empty() || targets.len() > 1 {
+                let mut plan = Vec::with_capacity(targets.len());
+                for host in &targets {
+                    let done = state
+                        .hosts
+                        .iter()
+                        .find(|saved| saved.host.parse::<IpAddr>().ok().as_ref() == Some(host))
+                        .map(|saved| &saved.ports_scanned);
+                    let remaining = match done {
+                        Some(done) => resume::remaining_ports(&all_ports, done),
+                        None => all_ports.clone(),
+                    };
+                    plan.push((*host, remaining));
+                }
+                let union: HashSet<u16> = plan
+                    .iter()
+                    .flat_map(|(_, rem)| rem.iter().copied())
+                    .collect();
+                let remaining: Vec<u16> = all_ports
+                    .iter()
+                    .copied()
+                    .filter(|port| union.contains(port))
+                    .collect();
+                (
+                    results,
+                    counts,
+                    state.ports_scanned.clone(),
+                    remaining,
+                    Some(plan),
+                )
+            } else {
+                let remaining = resume::remaining_ports(&all_ports, &state.ports_scanned);
+                (
+                    results,
+                    counts,
+                    state.ports_scanned.clone(),
+                    remaining,
+                    None,
+                )
+            }
         } else {
             (
                 vec![],
                 crate::model::StateCounts::default(),
                 vec![],
                 all_ports.clone(),
+                None,
             )
         };
 
@@ -184,6 +272,7 @@ pub(crate) async fn run_scan(
             results: prior_results,
             os_fingerprints: HashMap::new(),
             probed_ports: all_ports.clone(),
+            host_progress: HashMap::new(),
             partial: false,
             defense_observations: Vec::new(),
         };
@@ -194,12 +283,21 @@ pub(crate) async fn run_scan(
             args.quiet,
         )
         .await;
+        if resolved.service_detection {
+            rdp::apply(
+                &mut report,
+                resolved.timeout.min(std::time::Duration::from_secs(5)),
+                args.quiet,
+            )
+            .await;
+        }
         plugins
             .apply(&mut report.results, resolved.probe_timeout, args.quiet)
             .await;
         accuracy::score_report(&mut report);
         if resolved.advisories {
             advisory::apply_advisories_with(&mut report, local_index.as_ref());
+            advisory::filter_advisories(&mut report, resolved.kev_only, resolved.min_epss);
         }
         let diff_report = if let Some(ref diff_path) = resolved.diff_file {
             match diff::load_baseline(diff_path) {
@@ -220,7 +318,18 @@ pub(crate) async fn run_scan(
         } else {
             None
         };
-        return output::emit(
+        if let Some(path) = &resolved.save_baseline {
+            output::write_json_report(
+                &report,
+                &args.target_label(),
+                StateSet::all(),
+                None,
+                None,
+                path,
+                args.quiet,
+            )?;
+        }
+        output::emit(
             &report,
             &args.target_label(),
             output::EmitOptions {
@@ -234,14 +343,27 @@ pub(crate) async fn run_scan(
                 explain: resolved.explain,
                 defense: resolved.defense,
                 advisories: resolved.advisories,
+                stream: resolved.stream,
                 diff: diff_report.as_ref(),
             },
+        )?;
+        return finish_diff_side_effects(
+            diff_report.as_ref(),
+            resolved.alert_file.as_deref(),
+            resolved.fail_on_change,
+            args.quiet,
         );
     }
 
-    let jobs = (targets.len() as u64)
-        .checked_mul(ports.len() as u64)
-        .ok_or_else(|| AppError::usage("target/port combination count overflowed"))?;
+    let jobs = if let Some(plan) = &host_plan {
+        plan.iter()
+            .map(|(_, remaining)| remaining.len() as u64)
+            .sum()
+    } else {
+        (targets.len() as u64)
+            .checked_mul(ports.len() as u64)
+            .ok_or_else(|| AppError::usage("target/port combination count overflowed"))?
+    };
     let target_label = args.target_label();
     let profile_name = args.profile.map(|p| p.as_str()).unwrap_or("balanced");
     let scan_mode = if resolved.syn_mode {
@@ -283,7 +405,9 @@ pub(crate) async fn run_scan(
         }
     });
 
-    let live_table_enabled = resolved.live_table
+    let stream_enabled = resolved.stream;
+    let live_table_enabled = !stream_enabled
+        && resolved.live_table
         && std::io::stdout().is_terminal()
         && !args.quiet
         && resolved.format == output::OutputFormat::Table
@@ -292,8 +416,8 @@ pub(crate) async fn run_scan(
     let live_streamed = Arc::new(AtomicBool::new(false));
     let live_streamed_ref = Arc::clone(&live_streamed);
 
-    let callback: Option<ProgressCallback> = progress.as_ref().map(|bar| {
-        let bar = bar.clone();
+    let callback: Option<ProgressCallback> = if progress.is_some() || stream_enabled {
+        let bar = progress.clone();
         let opens = Arc::new(AtomicU64::new(0));
         let closed = Arc::new(AtomicU64::new(0));
         let filtered = Arc::new(AtomicU64::new(0));
@@ -305,8 +429,10 @@ pub(crate) async fn run_scan(
         let theme = resolved.theme;
         let use_color = color_enabled(theme, stdout_is_tty);
 
-        Arc::new(move |event: ProgressEvent| {
-            bar.inc(1);
+        Some(Arc::new(move |event: ProgressEvent| {
+            if let Some(ref bar) = bar {
+                bar.inc(1);
+            }
             if let Some(state) = event.state {
                 match state {
                     crate::model::PortState::Open => {
@@ -325,12 +451,29 @@ pub(crate) async fn run_scan(
                 }
             }
 
-            if live_table_enabled
+            if stream_enabled {
+                if let Some(result) = &event.result
+                    && show.contains(result.state)
+                {
+                    let mut seen = seen_ports.lock().unwrap();
+                    if seen.insert((result.host, result.port)) {
+                        let item = output::JsonResult::from_result(result);
+                        if let Ok(line) = serde_json::to_string(&item) {
+                            use std::io::Write;
+                            let mut stdout = std::io::stdout().lock();
+                            let _ = writeln!(stdout, "{line}");
+                            let _ = stdout.flush();
+                        }
+                    }
+                }
+            } else if live_table_enabled
                 && let Some(result) = &event.result
                 && show.contains(result.state)
             {
                 let mut seen = seen_ports.lock().unwrap();
-                if seen.insert((result.host, result.port)) {
+                if seen.insert((result.host, result.port))
+                    && let Some(ref bar) = bar
+                {
                     if !header_printed.swap(true, Ordering::Relaxed) {
                         bar.println(output::format_live_header(theme, use_color));
                         bar.println(output::format_live_divider(use_color));
@@ -340,21 +483,25 @@ pub(crate) async fn run_scan(
                 }
             }
 
-            let position = bar.position();
-            if position % 16 == 0
-                || position == jobs
-                || event.state == Some(crate::model::PortState::Open)
-            {
-                bar.set_message(format!(
-                    "Open: {}  Closed: {}  Filtered: {}  Silent: {}",
-                    opens.load(Ordering::Relaxed),
-                    closed.load(Ordering::Relaxed),
-                    filtered.load(Ordering::Relaxed),
-                    silent.load(Ordering::Relaxed)
-                ));
+            if let Some(ref bar) = bar {
+                let position = bar.position();
+                if position % 16 == 0
+                    || position == jobs
+                    || event.state == Some(crate::model::PortState::Open)
+                {
+                    bar.set_message(format!(
+                        "Open: {}  Closed: {}  Filtered: {}  Silent: {}",
+                        opens.load(Ordering::Relaxed),
+                        closed.load(Ordering::Relaxed),
+                        filtered.load(Ordering::Relaxed),
+                        silent.load(Ordering::Relaxed)
+                    ));
+                }
             }
-        }) as ProgressCallback
-    });
+        }) as ProgressCallback)
+    } else {
+        None
+    };
 
     let scan_options = ScanOptions {
         timeout: resolved.timeout,
@@ -366,11 +513,69 @@ pub(crate) async fn run_scan(
         connect_only: resolved.connect_only,
         service_detection: resolved.service_detection,
         retain,
+        retain_silent_ports: if resolved.service_detection {
+            vec![rdp::RDP_PORT]
+        } else {
+            Vec::new()
+        },
+        retain_reset_closed: resolved.service_detection,
         jitter: resolved.jitter,
         shutdown: Arc::clone(&shutdown),
     };
 
-    let mut report = if resolved.syn_mode {
+    let hosts_resume = host_plan.is_some();
+    let mut report = if let Some(plan) = host_plan {
+        let mut combined = crate::model::ScanReport {
+            targets: targets.len(),
+            ports: all_ports.len(),
+            jobs,
+            workers: resolved.workers,
+            elapsed: std::time::Duration::ZERO,
+            counts: crate::model::StateCounts::default(),
+            results: Vec::new(),
+            os_fingerprints: HashMap::new(),
+            probed_ports: Vec::new(),
+            host_progress: HashMap::new(),
+            partial: false,
+            defense_observations: Vec::new(),
+        };
+        for (host, remaining) in plan {
+            if remaining.is_empty() {
+                continue;
+            }
+            match scanner::scan(&[host], &remaining, &scan_options, callback.clone()).await {
+                Ok(part) => {
+                    combined.counts.open += part.counts.open;
+                    combined.counts.closed += part.counts.closed;
+                    combined.counts.filtered += part.counts.filtered;
+                    combined.counts.silent += part.counts.silent;
+                    combined.counts.unreachable += part.counts.unreachable;
+                    combined.counts.error += part.counts.error;
+                    combined.results.extend(part.results);
+                    combined.elapsed += part.elapsed;
+                    combined.partial |= part.partial;
+                    combined
+                        .defense_observations
+                        .extend(part.defense_observations);
+                    combined.probed_ports.extend(part.probed_ports);
+                    combined.host_progress.extend(part.host_progress);
+                    if shutdown.load(Ordering::Relaxed) {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    if let Some(bar) = &progress {
+                        bar.abandon();
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        if let Some(bar) = &progress {
+            bar.finish_and_clear();
+        }
+        combined
+    } else if resolved.syn_mode {
         let syn_opts = syn::SynScanOptions {
             targets: targets.clone(),
             ports: ports.clone(),
@@ -378,7 +583,7 @@ pub(crate) async fn run_scan(
             retry_rate_pps: 0, // auto: rate / 4
             sport_range: (61000, 61999),
             timeout_ms: (resolved.timeout.as_millis() as u64).clamp(500, 10000),
-            batch_size: 64,
+            batch_size: 4096,
             retries: resolved.retries,
             retain,
             aimd: resolved.aimd,
@@ -463,6 +668,7 @@ pub(crate) async fn run_scan(
                         name: format!("udp:{}", udp_svc.name),
                         product: udp_svc.product,
                         version: udp_svc.version,
+                        confidence: None,
                     });
                     if result.detail.is_none() {
                         result.detail = Some("udp".to_string());
@@ -517,6 +723,7 @@ pub(crate) async fn run_scan(
                     name: format!("udp:{}", service.name),
                     product: service.product,
                     version: service.version,
+                    confidence: None,
                 });
                 report.results.push(result);
                 report.counts.add(crate::model::PortState::Open);
@@ -571,15 +778,51 @@ pub(crate) async fn run_scan(
 
     // ── Phase 6: Merge prior results (from --resume) with new scan ──────────
     if resolved.resume_file.is_some() {
-        // Append prior retained results and add their counts.
-        report.results.extend(prior_results);
-        report.counts.open += prior_counts.open;
-        report.counts.closed += prior_counts.closed;
-        report.counts.filtered += prior_counts.filtered;
-        report.counts.silent += prior_counts.silent;
-        report.counts.unreachable += prior_counts.unreachable;
-        report.counts.error += prior_counts.error;
-        report.jobs += (targets.len() as u64) * ((all_ports.len() - ports.len()) as u64);
+        let hosts_mode = resume_state
+            .as_ref()
+            .is_some_and(|state| !state.hosts.is_empty());
+        if hosts_mode {
+            // Per-host progress guarantees the saved pairs are disjoint from
+            // the just-scanned remaining pairs, so prior results and counts
+            // merge without overlap.
+            report.results.extend(prior_results);
+            report.counts.open += prior_counts.open;
+            report.counts.closed += prior_counts.closed;
+            report.counts.filtered += prior_counts.filtered;
+            report.counts.silent += prior_counts.silent;
+            report.counts.unreachable += prior_counts.unreachable;
+            report.counts.error += prior_counts.error;
+            report.jobs += resume_state
+                .as_ref()
+                .map(|state| {
+                    state
+                        .hosts
+                        .iter()
+                        .map(|host| host.ports_scanned.len() as u64)
+                        .sum::<u64>()
+                })
+                .unwrap_or(0);
+        } else if hosts_resume {
+            // Old single-target state resumed against multiple targets: every
+            // known host is being rescanned, so keep only results for hosts
+            // that are no longer part of the scan.
+            let known: HashSet<IpAddr> = targets.iter().copied().collect();
+            report.results.extend(
+                prior_results
+                    .into_iter()
+                    .filter(|r| !known.contains(&r.host)),
+            );
+        } else {
+            // Append prior retained results and add their counts.
+            report.results.extend(prior_results);
+            report.counts.open += prior_counts.open;
+            report.counts.closed += prior_counts.closed;
+            report.counts.filtered += prior_counts.filtered;
+            report.counts.silent += prior_counts.silent;
+            report.counts.unreachable += prior_counts.unreachable;
+            report.counts.error += prior_counts.error;
+            report.jobs += (targets.len() as u64) * ((all_ports.len() - ports.len()) as u64);
+        }
         report.ports = all_ports.len();
     }
 
@@ -590,6 +833,14 @@ pub(crate) async fn run_scan(
         args.quiet,
     )
     .await;
+    if resolved.service_detection {
+        rdp::apply(
+            &mut report,
+            resolved.timeout.min(std::time::Duration::from_secs(5)),
+            args.quiet,
+        )
+        .await;
+    }
 
     // ── Phase 6: Save state if requested ────────────────────────────────────
     if let Some(ref save_path) = resolved.save_state_file {
@@ -600,8 +851,48 @@ pub(crate) async fn run_scan(
             .copied()
             .filter(|port| probed.contains(port))
             .collect();
-        let state =
+        let mut state =
             resume::ScanState::from_report(&report, &target_label, &ports_spec, probed_ports);
+        if targets.len() > 1 {
+            let mut hosts = Vec::with_capacity(targets.len());
+            for host in &targets {
+                let mut done: Vec<u16> = Vec::new();
+                let mut counts = crate::model::StateCounts::default();
+                if let Some(saved) = resume_state.as_ref().and_then(|saved| {
+                    saved
+                        .hosts
+                        .iter()
+                        .find(|entry| entry.host.parse::<IpAddr>().ok().as_ref() == Some(host))
+                }) {
+                    done.extend(saved.ports_scanned.iter().copied());
+                    counts.open += saved.counts.open;
+                    counts.closed += saved.counts.closed;
+                    counts.filtered += saved.counts.filtered;
+                    counts.silent += saved.counts.silent;
+                    counts.unreachable += saved.counts.unreachable;
+                    counts.error += saved.counts.error;
+                }
+                if let Some(progress) = report.host_progress.get(host) {
+                    for port in &progress.ports_scanned {
+                        if !done.contains(port) {
+                            done.push(*port);
+                        }
+                    }
+                    counts.open += progress.counts.open;
+                    counts.closed += progress.counts.closed;
+                    counts.filtered += progress.counts.filtered;
+                    counts.silent += progress.counts.silent;
+                    counts.unreachable += progress.counts.unreachable;
+                    counts.error += progress.counts.error;
+                }
+                hosts.push(resume::SavedHostProgress {
+                    host: host.to_string(),
+                    ports_scanned: done,
+                    counts: resume::SavedCounts::from(counts),
+                });
+            }
+            state = state.with_hosts(hosts);
+        }
         match resume::save_state(save_path, &state) {
             Ok(()) => {
                 if !args.quiet {
@@ -625,6 +916,7 @@ pub(crate) async fn run_scan(
     accuracy::score_report(&mut report);
     if resolved.advisories {
         advisory::apply_advisories_with(&mut report, local_index.as_ref());
+        advisory::filter_advisories(&mut report, resolved.kev_only, resolved.min_epss);
     }
 
     let diff_report = if let Some(ref diff_path) = resolved.diff_file {
@@ -647,6 +939,18 @@ pub(crate) async fn run_scan(
         None
     };
 
+    if let Some(path) = &resolved.save_baseline {
+        output::write_json_report(
+            &report,
+            &target_label,
+            StateSet::all(),
+            None,
+            None,
+            path,
+            args.quiet,
+        )?;
+    }
+
     output::emit(
         &report,
         &target_label,
@@ -661,9 +965,36 @@ pub(crate) async fn run_scan(
             explain: resolved.explain,
             defense: resolved.defense,
             advisories: resolved.advisories,
+            stream: resolved.stream,
             diff: diff_report.as_ref(),
         },
+    )?;
+    finish_diff_side_effects(
+        diff_report.as_ref(),
+        resolved.alert_file.as_deref(),
+        resolved.fail_on_change,
+        args.quiet,
     )
+}
+
+fn finish_diff_side_effects(
+    diff_report: Option<&diff::ScanDiff>,
+    alert_file: Option<&std::path::Path>,
+    fail_on_change: bool,
+    quiet: bool,
+) -> Result<(), AppError> {
+    if let Some(diff) = diff_report
+        && let Some(path) = alert_file
+    {
+        diff::write_alert(path, diff)?;
+        if !quiet {
+            eprintln!("[alert] wrote {}", path.display());
+        }
+    }
+    if fail_on_change && diff_report.is_some_and(diff::ScanDiff::changes_detected) {
+        return Err(AppError::silent(1));
+    }
+    Ok(())
 }
 
 fn make_progress(

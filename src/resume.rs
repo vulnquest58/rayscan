@@ -107,6 +107,17 @@ impl From<&PortResult> for SavedResult {
 
 // ── Main state struct ─────────────────────────────────────────────────────────
 
+/// Per-target progress recorded for multi-target state files.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SavedHostProgress {
+    /// Target IP the progress belongs to.
+    pub host: String,
+    /// Every port probed against this host (all outcomes).
+    pub ports_scanned: Vec<u16>,
+    /// State counts restricted to the probes above.
+    pub counts: SavedCounts,
+}
+
 /// The on-disk representation of an interrupted or completed scan.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ScanState {
@@ -129,6 +140,10 @@ pub struct ScanState {
     pub partial: bool,
     /// ISO-8601 timestamp when the state was saved.
     pub timestamp: String,
+    /// Per-target progress for multi-target scans. Empty for single-target
+    /// state files; old readers ignore the extra field.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hosts: Vec<SavedHostProgress>,
 }
 
 impl ScanState {
@@ -151,7 +166,14 @@ impl ScanState {
             elapsed_ms: report.elapsed.as_secs_f64() * 1000.0,
             partial: report.partial,
             timestamp,
+            hosts: Vec::new(),
         }
+    }
+
+    /// Attach per-target progress (multi-target scans).
+    pub fn with_hosts(mut self, hosts: Vec<SavedHostProgress>) -> Self {
+        self.hosts = hosts;
+        self
     }
 }
 
@@ -227,6 +249,7 @@ pub fn restore_results(state: &ScanState) -> (Vec<PortResult>, StateCounts) {
                     name: name.clone(),
                     product: r.service_product.clone(),
                     version: r.service_version.clone(),
+                    confidence: None,
                 });
             }
             if r.banner.is_some() || r.service.is_some() {
@@ -427,6 +450,54 @@ mod tests {
     use super::*;
 
     #[test]
+    fn host_progress_round_trips_through_state() {
+        let all: Vec<u16> = (1..=6).collect();
+        let state = ScanState {
+            version: STATE_VERSION,
+            target_label: "a,b".to_string(),
+            ports_spec: "1-6".to_string(),
+            ports_scanned: (1..=6).collect(),
+            results: Vec::new(),
+            counts: SavedCounts::default(),
+            elapsed_ms: 0.0,
+            partial: true,
+            timestamp: chrono_now(),
+            hosts: vec![
+                SavedHostProgress {
+                    host: "127.0.0.1".to_string(),
+                    ports_scanned: vec![1, 2, 3],
+                    counts: SavedCounts {
+                        open: 1,
+                        closed: 2,
+                        ..SavedCounts::default()
+                    },
+                },
+                SavedHostProgress {
+                    host: "127.0.0.2".to_string(),
+                    ports_scanned: vec![1],
+                    counts: SavedCounts {
+                        open: 1,
+                        ..SavedCounts::default()
+                    },
+                },
+            ],
+        };
+
+        let json = serde_json::to_string(&state).unwrap();
+        let loaded: ScanState = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.hosts.len(), 2);
+        assert_eq!(loaded.hosts[1].ports_scanned, vec![1]);
+
+        let host = "127.0.0.1".parse::<IpAddr>().unwrap();
+        let done = loaded
+            .hosts
+            .iter()
+            .find(|saved| saved.host.parse::<IpAddr>().ok().as_ref() == Some(&host))
+            .unwrap();
+        assert_eq!(remaining_ports(&all, &done.ports_scanned), vec![4, 5, 6]);
+    }
+
+    #[test]
     fn remaining_ports_subtracts_scanned() {
         let all: Vec<u16> = (1..=10).collect();
         let scanned: Vec<u16> = vec![1, 2, 3, 5];
@@ -473,6 +544,7 @@ mod tests {
             ],
             os_fingerprints: HashMap::new(),
             probed_ports: vec![22, 23],
+            host_progress: Default::default(),
             partial: true,
             defense_observations: Vec::new(),
         };
@@ -517,6 +589,7 @@ mod tests {
             ],
             os_fingerprints: HashMap::new(),
             probed_ports: vec![80, 81],
+            host_progress: Default::default(),
             partial: false,
             defense_observations: Vec::new(),
         };
@@ -539,6 +612,7 @@ mod tests {
             name: "ftp".to_string(),
             product: Some("vsFTPd".to_string()),
             version: Some("2.3.4".to_string()),
+            confidence: Some(0.98),
         });
         ftp.banner = Some("220 (vsFTPd 2.3.4)".to_string());
 
@@ -555,6 +629,7 @@ mod tests {
             results: vec![ftp],
             os_fingerprints: HashMap::new(),
             probed_ports: vec![21],
+            host_progress: Default::default(),
             partial: true,
             defense_observations: Vec::new(),
         };

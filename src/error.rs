@@ -22,8 +22,23 @@ impl AppError {
         }
     }
 
+    /// Exit with `code` without printing a diagnostic.
+    ///
+    /// Used for control-flow statuses such as "the differential scan detected
+    /// changes" where the normal output already explains the result.
+    pub fn silent(code: i32) -> Self {
+        Self {
+            message: String::new(),
+            exit_code: code,
+        }
+    }
+
     pub fn exit_code(&self) -> i32 {
         self.exit_code
+    }
+
+    pub fn is_silent(&self) -> bool {
+        self.message.is_empty()
     }
 }
 
