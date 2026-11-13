@@ -9,6 +9,7 @@ use crate::error::AppError;
 use crate::limits::MAX_WORKERS;
 use crate::model::StateSet;
 use crate::output::OutputFormat;
+use crate::ports::PortPreset;
 use crate::targets::AddressFamily;
 use crate::theme::Theme;
 use crate::tls::TlsMode;
@@ -186,6 +187,10 @@ pub struct ScanArgs {
     #[arg(long, value_name = "N", conflicts_with = "ports")]
     pub top_ports: Option<usize>,
 
+    /// Port preset bundle (e.g. dc, win, web, linux, full, q).
+    #[arg(long, value_enum, conflicts_with_all = ["ports", "top_ports"], value_name = "PRESET")]
+    pub preset: Option<PortPreset>,
+
     /// Exclude ports from the scan, for example 22,135,445 or 8000-8100.
     #[arg(long, value_name = "PORTS")]
     pub exclude_ports: Option<String>,
@@ -221,6 +226,10 @@ pub struct ScanArgs {
     /// How long to wait for a banner before calling a handshake silent, in ms.
     #[arg(long, value_name = "MS")]
     pub probe_timeout_ms: Option<u64>,
+
+    /// Per-connect timeout ceiling in milliseconds. Overrides --timeout.
+    #[arg(long, value_name = "MS")]
+    pub connect_timeout_ms: Option<u64>,
 
     /// Global probes per second. 0 means unlimited.
     #[arg(long, visible_alias = "max-rate", value_name = "N")]
@@ -333,6 +342,10 @@ pub struct ScanArgs {
     #[arg(long)]
     pub no_aimd: bool,
 
+    /// Enable adaptive rate control for connect scans (detect rate limiting and back off).
+    #[arg(long)]
+    pub rate_auto: bool,
+
     /// AIMD minimum rate floor in packets per second (default: 100).
     #[arg(long, value_name = "N")]
     pub aimd_min_rate: Option<u64>,
@@ -379,7 +392,12 @@ pub struct ScanArgs {
     pub no_db_update: bool,
 
     /// Compare scan results against a previous scan JSON report or state file to detect changes.
-    #[arg(long, visible_alias = "compare-to", value_name = "FILE")]
+    #[arg(
+        long,
+        visible_alias = "compare",
+        alias = "compare-to",
+        value_name = "FILE"
+    )]
     pub diff: Option<PathBuf>,
 
     /// Save the final report as a JSON baseline for future --diff comparisons.
@@ -469,6 +487,8 @@ pub struct ResolvedConfig {
     pub aimd: bool,
     /// AIMD minimum rate floor in packets per second.
     pub aimd_min_pps: u64,
+    /// Enable adaptive rate control for connect scans.
+    pub rate_auto: bool,
     /// Per-host SYN-open count above which the host is treated as an anomaly.
     /// `0` disables anomaly detection.
     pub anomaly_threshold: u32,
@@ -557,6 +577,17 @@ impl ScanArgs {
             ));
         }
 
+        let timeout = if let Some(ms) = self.connect_timeout_ms {
+            if !(1..=300_000).contains(&ms) {
+                return Err(AppError::usage(
+                    "--connect-timeout-ms must be between 1 and 300000",
+                ));
+            }
+            Duration::from_millis(ms)
+        } else {
+            Duration::from_secs_f64(timeout_seconds)
+        };
+
         let probe_timeout_ms = self
             .probe_timeout_ms
             .or(file.probe_timeout_ms)
@@ -624,6 +655,12 @@ impl ScanArgs {
             config::state_set(&self.show)
         } else if let Some(filters) = file.show.as_deref() {
             config::state_set(filters)
+        } else if format == OutputFormat::PortList {
+            // Discovery stage: silent means the TCP handshake completed but
+            // the listener held mute, so the port still belongs in the list.
+            let mut discovery = StateSet::open();
+            discovery.insert(crate::model::PortState::Silent);
+            discovery
         } else {
             StateSet::open()
         };
@@ -705,7 +742,7 @@ impl ScanArgs {
         };
 
         Ok(ResolvedConfig {
-            timeout: Duration::from_secs_f64(timeout_seconds),
+            timeout,
             probe_timeout: Duration::from_millis(probe_timeout_ms),
             rate,
             workers,
@@ -721,6 +758,7 @@ impl ScanArgs {
             syn_mode: self.syn,
             aimd: !self.no_aimd,
             aimd_min_pps: self.aimd_min_rate.unwrap_or(100),
+            rate_auto: self.rate_auto,
             anomaly_threshold: self.anomaly_threshold.unwrap_or(1000),
             top_ports_first,
             live_table: !self.no_live,
@@ -788,6 +826,38 @@ impl ScanArgs {
             Ok((ports, default_spec.to_string()))
         }
     }
+
+    /// Resolve the port set for a scan, taking the output format into account.
+    ///
+    /// `--format port-list` is the discovery stage of a two-step workflow
+    /// (discover, then deep-scan the returned list), so without an explicit
+    /// `--ports`/`--top-ports` selection it sweeps the full TCP range
+    /// (1-65535) instead of the well-known 1-1024 default.
+    pub fn resolve_ports_for(&self, format: OutputFormat) -> Result<(Vec<u16>, String), AppError> {
+        if let Some(preset) = self.preset {
+            let ports = preset.ports();
+            let spec = if ports.len() == 65_535 {
+                "1-65535".to_string()
+            } else {
+                preset.spec()
+            };
+            if spec.starts_with("preset:") {
+                let list = ports
+                    .iter()
+                    .map(|p| p.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                return Ok((ports, list));
+            }
+            return Ok((ports, spec));
+        }
+        if self.ports.is_none() && self.top_ports.is_none() && format == OutputFormat::PortList {
+            let discovery_spec = "1-65535";
+            let ports = crate::ports::parse_ports(discovery_spec)?;
+            return Ok((ports, discovery_spec.to_string()));
+        }
+        self.resolve_ports()
+    }
 }
 
 fn parse_decoy_addresses(spec: Option<&str>) -> Result<Vec<Ipv4Addr>, AppError> {
@@ -822,6 +892,7 @@ mod tests {
             exclude: Vec::new(),
             ports: Some("80".to_string()),
             top_ports: None,
+            preset: None,
             json: false,
             format: None,
             output: None,
@@ -830,6 +901,7 @@ mod tests {
             config: None,
             timeout: None,
             probe_timeout_ms: None,
+            connect_timeout_ms: None,
             rate: None,
             workers: None,
             retries: None,
@@ -852,6 +924,7 @@ mod tests {
             quiet: false,
             syn: false,
             no_aimd: false,
+            rate_auto: false,
             aimd_min_rate: None,
             retry_rate: None,
             anomaly_threshold: None,
@@ -976,6 +1049,86 @@ mod tests {
         assert_eq!(spec, "top-20");
         assert_eq!(ports.len(), 20);
         assert_eq!(ports[0], 80);
+    }
+
+    #[test]
+    fn resolve_ports_preset_overrides_format_default() {
+        let mut preset = args();
+        preset.ports = None;
+        preset.top_ports = None;
+        preset.preset = Some(PortPreset::DcAd);
+        let (ports, spec) = preset.resolve_ports_for(OutputFormat::PortList).unwrap();
+        assert!(ports.contains(&88));
+        assert!(ports.contains(&389));
+        assert!(ports.contains(&445));
+        assert!(ports.len() < 65_535);
+        assert!(!spec.is_empty());
+    }
+
+    #[test]
+    fn connect_timeout_ms_overrides_timeout_seconds() {
+        let mut args = args();
+        args.connect_timeout_ms = Some(2_500);
+        let resolved = args.resolve().unwrap();
+        assert_eq!(resolved.timeout, Duration::from_millis(2_500));
+    }
+
+    #[test]
+    fn connect_timeout_ms_rejects_out_of_range() {
+        let mut args = args();
+        args.connect_timeout_ms = Some(0);
+        assert_eq!(args.resolve().unwrap_err().exit_code(), 2);
+        args.connect_timeout_ms = Some(300_001);
+        assert_eq!(args.resolve().unwrap_err().exit_code(), 2);
+    }
+
+    #[test]
+    fn port_list_discovery_defaults_to_full_tcp_range() {
+        let mut discovery = args();
+        discovery.ports = None;
+        discovery.top_ports = None;
+
+        let (ports, spec) = discovery.resolve_ports_for(OutputFormat::PortList).unwrap();
+        assert_eq!(spec, "1-65535");
+        assert_eq!(ports.len(), 65_535);
+        assert_eq!(ports[0], 1);
+        assert_eq!(ports[65_534], 65_535);
+
+        // An explicit selection still takes precedence.
+        discovery.ports = Some("80,445".to_string());
+        let (ports, spec) = discovery.resolve_ports_for(OutputFormat::PortList).unwrap();
+        assert_eq!(spec, "80,445");
+        assert_eq!(ports, vec![80, 445]);
+
+        // Every other format keeps the well-known-port default.
+        discovery.ports = None;
+        let (ports, spec) = discovery.resolve_ports_for(OutputFormat::Table).unwrap();
+        assert_eq!(spec, "1-1024");
+        assert_eq!(ports.len(), 1_024);
+    }
+
+    #[test]
+    fn port_list_discovery_includes_silent_by_default() {
+        let mut discovery = args();
+        discovery.format = Some(OutputFormat::PortList);
+        let resolved = discovery.resolve().unwrap();
+        assert!(resolved.show.contains(crate::model::PortState::Open));
+        assert!(resolved.show.contains(crate::model::PortState::Silent));
+        assert!(!resolved.show.contains(crate::model::PortState::Closed));
+        assert!(!resolved.show.contains(crate::model::PortState::Filtered));
+
+        // An explicit --show still wins over the discovery default.
+        discovery.show = vec![StateFilter::Open];
+        let resolved = discovery.resolve().unwrap();
+        assert!(resolved.show.contains(crate::model::PortState::Open));
+        assert!(!resolved.show.contains(crate::model::PortState::Silent));
+
+        // Other formats keep showing verified-open ports only.
+        let mut table = args();
+        table.format = Some(OutputFormat::Table);
+        let resolved = table.resolve().unwrap();
+        assert!(resolved.show.contains(crate::model::PortState::Open));
+        assert!(!resolved.show.contains(crate::model::PortState::Silent));
     }
 
     #[test]

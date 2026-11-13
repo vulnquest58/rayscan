@@ -36,6 +36,11 @@ pub enum OutputFormat {
     /// Plain `host:port` list — one open port per line for pipeline chaining.
     #[value(name = "host-port", alias = "hostport", alias = "plain")]
     HostPort,
+    /// Comma-separated port numbers only — ready to paste into -p of any tool.
+    /// Without --ports/--top-ports this discovery format scans the full TCP
+    /// range (1-65535). Example: 53,88,139,445,3389,5985
+    #[value(name = "port-list", alias = "ports", alias = "portlist")]
+    PortList,
 }
 
 impl OutputFormat {
@@ -50,7 +55,16 @@ impl OutputFormat {
             Self::Sarif => "sarif",
             Self::Markdown => "markdown",
             Self::HostPort => "host-port",
+            Self::PortList => "port-list",
         }
+    }
+
+    /// True for formats written for scripts and pipelines (`port-list`,
+    /// `json`, `csv`, ...). When one of these is selected, scan progress and
+    /// intelligence output is suppressed automatically so stdout stays pure
+    /// and parseable — no `--quiet` required (RSC-BUG-002 / PROPOSAL-001).
+    pub const fn is_machine_readable(self) -> bool {
+        !matches!(self, Self::Table | Self::Markdown)
     }
 }
 
@@ -120,6 +134,7 @@ pub fn emit(report: &ScanReport, target: &str, options: EmitOptions<'_>) -> Resu
         OutputFormat::Sarif => render_sarif(&selected)?,
         OutputFormat::Markdown => render_markdown(report, target, &selected, options.diff),
         OutputFormat::HostPort => render_host_port(&selected),
+        OutputFormat::PortList => render_port_list(&selected),
     };
 
     if let Some(path) = options.destination {
@@ -144,12 +159,18 @@ pub fn emit(report: &ScanReport, target: &str, options: EmitOptions<'_>) -> Resu
                     .as_deref()
                     .map(|e| format!(" | Evidence: {e}"))
                     .unwrap_or_default();
+                let role = guess
+                    .role
+                    .as_ref()
+                    .map(|r| format!(" [{}]", r.as_str()))
+                    .unwrap_or_default();
                 println!(
-                    "  {} → {} ({}) confidence={:.0}%{}",
+                    "  {} → {} ({}) confidence={:.0}%{}{}",
                     host,
                     guess.detail,
                     guess.family,
                     guess.confidence * 100.0,
+                    role,
                     ev
                 );
             }
@@ -373,7 +394,14 @@ fn render_table(report: &ScanReport, results: &[&PortResult], opts: TableOptions
             let os_label = report
                 .os_fingerprints
                 .get(&result.host)
-                .map(|g| format!("{} ({:.0}%)", g.detail, g.confidence * 100.0))
+                .map(|g| {
+                    let role = g
+                        .role
+                        .as_ref()
+                        .map(|r| format!(" [{}]", r.as_str()))
+                        .unwrap_or_default();
+                    format!("{} ({:.0}%){}", g.detail, g.confidence * 100.0, role)
+                })
                 .unwrap_or_default();
             row.push(Cell::new(os_label.chars().take(24).collect::<String>()));
         }
@@ -393,12 +421,18 @@ fn render_table(report: &ScanReport, results: &[&PortResult], opts: TableOptions
                 .as_deref()
                 .map(|e| format!(" | Evidence: {e}"))
                 .unwrap_or_default();
+            let role = guess
+                .role
+                .as_ref()
+                .map(|r| format!(" [{}]", r.as_str()))
+                .unwrap_or_default();
             output.push_str(&format!(
-                "  {} → {} ({}) confidence={:.0}%{}\n",
+                "  {} → {} ({}) confidence={:.0}%{}{}\n",
                 host,
                 guess.detail,
                 guess.family,
                 guess.confidence * 100.0,
+                role,
                 ev
             ));
         }
@@ -1443,6 +1477,34 @@ fn render_host_port(results: &[&PortResult]) -> String {
     output
 }
 
+/// Render discovered ports as a single comma-separated list, sorted numerically.
+///
+/// Only ports whose state is `Open` or `Silent` are included (i.e., ports that
+/// accepted or at least acknowledged a connection). The result is ready to paste
+/// directly into the `-p` argument of nmap, rayscan, netexec, impacket, or any
+/// other tool that accepts a comma-separated port list.
+///
+/// Example output: `53,88,139,389,445,593,3268,3389,5985`
+fn render_port_list(results: &[&PortResult]) -> String {
+    let mut ports: Vec<u16> = results
+        .iter()
+        .filter(|r| matches!(r.state, PortState::Open | PortState::Silent))
+        .map(|r| r.port)
+        .collect();
+    ports.sort_unstable();
+    ports.dedup();
+    let list = ports
+        .iter()
+        .map(|p| p.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    if list.is_empty() {
+        list
+    } else {
+        format!("{list}\n")
+    }
+}
+
 /// Write a standalone JSON report to `path`, regardless of the display format.
 pub fn write_json_report(
     report: &ScanReport,
@@ -1625,6 +1687,73 @@ mod tests {
         assert!(output.contains("Defense & Middlebox Intelligence:"));
         assert!(output.contains("Target 192.0.2.1:"));
         assert!(output.contains("Posture:"));
+    }
+
+    #[test]
+    fn port_list_is_sorted_deduplicated_and_state_filtered() {
+        let host: IpAddr = "192.0.2.1".parse().unwrap();
+        // RSC-BUG-003 regression: duplicate results for one port (e.g. a port
+        // probed by two probers) must not duplicate entries in the list.
+        let results = [
+            PortResult::new(host, 445, PortState::Open, Duration::from_millis(1)),
+            PortResult::new(host, 135, PortState::Open, Duration::from_millis(1)),
+            PortResult::new(host, 135, PortState::Open, Duration::from_millis(2)),
+            PortResult::new(host, 53, PortState::Silent, Duration::from_millis(1)),
+            PortResult::new(host, 80, PortState::Closed, Duration::from_millis(1)),
+            PortResult::new(host, 22, PortState::Filtered, Duration::from_millis(1)),
+        ];
+        let refs: Vec<&PortResult> = results.iter().collect();
+        assert_eq!(render_port_list(&refs), "53,135,445\n");
+    }
+
+    #[test]
+    fn port_list_emit_is_pure_with_defense_and_advisories_enabled() {
+        // RSC-BUG-002 / RSC-BUG-004 regression: with a machine-readable
+        // format the emitted document must contain only results, even when
+        // defense intelligence and advisory extras are requested.
+        let dir = std::env::temp_dir().join(format!(
+            "rayscan-portlist-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let path = dir.join("ports.txt");
+        let mut report = sample_report();
+        crate::accuracy::score_report(&mut report);
+
+        emit(
+            &report,
+            "127.0.0.1",
+            EmitOptions {
+                format: OutputFormat::PortList,
+                show: StateSet::all(),
+                destination: Some(&path),
+                quiet: true,
+                theme: Theme::Minimal,
+                streamed: false,
+                min_confidence: None,
+                explain: None,
+                defense: true,
+                advisories: true,
+                stream: false,
+                diff: None,
+            },
+        )
+        .expect("emit port list");
+
+        let contents = std::fs::read_to_string(&path).expect("read port list");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(contents, "80\n", "port-list output must contain only ports");
+        assert!(!contents.contains("Defense"));
+        assert!(!contents.contains("Posture"));
+    }
+
+    #[test]
+    fn machine_readable_formats_are_classified() {
+        assert!(OutputFormat::PortList.is_machine_readable());
+        assert!(OutputFormat::Json.is_machine_readable());
+        assert!(OutputFormat::Csv.is_machine_readable());
+        assert!(!OutputFormat::Table.is_machine_readable());
+        assert!(!OutputFormat::Markdown.is_machine_readable());
     }
 
     #[test]

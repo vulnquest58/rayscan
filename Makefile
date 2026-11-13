@@ -1,7 +1,7 @@
 SHELL := /usr/bin/env bash
 CARGO ?= cargo
 
-VERSION     ?= 0.4.0
+VERSION     ?= 0.5.0
 MUSL_TARGET := x86_64-unknown-linux-musl
 PREFIX      ?= /usr/local
 DESTDIR     ?=

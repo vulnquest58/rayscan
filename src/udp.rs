@@ -64,6 +64,28 @@ const RPCBIND_NULL_CALL: &[u8] = &[
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 ];
 
+/// SSDP M-SEARCH probe (port 1900) — discovers UPnP root devices and services.
+const SSDP_MSEARCH: &[u8] = b"M-SEARCH * HTTP/1.1\r\n\
+HOST: 239.255.255.250:1900\r\n\
+MAN: \"ssdp:discover\"\r\n\
+MX: 1\r\n\
+ST: ssdp:all\r\n\r\n";
+
+/// mDNS unicast-response PTR query (port 5353) enumerating service types.
+const MDNS_QUERY_PTR: &[u8] = &[
+    0x00, 0x00, // txid (ignored by mDNS)
+    0x00, 0x00, // flags: standard query
+    0x00, 0x01, // qdcount=1
+    0x00, 0x00, // ancount=0
+    0x00, 0x00, // nscount=0
+    0x00, 0x00, // arcount=0
+    // QNAME: "_services._dns-sd._udp.local"
+    0x09, b'_', b's', b'e', b'r', b'v', b'i', b'c', b'e', b's', 0x07, b'_', b'd', b'n', b's', b'-',
+    b's', b'd', 0x04, b'_', b'u', b'd', b'p', 0x05, b'l', b'o', b'c', b'a', b'l', 0x00, 0x00,
+    0x0c, // QTYPE=PTR
+    0x00, 0x01, // QCLASS=IN
+];
+
 /// UDP ports probed by `--udp` even when the TCP port is not open.
 pub const COMMON_UDP_PORTS: &[u16] = &[
     53, 67, 68, 69, 111, 123, 137, 138, 161, 162, 500, 514, 520, 631, 1900, 4500, 5060, 5353,
@@ -157,6 +179,14 @@ pub fn inspect_udp_port(port: u16, data: &[u8]) -> UdpDetection {
         };
     }
 
+    // mDNS (5353): DNS-shaped response; report as mdns instead of dns.
+    if port == 5353 && data.len() >= 4 && (data[2] & 0x80) != 0 {
+        return UdpDetection {
+            service: Some(UdpServiceInfo::new("mdns")),
+            banner: Some("mDNS response".to_string()),
+        };
+    }
+
     // DNS response: QR bit set (0x80 in second byte of flags), OPCODE=0
     if data.len() >= 4 && (data[2] & 0x80) != 0 && (data[2] & 0x78) == 0 {
         let product = extract_dns_server_field(data);
@@ -194,6 +224,27 @@ pub fn inspect_udp_port(port: u16, data: &[u8]) -> UdpDetection {
         }
     }
 
+    // SSDP response: HTTP 200 with an ST (search target) header.
+    if (data.starts_with(b"HTTP/1.1 2") || data.starts_with(b"HTTP/1.0 2"))
+        && data.windows(4).any(|w| w == b"ST: ")
+    {
+        let product = extract_http_header(data, b"Server: ");
+        let location = extract_http_header(data, b"Location: ");
+        let first_line = std::str::from_utf8(data)
+            .unwrap_or("")
+            .lines()
+            .next()
+            .unwrap_or("SSDP response")
+            .to_string();
+        return UdpDetection {
+            service: Some(UdpServiceInfo::new("ssdp").with_product(product)),
+            banner: Some(match location {
+                Some(loc) => format!("{first_line} ({loc})"),
+                None => first_line,
+            }),
+        };
+    }
+
     // Generic: preserve printable text banner (first line only, max 128 chars)
     let text = std::str::from_utf8(data).unwrap_or("");
     let first_line = text
@@ -216,6 +267,17 @@ pub fn inspect_udp_port(port: u16, data: &[u8]) -> UdpDetection {
 
 fn contains_slice(data: &[u8], needle: &[u8]) -> bool {
     data.windows(needle.len()).any(|w| w == needle)
+}
+
+/// Best-effort extraction of a single HTTP header value from a raw response.
+fn extract_http_header(data: &[u8], header: &[u8]) -> Option<String> {
+    let pos = data
+        .windows(header.len())
+        .position(|w| w.eq_ignore_ascii_case(header))?;
+    let rest = &data[pos + header.len()..];
+    let end = rest.iter().position(|&b| b == b'\r' || b == b'\n')?;
+    let value = String::from_utf8_lossy(&rest[..end]).trim().to_string();
+    (!value.is_empty()).then_some(value)
 }
 
 fn extract_netbios_name(data: &[u8]) -> Option<String> {
@@ -321,6 +383,8 @@ pub async fn probe_udp(
         123 => NTP_QUERY,
         137 => NETBIOS_QUERY,
         161 => SNMP_GET_SYSDESCR,
+        1900 => SSDP_MSEARCH,
+        5353 => MDNS_QUERY_PTR,
         5060 => SIP_OPTIONS_PROBE,
         _ => DNS_QUERY,
     };
@@ -495,6 +559,52 @@ Content-Length: 0\r\n\r\n";
             Some("18.2.0")
         );
         assert_eq!(detection.banner.as_deref(), Some("SIP/2.0 200 OK"));
+    }
+
+    #[test]
+    fn inspect_ssdp_response_with_location() {
+        let raw = b"HTTP/1.1 200 OK\r\n\
+Server: Linux/2.6 UPnP/1.0 miniupnpd/2.1\r\n\
+Location: http://192.168.1.1:49652/desc.xml\r\n\
+ST: ssdp:all\r\n\r\n";
+        let detection = inspect_udp_port(1900, raw);
+        assert_eq!(
+            detection.service.as_ref().map(|s| s.name.as_str()),
+            Some("ssdp")
+        );
+        assert_eq!(
+            detection
+                .service
+                .as_ref()
+                .and_then(|s| s.product.as_deref()),
+            Some("Linux/2.6 UPnP/1.0 miniupnpd/2.1")
+        );
+        assert!(
+            detection
+                .banner
+                .as_deref()
+                .unwrap()
+                .contains("http://192.168.1.1:49652/desc.xml")
+        );
+    }
+
+    #[test]
+    fn inspect_mdns_response() {
+        // QR=1 response to the service-type enumeration PTR query.
+        let data = [
+            0x00, 0x00, 0x80, 0x00, 0x00, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00,
+        ];
+        let detection = inspect_udp_port(5353, &data);
+        assert_eq!(
+            detection.service.as_ref().map(|s| s.name.as_str()),
+            Some("mdns")
+        );
+        // The same shape on port 53 is still classified as DNS.
+        let detection = inspect_udp_port(53, &data);
+        assert_eq!(
+            detection.service.as_ref().map(|s| s.name.as_str()),
+            Some("dns")
+        );
     }
 
     #[test]

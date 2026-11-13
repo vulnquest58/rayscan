@@ -129,6 +129,36 @@ fn json_scan_reports_an_open_port() {
 }
 
 #[test]
+fn quiet_scan_emits_no_progress_on_stderr() {
+    let server = banner_server();
+    let port = server.port();
+    let output = rayscan()
+        .args([
+            "scan",
+            "--target",
+            "127.0.0.1",
+            "--ports",
+            &port.to_string(),
+            "--json",
+            "--quiet",
+        ])
+        .output()
+        .expect("run rayscan scan");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.stderr.is_empty(),
+        "quiet mode must not emit progress on stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    server.stop();
+}
+
+#[test]
 fn no_service_detection_keeps_the_open_set_without_metadata() {
     let server = banner_server();
     let port = server.port();
@@ -481,6 +511,55 @@ fn host_port_format_lists_open_ports_for_pipelines() {
     assert_eq!(
         String::from_utf8_lossy(&output.stdout).trim(),
         format!("127.0.0.1:{port}")
+    );
+    server.stop();
+}
+
+#[test]
+fn port_list_format_stdout_stays_machine_readable() {
+    let server = banner_server();
+    let port = server.port();
+    let output = rayscan()
+        .args([
+            "scan",
+            "--target",
+            "127.0.0.1",
+            "--ports",
+            &port.to_string(),
+            "--format",
+            "port-list",
+            "--tls",
+            "--os",
+            "--defense",
+            "--timeout",
+            "1",
+        ])
+        .output()
+        .expect("run rayscan scan");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // RSC-BUG-002/003/004 regression: stdout for a machine-readable format
+    // contains only the port list — no progress lines, no ANSI, no duplicate
+    // ports and no defense intelligence blocks.
+    assert!(
+        stdout
+            .trim_end()
+            .chars()
+            .all(|c| c.is_ascii_digit() || c == ','),
+        "stdout must only contain a port list: {stdout:?}"
+    );
+    assert_eq!(stdout.trim(), port.to_string());
+
+    // PROPOSAL-001 regression: progress phases auto-quiet for machine formats.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("[tls]") && !stderr.contains("[os]"),
+        "progress lines must be suppressed for machine-readable formats: {stderr:?}"
     );
     server.stop();
 }

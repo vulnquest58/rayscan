@@ -5,9 +5,15 @@
 //! a TCP connect probe against a small set of common ports is used.  A
 //! connection refusal still proves the host is alive, so firewalled hosts
 //! with reachable closed ports are discovered without raw privileges.
+//!
+//! IPv4 targets additionally get an ARP probe (who-has) as the first and
+//! most definitive liveness check on a LAN segment.  On Linux this uses
+//! raw `AF_PACKET` frames for directly connected routes only; on Windows
+//! it uses the `SendARP` helper API, which previously left no usable
+//! discovery path for hosts that drop ICMP and refuse no TCP ports.
 
 use std::collections::{HashMap, HashSet};
-use std::net::{IpAddr, Ipv6Addr, SocketAddr, SocketAddrV6};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6};
 #[cfg(target_os = "linux")]
 use std::process::Command;
 use std::sync::{OnceLock, RwLock};
@@ -17,6 +23,9 @@ use std::time::Instant;
 
 use tokio::net::TcpStream;
 use tokio::task::JoinSet;
+
+#[cfg(target_os = "linux")]
+use crate::syn::route::{arp_resolve, iface_mac, route_for};
 
 pub const TCP_PING_PORTS: [u16; 7] = [80, 443, 22, 445, 3389, 8080, 53];
 
@@ -81,15 +90,6 @@ async fn sweep_ports(targets: &[IpAddr], options: DiscoveryOptions, ports: &[u16
         return Vec::new();
     }
 
-    #[cfg(target_os = "linux")]
-    let raw_icmp = raw_icmp_available();
-    #[cfg(target_os = "linux")]
-    let raw_icmp_v6 = raw_icmpv6_available();
-    #[cfg(not(target_os = "linux"))]
-    let raw_icmp = false;
-    #[cfg(not(target_os = "linux"))]
-    let raw_icmp_v6 = false;
-
     let ports = ports.to_vec();
     let mut alive = HashSet::new();
     for chunk in targets.chunks(64) {
@@ -97,22 +97,10 @@ async fn sweep_ports(targets: &[IpAddr], options: DiscoveryOptions, ports: &[u16
         for &host in chunk {
             let ports = ports.clone();
             tasks.spawn(async move {
-                let discovered = if raw_icmp && host.is_ipv4() {
-                    let raw = tokio::task::spawn_blocking(move || {
-                        host_responds_to_icmp(host, options.count, options.timeout)
-                    })
-                    .await
-                    .unwrap_or(false);
-                    raw || tcp_ping(host, options.count, options.timeout, &ports).await
-                } else if raw_icmp_v6 && host.is_ipv6() {
-                    let raw = tokio::task::spawn_blocking(move || {
-                        host_responds_to_icmpv6(host, options.count, options.timeout)
-                    })
-                    .await
-                    .unwrap_or(false);
-                    raw || tcp_ping(host, options.count, options.timeout, &ports).await
+                let discovered = if host.is_ipv4() && arp_ping_available() {
+                    arp_ping(host).await || icmp_or_tcp_discovery(host, options, &ports).await
                 } else {
-                    tcp_ping(host, options.count, options.timeout, &ports).await
+                    icmp_or_tcp_discovery(host, options, &ports).await
                 };
                 (host, discovered)
             });
@@ -129,6 +117,148 @@ async fn sweep_ports(targets: &[IpAddr], options: DiscoveryOptions, ports: &[u16
         .copied()
         .filter(|target| alive.contains(target))
         .collect()
+}
+
+/// ICMP/TCP discovery fallback shared by all platforms.
+async fn icmp_or_tcp_discovery(host: IpAddr, options: DiscoveryOptions, ports: &[u16]) -> bool {
+    #[cfg(target_os = "linux")]
+    let raw_icmp = raw_icmp_available();
+    #[cfg(target_os = "linux")]
+    let raw_icmp_v6 = raw_icmpv6_available();
+    #[cfg(not(target_os = "linux"))]
+    let raw_icmp = false;
+    #[cfg(not(target_os = "linux"))]
+    let raw_icmp_v6 = false;
+
+    if raw_icmp && host.is_ipv4() {
+        let raw = tokio::task::spawn_blocking(move || {
+            host_responds_to_icmp(host, options.count, options.timeout)
+        })
+        .await
+        .unwrap_or(false);
+        raw || tcp_ping(host, options.count, options.timeout, ports).await
+    } else if raw_icmp_v6 && host.is_ipv6() {
+        let raw = tokio::task::spawn_blocking(move || {
+            host_responds_to_icmpv6(host, options.count, options.timeout)
+        })
+        .await
+        .unwrap_or(false);
+        raw || tcp_ping(host, options.count, options.timeout, ports).await
+    } else {
+        tcp_ping(host, options.count, options.timeout, ports).await
+    }
+}
+
+/// Whether an ARP liveness probe is possible on this platform.
+///
+/// Linux needs `CAP_NET_RAW` for an `AF_PACKET` socket; Windows always
+/// exposes `SendARP` from iphlpapi.  Other platforms have no implementation.
+pub fn arp_ping_available() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: creating and immediately closing a socket is sound.
+        let fd = unsafe {
+            libc::socket(
+                libc::AF_PACKET,
+                libc::SOCK_RAW,
+                (libc::ETH_P_ARP as u16).to_be() as i32,
+            )
+        };
+        if fd < 0 {
+            return false;
+        }
+        // SAFETY: fd is a valid owned socket.
+        unsafe {
+            libc::close(fd);
+        }
+        true
+    }
+    #[cfg(target_os = "windows")]
+    {
+        true
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    {
+        false
+    }
+}
+
+/// ARP who-has liveness probe for an IPv4 target.
+///
+/// Linux: only directly connected routes are probed — the gateway is never
+/// asked for, so an ARP reply can only come from the target itself.  Windows:
+/// `SendARP` performs the same constrained lookup internally and fails for
+/// off-link destinations without ARPing the gateway.
+async fn arp_ping(host: IpAddr) -> bool {
+    let address = match host {
+        IpAddr::V4(address) => address,
+        IpAddr::V6(_) => return false,
+    };
+    if address.is_loopback() {
+        return false;
+    }
+    tokio::task::spawn_blocking(move || blocking_arp_ping(address))
+        .await
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "linux")]
+fn blocking_arp_ping(address: Ipv4Addr) -> bool {
+    // Directly connected targets only: the route's next hop must be the
+    // target itself so a gateway's reply can never count as liveness.
+    let Ok(route) = route_for(address) else {
+        return false;
+    };
+    if route.gateway_ip != address {
+        return false;
+    }
+    let Ok(src_mac) = iface_mac(&route.iface) else {
+        return false;
+    };
+    arp_resolve(&route.iface, &src_mac, route.src_ip, address).is_ok()
+}
+
+#[cfg(target_os = "windows")]
+fn blocking_arp_ping(address: Ipv4Addr) -> bool {
+    const NO_ERROR: u32 = 0;
+    #[link(name = "iphlpapi")]
+    unsafe extern "system" {
+        fn SendARP(dest_ip: u32, src_ip: u32, mac_addr: *mut u8, phy_addr_len: *mut u32) -> u32;
+    }
+
+    let mut mac = [0u8; 6];
+    let mut mac_len = mac.len() as u32;
+    // SAFETY: buffers are correctly sized; SendARP only writes mac_len bytes.
+    let status = unsafe {
+        SendARP(
+            u32::from_ne_bytes(address.octets()),
+            0,
+            mac.as_mut_ptr(),
+            &mut mac_len,
+        )
+    };
+    status == NO_ERROR && mac_len == 6
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+fn blocking_arp_ping(_address: Ipv4Addr) -> bool {
+    false
+}
+
+/// Distinct ICMP echo identifier per probe socket so concurrent probes never
+/// collide on (id, sequence) even if the kernel multiplexes replies across
+/// raw sockets bound for other targets.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn icmp_id_for(host: IpAddr) -> u16 {
+    let pid = std::process::id();
+    let folded: u32 = match host {
+        IpAddr::V4(v4) => u32::from(v4),
+        IpAddr::V6(v6) => {
+            let o = v6.octets();
+            u32::from_ne_bytes([o[0] ^ o[8], o[1] ^ o[9], o[2] ^ o[10], o[3] ^ o[11]])
+        }
+    };
+    (pid ^ folded) as u16
 }
 
 async fn tcp_ping(host: IpAddr, count: u8, timeout: Duration, ports: &[u16]) -> bool {
@@ -214,7 +344,7 @@ fn host_responds_to_icmp(host: IpAddr, count: u8, timeout: Duration) -> bool {
         destination.sin_port = 0;
         destination.sin_addr.s_addr = u32::from_ne_bytes(address.octets());
 
-        let id = std::process::id() as u16;
+        let id = icmp_id_for(host);
         let mut answered = false;
 
         'probe: for sequence in 0..u32::from(count.max(1)) {
@@ -303,7 +433,7 @@ fn host_responds_to_icmpv6(host: IpAddr, count: u8, timeout: Duration) -> bool {
         destination.sin6_port = 0;
         destination.sin6_addr.s6_addr = address.octets();
 
-        let id = std::process::id() as u16;
+        let id = icmp_id_for(host);
         let mut answered = false;
 
         'probe: for sequence in 0..u32::from(count.max(1)) {
@@ -770,6 +900,42 @@ mod tests {
         assert_eq!(neighbors[0], "2001:db8::5".parse::<Ipv6Addr>().unwrap());
         assert_eq!(neighbors[1], "fe80::1".parse::<Ipv6Addr>().unwrap());
         assert_eq!(neighbors[2], "fe80::2".parse::<Ipv6Addr>().unwrap());
+    }
+
+    #[test]
+    fn icmp_ids_are_stable_per_host_and_differ_between_hosts() {
+        let a: IpAddr = "192.168.1.10".parse().unwrap();
+        let a6: IpAddr = "fe80::1".parse().unwrap();
+        assert_eq!(icmp_id_for(a), icmp_id_for(a));
+        assert_eq!(icmp_id_for(a6), icmp_id_for(a6));
+        // 255 consecutive LAN addresses should collide at most once with the
+        // pid fold (birthday bound), so assert strict separation for a small
+        // deterministic sample instead of over the whole range.
+        let sample: Vec<IpAddr> = (1..8)
+            .map(|i| IpAddr::V4(Ipv4Addr::new(192, 168, 1, i)))
+            .collect();
+        let mut seen = HashSet::new();
+        for host in &sample {
+            assert!(seen.insert(icmp_id_for(*host)), "id collision in sample");
+        }
+    }
+
+    #[test]
+    fn arp_ping_skips_loopback_and_ipv6() {
+        assert!(!arp_ping_sync(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        assert!(!arp_ping_sync(IpAddr::V6("::1".parse().unwrap())));
+    }
+
+    /// Synchronous wrapper used only by tests.
+    fn arp_ping_sync(host: IpAddr) -> bool {
+        let address = match host {
+            IpAddr::V4(address) => address,
+            IpAddr::V6(_) => return false,
+        };
+        if address.is_loopback() {
+            return false;
+        }
+        blocking_arp_ping(address)
     }
 
     #[test]

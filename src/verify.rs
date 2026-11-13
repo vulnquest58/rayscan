@@ -173,6 +173,7 @@ mod tests {
             retain_silent_ports: Vec::new(),
             retain_reset_closed: false,
             jitter: Duration::ZERO,
+            rate_auto: false,
             shutdown: Arc::new(AtomicBool::new(false)),
         }
     }

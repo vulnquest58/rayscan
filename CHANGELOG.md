@@ -2,6 +2,84 @@
 
 All notable changes to rayscan are documented here.
 
+## [Unreleased]
+
+## [0.5.0] - 2026-11-13
+
+### Added
+
+- **Port presets** (`--preset <PRESET>`): curated engagement port sets with
+  `dc|ad`, `win|ws`, `web|http`, `linux|lx`, `full|all`, and `q|top` (nmap
+  top-1000 frequency table) presets. `--preset` conflicts with `--ports` and
+  `--top-ports`. Presets expand to explicit port lists for save/resume state
+  compatibility.
+- **Independent connect timeout** (`--connect-timeout-ms`): per-connect
+  timeout ceiling in milliseconds that overrides `--timeout` seconds.
+- **Adaptive rate control** (`--rate-auto`): connect-scan rate controller
+  halves the rate when >25% of probes time out in a 500-probe window and
+  increases by 25% when <5% time out, clamped by a floor and ceiling.
+- **Windows OS role refinement**: inferred `OsRole` from open service ports
+  (Domain Controller / Member Server / Workstation) and emitted in table/JSON
+  outputs and `OsGuess`.
+- **`--compare` alias** for `--diff` (visible alias `compare-to` retained).
+- **ARP host-discovery sweep** (`src/discovery.rs`): IPv4 targets in
+  `--ping-sweep` are now probed with an ARP who-has liveness check before
+  ICMP/TCP. Linux sends raw `AF_PACKET` ARP requests for **directly connected
+  routes only** (reusing the SYN engine's route/ARP machinery; the gateway is
+  never probed, so its replies cannot count as liveness). Windows uses the
+  `SendARP` helper API from iphlpapi. This closes the largest platform gap in
+  host discovery: hosts that drop ICMP and filter every TCP-ping port
+  (embedded devices, TVs, IoT appliances) were previously undiscoverable on
+  Windows, where raw ICMP is unavailable. Live-verified: a webOS smart TV that
+  answers no ping port is now found via `--ping-sweep` on Windows.
+- **UDP probes for SSDP (1900) and mDNS (5353)** (`src/udp.rs`): an M-SEARCH
+  `ssdp:all` request and a `_services._dns-sd._udp.local` PTR enumeration
+  query, with response classifiers (SSDP `ST:`/`Server:`/`Location:` header
+  extraction; mDNS responses are classified as `mdns` instead of `dns`).
+  These surface UPnP routers and IoT/Bonjour devices on LAN sweeps.
+- **ICMP echo id hardening** (`src/discovery.rs`): each raw ICMP/ICMPv6 sweep
+  now derives a per-target echo identifier from `(pid ^ target)`, so
+  concurrent probes can never collide on `(id, sequence)` if the kernel
+  multiplexes replies across raw sockets.
+- **`--format port-list`** (aliases `ports`/`portlist`): comma-separated open
+  port numbers only, ready to paste into `-p` of any tool. Entries are sorted
+  and de-duplicated (audit RSC-BUG-003). When no `--ports`/`--top-ports` is
+  given, this discovery format sweeps the full TCP range (1-65535) and includes
+  handshake-completed silent listeners by default, so a fresh target can be
+  enumerated in one command and the resulting list used for a deeper
+  second-stage scan; other formats keep the 1-1024 / open-only defaults.
+
+### Fixed
+
+- **Post-handshake resets no longer classify open ports as closed** (audit
+  RSC-BUG-001): verification only runs after a successful TCP connect, so a
+  reset/abort/broken-pipe reported there proves the port accepted the
+  connection. SYN-proxy-protected hosts previously produced ~32% false
+  negatives on live HTB targets.
+- **Machine-readable formats auto-quiet** (audit RSC-BUG-002 / PROPOSAL-001):
+  `[tls]`, `[rdp]`, `[os]` and plugin progress lines are suppressed
+  automatically for every non-human format (`port-list`, `json`, `jsonl`,
+  `csv`, `nmap-xml`, `greppable`, `sarif`, `host-port`) — `--quiet` is no
+  longer required for clean pipeline output. All progress writes remain on
+  stderr.
+- **Defense intelligence never contaminates machine formats** (audit
+  RSC-BUG-004): defense blocks render only for table output; `port-list` and
+  other machine formats emit results only, even with `--defense` set.
+
+### Tests
+
+- Regression coverage for the v0.4.0 audit: reset-after-handshake and
+  accept-then-close classified `Open` (RSC-BUG-001), port-list dedup
+  (RSC-BUG-003), pure `--format port-list` stdout with `--tls --os --defense`
+  and no progress on stderr (RSC-BUG-002/004, PROPOSAL-001), and
+  machine-format classification.
+
+### Deferred (roadmap)
+
+- ACK scan (`--ack`) with an `unfiltered` port state in the SYN engine to
+  distinguish stateful-DROP filtering from reachable-but-unfiltered hosts.
+- Raw SYN scanning on Windows via an Npcap packet path.
+
 ## [0.4.0] - 2026-11-11
 
 ### Added

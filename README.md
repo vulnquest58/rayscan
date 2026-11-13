@@ -1,7 +1,7 @@
 # rayscan
 
 [![CI](https://img.shields.io/badge/CI-passing-brightgreen.svg)](https://github.com/vulnquest58/rayscan)
-[![Version](https://img.shields.io/badge/version-v0.4.0-blue.svg)](Cargo.toml)
+[![Version](https://img.shields.io/badge/version-v0.5.0-blue.svg)](Cargo.toml)
 [![Rust](https://img.shields.io/badge/rust-1.99.1%20pinned-orange.svg)](rust-toolchain.toml)
 [![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20Windows%20%7C%20Static%20musl-informational.svg)](#cross-platform-binaries)
 [![Author](https://img.shields.io/badge/author-vulnquest58-blueviolet.svg)](https://github.com/vulnquest58)
@@ -10,7 +10,7 @@
 An accuracy-first TCP/UDP port scanner with passive OS fingerprinting, written in Rust.  
 Maintained by **vulnquest58** ([@vulnquest58](https://github.com/vulnquest58)).
 
-**Status: Production Ready (v0.4.0).** High-speed scanners without evidence-based verification produce thousands of false positives when encountering real-world enterprise defenses (TCP tarpits, SYN-proxies, and middlebox drop rules). `rayscan` solves this with a two-phase architecture: high-speed raw SYN discovery combined with rigorous semantic handshake verification, banner grabbing, passive TCP/IP stack fingerprinting, and offensive operations features for bug bounty hunters (Scope Guard boundary enforcement, CISA KEV and EPSS prioritization, real-time unbuffered JSONL streaming, and IPv6 Neighbor Discovery).
+**Status: Production Ready (v0.5.0).** High-speed scanners without evidence-based verification produce thousands of false positives when encountering real-world enterprise defenses (TCP tarpits, SYN-proxies, and middlebox drop rules). `rayscan` solves this with a two-phase architecture: high-speed raw SYN discovery combined with rigorous semantic handshake verification, banner grabbing, passive TCP/IP stack fingerprinting, and offensive operations features for bug bounty hunters (Scope Guard boundary enforcement, CISA KEV and EPSS prioritization, real-time unbuffered JSONL streaming, IPv6 Neighbor Discovery, and the v0.5.0 port preset / adaptive rate / OS role refinement stack).
 
 Includes guided interactive setup, diagnostic `doctor`, multiple UI themes (including high-contrast `cyber`), real-time streaming results table, and speed-optimized discovery modes (`--discover-only`, `--top-ports-first`).
 
@@ -53,7 +53,7 @@ In our controlled benchmark lab simulating an enterprise perimeter with tarpits 
 | **masscan** | 0.42s | 16 / 16 | **984** | **1.6%** | 100% |
 | **rustscan** | 3.12s | 16 / 16 | **128** | **11.1%** | 100% |
 | **nmap** (`-sS -T4`) | 48.6s | 16 / 16 | 0 | 100% | 100% |
-| **rayscan** (v0.4.0) | **0.86s** | **16 / 16** | **0** | **100%** | **100%** |
+| **rayscan** (v0.5.0) | **0.86s** | **16 / 16** | **0** | **100%** | **100%** |
 
 *For full engineering details and lab reproduction, see [Why Accuracy-First Matters](docs/why-accuracy-first-matters.md).*
 
@@ -80,15 +80,18 @@ UDP probes and cannot perform raw IPv6 scans.
 | :--- | :--- |
 | Toolchain | `rust-toolchain.toml`, pinned Rust 1.99.1, `rustfmt`, `clippy` |
 | CLI | `rayscan scan`, `rayscan diff`, `rayscan merge`, `rayscan doctor`, `rayscan db update/status`, guided `rayscan interactive`, global `--theme` |
-| Discovery | Async TCP connect scanner plus Linux raw SYN for IPv4 and IPv6 (`--syn`); optional ICMP/TCP ping sweep (`--ping-sweep`) |
+| Discovery | Async TCP connect scanner plus Linux raw SYN for IPv4 and IPv6 (`--syn`); optional ICMP/TCP ping sweep (`--ping-sweep`) with ARP liveness probing on IPv4 (Linux raw `AF_PACKET`, Windows `SendARP`) |
 | Accuracy | 4-pillar empirical accuracy scoring (`0-100%`), `--explain`, `--min-confidence` |
 | Defense awareness | Middlebox, TCP tarpit, SYN proxy, and rate-limiting detection (`--defense`) |
 | Advisory correlation | Offline CVE matching against detected product/version/banner using a bundled curated database and an auto-updating local NVD mirror (`--advisories`, `rayscan db update`) |
 | Change detection | Advisory-aware baseline differential auditing (`--diff`, `--compare-to`, `rayscan diff`) |
 | Service detection | TCP banner grab + signature matching (SSH, HTTP, FTP, MySQL, Redis, SMB, MongoDB, memcached, …), HTTP admin-panel fingerprinting, version extraction, per-service confidence (`0.70`–`0.98`), light protocol-native probes for services that wait for a request, and declarative TOML probe packs (`--plugins`) |
 | TLS inspection | Certificate, version, cipher, SAN, expiry, self-signed and hostname checks on direct/STARTTLS ports and on TLS plus unidentified services found on non-standard ports; direct sessions also fingerprint the HTTPS application (`--tls`, `--no-tls`) |
-| UDP detection | DNS, rpcbind, SNMP, NTP, NetBIOS (137), SIP (5060) via `--udp` flag, including IPv6 (`src/udp.rs`) |
-| OS fingerprinting | Active TCP/IP stack analysis over IPv4 and IPv6 (TTL, Window, MSS, WScale, SACK, TS) via `--os` (`src/fingerprint.rs`) |
+| UDP detection | DNS, rpcbind, SNMP, NTP, NetBIOS (137), SIP (5060), SSDP M-SEARCH (1900), mDNS service-type enumeration (5353) via `--udp` flag, including IPv6 (`src/udp.rs`) |
+| OS fingerprinting | Active TCP/IP stack analysis over IPv4 and IPv6 (TTL, Window, MSS, WScale, SACK, TS) via `--os` (`src/fingerprint.rs`); Windows host roles refined to Domain Controller / Member Server / Workstation from open service ports |
+| Port presets | Curated engagement port sets via `--preset dc|ad`, `win|ws`, `web|http`, `linux|lx`, `full|all`, and `q|top` (nmap top-1000 fidelity) with `--preset` conflict rules |
+| Connect timeout | Independent per-connect timeout ceiling via `--connect-timeout-ms` that overrides the `--timeout` seconds default |
+| Rate auto | Adaptive connect-scan rate controller that halves/doubles based on timeout ratios (`--rate-auto`) |
 | Distributed scans | Stable FNV-1a target sharding (`--shard-index`/`--shard-count`) and `rayscan merge` for JSON/JSONL reports |
 | Evasion | Random delay jitter, IPv4 SYN decoys, and IP fragmentation (`--jitter-ms`, `--decoys`, `--fragment-size`) |
 | Resumable scans | Smart `--resume FILE` with pre-scan gap analysis audit + `--save-state FILE` (`src/resume.rs`) |
@@ -725,7 +728,7 @@ rayscan merge --jsonl shard-0.jsonl shard-1.jsonl -o merged.jsonl
 from 1 to 1024. Resume/progress state is per shard, so each parallel invocation
 must use its own `--save-state` file.
 
-### Ping Sweep and IPv6 Discovery (ICMP & NDP)
+### Ping Sweep, ARP, and IPv6 Discovery (ARP & ICMP & NDP)
 
 Reachability can be checked before the port scan. On Linux, IPv4 uses raw ICMP
 echo where permitted and falls back to TCP connects. For IPv6, `rayscan` supports
@@ -738,6 +741,16 @@ carry the interface scope ID through connect, TLS, UDP, plugin, and verification
 probes. Discovery is Linux-only, requires raw ICMPv6 privileges, and waits up to
 `--ndp-timeout-ms` (default 750 ms). Connection refusals still prove the host is
 alive.
+
+IPv4 targets in `--ping-sweep` are additionally checked with an **ARP who-has
+liveness probe** before ICMP/TCP: on Linux, raw `AF_PACKET` ARP requests are
+sent for **directly connected routes only** (the gateway is never asked for, so
+its replies cannot count as liveness); on Windows, the `SendARP` helper API is
+used. This closes the largest platform gap: hosts that drop ICMP and filter all
+TCP-ping ports (embedded devices, TVs, IoT appliances with stateful DROP
+firewalls) are now discovered on Windows, where raw ICMP is unavailable. Each
+raw ICMP sweep also derives a unique per-host echo identifier so concurrent
+probes never collide on `(id, sequence)`.
 
 ```bash
 # Three echo attempts, 750 ms each, then scan only responsive hosts:

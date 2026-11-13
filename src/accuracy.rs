@@ -243,6 +243,7 @@ mod tests {
 
         let guess = OsGuess {
             family: crate::fingerprint::OsFamily::Linux,
+            role: None,
             detail: "Linux 5.x".to_string(),
             confidence: 0.95,
             initial_ttl: Some(64),
@@ -291,6 +292,7 @@ mod tests {
         let result = PortResult::new(host, 111, PortState::Open, Duration::from_millis(5));
         let guess = OsGuess {
             family: crate::fingerprint::OsFamily::Linux,
+            role: None,
             detail: "Linux 2.6.x".to_string(),
             confidence: 0.95,
             initial_ttl: Some(64),

@@ -131,11 +131,33 @@ impl TcpFingerprint {
     }
 }
 
+/// OS role refinement inferred from open service ports.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OsRole {
+    DomainController,
+    MemberServer,
+    Workstation,
+}
+
+impl OsRole {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::DomainController => "domain-controller",
+            Self::MemberServer => "member-server",
+            Self::Workstation => "workstation",
+        }
+    }
+}
+
 /// An OS guess produced by `classify()`.
 #[derive(Clone, Debug, Serialize)]
 pub struct OsGuess {
     /// Broad OS family.
     pub family: OsFamily,
+    /// Optional Windows-specific role refinement.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<OsRole>,
     /// Human-readable detail string, e.g. `"Linux 3.x–5.x"`.
     pub detail: String,
     /// Normalised confidence in `[0.0, 1.0]`. Values below 0.35 indicate
@@ -634,6 +656,7 @@ pub fn classify(fp: &TcpFingerprint) -> OsGuess {
     match best_sig {
         Some(sig) if confidence >= 0.20 => OsGuess {
             family: sig.family.clone(),
+            role: None,
             detail: sig.detail.to_string(),
             confidence,
             initial_ttl: Some(initial_ttl),
@@ -641,6 +664,7 @@ pub fn classify(fp: &TcpFingerprint) -> OsGuess {
         },
         _ => OsGuess {
             family: OsFamily::Unknown,
+            role: None,
             detail: format!(
                 "TTL={} window={} — insufficient evidence",
                 fp.ttl, fp.window
@@ -649,6 +673,40 @@ pub fn classify(fp: &TcpFingerprint) -> OsGuess {
             initial_ttl: Some(initial_ttl),
             evidence,
         },
+    }
+}
+
+/// Infer a Windows host role from the set of open service ports.
+///
+/// Rules:
+/// - **Domain Controller** — Kerberos (88) present **and** at least one
+///   Active Directory port (LDAP 389/636, Global Catalog 3268/3269, or
+///   AD Web Services 9389).
+/// - **Member Server** — no DC signal, but server-only indicators such as
+///   WinRM (5985/5986), MSSQL (1433), WSUS (8530/8531), or Exchange (25).
+/// - **Workstation** — typical client stack (RPC 135, NetBIOS 139, SMB 445,
+///   RDP 3389) without server-only indicators.
+///
+/// Returns `None` for non-Windows families or when evidence is ambiguous.
+pub fn infer_role(family: &OsFamily, open_ports: &[u16]) -> Option<OsRole> {
+    let has = |port: u16| open_ports.contains(&port);
+    match family {
+        OsFamily::Windows => {
+            if has(88) && (has(389) || has(636) || has(3268) || has(3269) || has(9389)) {
+                Some(OsRole::DomainController)
+            } else if !has(88)
+                && !has(389)
+                && !has(636)
+                && (has(5985) || has(5986) || has(1433) || has(8530) || has(8531) || has(25))
+            {
+                Some(OsRole::MemberServer)
+            } else if has(135) || has(139) || has(445) || has(3389) {
+                Some(OsRole::Workstation)
+            } else {
+                None
+            }
+        }
+        _ => None,
     }
 }
 

@@ -71,6 +71,10 @@ pub(crate) async fn run_scan(
 ) -> Result<(), AppError> {
     let mut resolved = args.resolve()?;
     resolved.theme = theme.unwrap_or(resolved.theme);
+    // RSC-BUG-002 / PROPOSAL-001: machine-readable output keeps stdout pure.
+    // Scan progress and intelligence phases are silent automatically for
+    // these formats — no --quiet flag required.
+    let progress_quiet = args.quiet || resolved.format.is_machine_readable();
     let plugins = match resolved.plugins.as_deref() {
         Some(path) => plugin::Registry::load(path)?,
         None => plugin::Registry::default(),
@@ -104,7 +108,7 @@ pub(crate) async fn run_scan(
             let ports = crate::ports::parse_spec(&state.ports_spec)?;
             (ports, state.ports_spec.clone())
         }
-        _ => args.resolve_ports()?,
+        _ => args.resolve_ports_for(resolved.format)?,
     };
     let mut targets = targets::resolve_targets_with_ndp(
         &args.target,
@@ -292,7 +296,7 @@ pub(crate) async fn run_scan(
             .await;
         }
         plugins
-            .apply(&mut report.results, resolved.probe_timeout, args.quiet)
+            .apply(&mut report.results, resolved.probe_timeout, progress_quiet)
             .await;
         accuracy::score_report(&mut report);
         if resolved.advisories {
@@ -520,6 +524,7 @@ pub(crate) async fn run_scan(
         },
         retain_reset_closed: resolved.service_detection,
         jitter: resolved.jitter,
+        rate_auto: resolved.rate_auto,
         shutdown: Arc::clone(&shutdown),
     };
 
@@ -746,8 +751,8 @@ pub(crate) async fn run_scan(
             }
         }
 
-        if !args.quiet && !host_ports.is_empty() {
-            eprintln!("[os] fingerprinting {} host(s) …", host_ports.len());
+        if !progress_quiet && !host_ports.is_empty() {
+            eprintln!("[os] fingerprinting {} host(s) .", host_ports.len());
         }
 
         let mut os_map = HashMap::new();
@@ -774,6 +779,22 @@ pub(crate) async fn run_scan(
             }
         }
         report.os_fingerprints = os_map;
+
+        // Refine OS role for Windows hosts based on observed open services.
+        let mut open_ports_by_host: HashMap<IpAddr, Vec<u16>> = HashMap::new();
+        for result in &report.results {
+            if result.state == crate::model::PortState::Open {
+                open_ports_by_host
+                    .entry(result.host)
+                    .or_default()
+                    .push(result.port);
+            }
+        }
+        for (host, guess) in report.os_fingerprints.iter_mut() {
+            if let Some(ports) = open_ports_by_host.get(host) {
+                guess.role = fingerprint::infer_role(&guess.family, ports);
+            }
+        }
     }
 
     // ── Phase 6: Merge prior results (from --resume) with new scan ──────────
@@ -830,14 +851,14 @@ pub(crate) async fn run_scan(
         &mut report,
         resolved.tls_mode,
         resolved.timeout.min(std::time::Duration::from_secs(5)),
-        args.quiet,
+        progress_quiet,
     )
     .await;
     if resolved.service_detection {
         rdp::apply(
             &mut report,
             resolved.timeout.min(std::time::Duration::from_secs(5)),
-            args.quiet,
+            progress_quiet,
         )
         .await;
     }
@@ -911,7 +932,7 @@ pub(crate) async fn run_scan(
     }
 
     plugins
-        .apply(&mut report.results, resolved.probe_timeout, args.quiet)
+        .apply(&mut report.results, resolved.probe_timeout, progress_quiet)
         .await;
     accuracy::score_report(&mut report);
     if resolved.advisories {

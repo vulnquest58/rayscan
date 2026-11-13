@@ -16,7 +16,7 @@ use crate::discovery::socket_addr;
 use crate::error::AppError;
 use crate::limits::worker_count;
 use crate::model::{HostProgress, PortResult, PortState, ScanReport, StateCounts, StateSet};
-use crate::rate::RateLimiter;
+use crate::rate::{AdaptiveRate, RateLimiter};
 use crate::rtt::RttEstimator;
 use crate::service;
 
@@ -93,6 +93,8 @@ pub struct ScanOptions {
     pub retain_reset_closed: bool,
     /// Maximum random delay before each probe. Zero disables jitter.
     pub jitter: Duration,
+    /// Enable adaptive rate control for connect scans.
+    pub rate_auto: bool,
     /// When set to `true` by an external signal handler, workers stop picking
     /// new jobs and the scan returns a partial report instead of an error.
     pub shutdown: Arc<AtomicBool>,
@@ -157,6 +159,13 @@ pub async fn scan(
     let (sender, receiver) =
         async_channel::bounded::<Vec<PortResult>>(batch_channel_capacity(workers));
 
+    let mut adaptive = if options.rate_auto && options.rate > 0 {
+        let floor = (options.rate / 10).max(100);
+        Some(AdaptiveRate::new(options.rate, floor))
+    } else {
+        None
+    };
+
     let mut tasks = JoinSet::new();
     for _ in 0..workers {
         let shared = Arc::clone(&shared);
@@ -174,6 +183,11 @@ pub async fn scan(
     let mut host_progress: HashMap<IpAddr, HostProgress> = HashMap::new();
     while let Ok(batch) = receiver.recv().await {
         for result in batch {
+            if let Some(adaptive) = adaptive.as_mut()
+                && let Some(new_rate) = adaptive.observe(result.state == PortState::Filtered)
+            {
+                shared.limiter.set_rate(new_rate);
+            }
             counts.add(result.state);
             probed_ports.push(result.port);
             let state = result.state;
@@ -344,9 +358,14 @@ async fn verify_candidate(
                     options.service_detection,
                 )
                 .await;
-                if matches!(result.state, PortState::Closed | PortState::Silent)
-                    && attempt < options.retries
-                {
+                // Retry inconclusive verifications: no listener evidence
+                // (closed/silent) or a port that accepted but produced no
+                // service identity yet. The latter covers flaky services that
+                // drop the first probe after the handshake (RSC-BUG-001 made
+                // that case Open instead of Silent).
+                let ambiguous = matches!(result.state, PortState::Closed | PortState::Silent)
+                    || (result.state == PortState::Open && result.service.is_none());
+                if ambiguous && attempt < options.retries {
                     attempt += 1;
                     tokio::time::sleep(retry_delay(attempt)).await;
                     continue;
@@ -691,8 +710,20 @@ fn verification_failure(
     error: std::io::Error,
 ) -> PortResult {
     let failure = classify_io_error(&error);
-    PortResult::new(host, port, failure.kind.state(), latency).with_detail(format!(
-        "connection closed during verification: {}",
+
+    // FIX RSC-BUG-001: A reset or abort received AFTER a successful TCP handshake
+    // means the port IS open — the listener (or its SYN-proxy) accepted the
+    // connection and then rejected our specific probe payload.
+    // We must NOT classify this as Closed; the handshake already proved the port
+    // is listening. This is distinct from a RST-to-SYN during connect() itself,
+    // which correctly maps to Closed via classify_kind() on the connect() error.
+    let state = match failure.kind {
+        FailureKind::Closed => PortState::Open,
+        other => other.state(),
+    };
+
+    PortResult::new(host, port, state, latency).with_detail(format!(
+        "port accepted connection; probe rejected by listener or upstream filter ({})",
         failure.detail
     ))
 }
@@ -729,6 +760,7 @@ mod tests {
             retain_silent_ports: Vec::new(),
             retain_reset_closed: false,
             jitter: Duration::ZERO,
+            rate_auto: false,
             shutdown: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -864,6 +896,61 @@ mod tests {
     async fn unused_port() -> u16 {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         listener.local_addr().unwrap().port()
+    }
+
+    /// Server that accepts the connection and immediately closes it. Models a
+    /// listener (or SYN-proxy) that admits the handshake and drops the probe.
+    async fn accept_then_close_server() -> (u16, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let task = tokio::spawn(async move {
+            // The scanner re-connects during verification; keep answering.
+            while let Ok((socket, _)) = listener.accept().await {
+                drop(socket);
+            }
+        });
+        (port, task)
+    }
+
+    #[test]
+    fn reset_after_handshake_is_classified_open() {
+        // RSC-BUG-001 regression: verification_failure() only runs after a
+        // successful TCP handshake, so a reset reported there means the port
+        // is open and the probe payload was rejected — never Closed.
+        let error = std::io::Error::from(std::io::ErrorKind::ConnectionReset);
+        let result = verification_failure(host(), 88, Duration::from_millis(5), error);
+        assert_eq!(
+            result.state,
+            PortState::Open,
+            "a reset after connect() proves the port accepted the connection"
+        );
+    }
+
+    #[test]
+    fn post_handshake_abort_and_broken_pipe_are_open() {
+        for kind in [
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::ConnectionAborted,
+            std::io::ErrorKind::BrokenPipe,
+        ] {
+            let error = std::io::Error::from(kind);
+            let result = verification_failure(host(), 445, Duration::from_millis(5), error);
+            assert_eq!(result.state, PortState::Open, "kind {kind:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn peer_close_after_accept_is_open() {
+        // A listener that accepts and immediately closes (EOF after the
+        // handshake) must be Open, not Silent and not Closed.
+        let (port, server) = accept_then_close_server().await;
+        let report = scan(&[host()], &[port], &options(false), None)
+            .await
+            .unwrap();
+        server.abort();
+
+        assert_eq!(report.counts.open, 1);
+        assert_eq!(report.results[0].state, PortState::Open);
     }
 
     #[tokio::test]
